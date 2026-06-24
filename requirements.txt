@@ -1,0 +1,33 @@
+# SkNeXt runtime dependencies
+# Requires Python >= 3.10
+#
+# PyTorch and torchvision are intentionally not pinned to an exact version.
+# Install builds compatible with your Python, NVIDIA driver, and CUDA environment.
+
+# Configuration
+PyYAML
+yacs
+
+# Numerical and scientific computing
+numpy
+scipy
+pandas
+
+# Image processing and microscopy I/O
+scikit-image
+opencv-python-headless
+Pillow
+tifffile
+
+# Zarr v3 storage
+zarr
+numcodecs
+
+# Training metrics, losses, and logging
+torchmetrics
+pytorch-msssim
+tensorboardX
+tensorboard
+
+# Progress display
+tqdm

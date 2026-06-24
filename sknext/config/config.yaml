@@ -6,7 +6,7 @@ PATHS:
         PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test'
 
 TASK:
-    CHANNELS: ["F", "C", "P", "S.varicosity", "S.spine"]
+    CHANNELS: ["F", "C", "P", "S.soma", "S.spine", "S.bouton"]
     CHANNELS_EXTRA_OPTS: [{"P":{"type": "skeleton", "dilation": 1}}]
     CHANNEL_WEIGHTS: [1, 1, 1, 1, 1]
     WATERSHED:
