@@ -1,0 +1,65 @@
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test'
+
+TASK:
+    TYPE: INSTANCE
+    INSTANCE:
+        CHANNELS: ["A"]
+        CHANNELS_EXTRA_OPTS: [{"A":{"z_affinities": [1, 2], "y_affinities": [1, 2], "x_affinities": [1, 2]}}]
+
+DATA:
+    PATCH_SIZE: [20, 256, 256, 1]
+    NORMALIZATION:
+        PERC_CLIP:
+            ENABLE: True
+            LOWER_PERC: 0.1
+            UPPER_PERC: 99.8
+        TYPE: "zero_mean_unit_variance"
+    TRAIN:
+        PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\train\raw'
+        GT_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\train\label'
+    VAL:
+        PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\val\raw'
+        GT_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\val\label'
+    INFER:
+        PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer'
+        GT_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer\label'
+        CHANNEL: 0
+        CHANNEL_NAME: 'result0'
+        SKELETON_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer'
+
+AUGMENTOR:
+    ENABLE: True
+    RANDOM_ROT: True
+    ZOOM: True
+    VFLIP: True
+    HFLIP: True
+    ZFLIP: True
+    ELASTIC: True
+    GAMMA_CONTRAST: True
+    BRIGHTNESS: True
+    CONTRAST: True
+    AFFINE_MODE: "reflect"
+
+TRAIN:
+    ENABLE: True
+    OPTIMIZER: "ADAMW"
+    LR: 1.E-4
+    BATCH_SIZE: 4
+    EPOCHS: 1000
+    PATIENCE: 100
+    LR_SCHEDULER:
+        NAME: "warmupcosine"
+        MIN_LR: 1.E-5
+        WARMUP_COSINE_DECAY_EPOCHS: 10
+
+INFER:
+    ENABLE: False
+    POST_PROCESSING:
+        ENABLE: True
+        OPERATIONS: ["fill_holes", "remove_small"]
+        VALUES: [None, 100]
