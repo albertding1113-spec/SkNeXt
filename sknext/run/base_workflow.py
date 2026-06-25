@@ -17,6 +17,7 @@ class Base_Workflow(ABC):
         self.checkpoint_file = os.path.join(self.checkpoint_dir, f"checkpoint_{self.job_id:02d}.pth")
         self.log_dir = cfg.PATHS.RESULT_DIR.OUTPUT_LOG
         self.log_writer = SummaryWriter(log_dir=self.log_dir)
+        self.chart_dir = cfg.PATHS.RESULT_DIR.OUTPUT_CHART
         self.patch_size = tuple(cfg.DATA.PATCH_SIZE)
         self.norm_type = cfg.DATA.NORMALIZATION.TYPE
         self.reflect_to_complete_shape = cfg.DATA.REFLECT_TO_COMPLETE_SHAPE

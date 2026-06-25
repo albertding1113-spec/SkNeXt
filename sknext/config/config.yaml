@@ -3,12 +3,12 @@ SYSTEM:
 
 PATHS:
     RESULT_DIR:
-        PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test'
+        PATH: 'E:\Albert_BigFile\Data\260618_SkNeXt_dataset\result'
 
 TASK:
     CHANNELS: ["F", "C", "P", "S.soma", "S.spine", "S.bouton"]
     CHANNELS_EXTRA_OPTS: [{"P":{"type": "skeleton", "dilation": 1}}]
-    CHANNEL_WEIGHTS: [1, 1, 1, 1, 1]
+    CHANNEL_WEIGHTS: [1, 1, 1, 1, 1, 1]
     WATERSHED:
         SEED_CHANNELS: ["C", "P"]
         SEED_CHANNELS_THRESH: ["auto", "auto"]
@@ -25,11 +25,11 @@ DATA:
             UPPER_PERC: 99.8
         TYPE: "zero_mean_unit_variance"
     TRAIN:
-        PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\train\raw'
-        GT_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\train\label'
+        PATH: 'E:\Albert_BigFile\Data\260618_SkNeXt_dataset\train\raw'
+        GT_PATH: 'E:\Albert_BigFile\Data\260618_SkNeXt_dataset\train\label'
     VAL:
-        PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\val\raw'
-        GT_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\val\label'
+        PATH: 'E:\Albert_BigFile\Data\260618_SkNeXt_dataset\val\raw'
+        GT_PATH: 'E:\Albert_BigFile\Data\260618_SkNeXt_dataset\val\label'
     INFER:
         PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer'
         GT_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer\label'
@@ -41,6 +41,7 @@ AUGMENTOR:
     ENABLE: True
     RANDOM_ROT: True
     ZOOM: True
+    ZOOM_RANGE: [0.7, 1.3]
     VFLIP: True
     HFLIP: True
     ZFLIP: True
@@ -49,7 +50,7 @@ AUGMENTOR:
     AFFINE_MODE: "reflect"
 
 MODEL:
-    LOAD_CHECKPOINT: False
+    LOAD_CHECKPOINT: True
     FEATURE_MAPS: [32, 64, 128, 256, 320]
 
 TRAIN:

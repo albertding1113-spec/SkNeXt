@@ -25,6 +25,7 @@ class SkNeXt_Config:
         _C.PATHS.RESULT_DIR.PATH = './result'
         _C.PATHS.RESULT_DIR.PATH_ = os.path.join(_C.PATHS.RESULT_DIR.PATH, "results", str(job_id))
         _C.PATHS.RESULT_DIR.OUTPUT_LOG = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "log")
+        _C.PATHS.RESULT_DIR.OUTPUT_CHART = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "chart")
         _C.PATHS.RESULT_DIR.OUTPUT_RAW = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "output_raw")
         _C.PATHS.RESULT_DIR.OUTPUT_INSTANCES = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "output_instances")
         _C.PATHS.RESULT_DIR.OUTPUT_POST_PROCESSING = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "output_post_processing")
@@ -378,6 +379,7 @@ def update_config(cfg:CN, new_cfg:CN, job_id:Optional[str|int]) -> CN:
     _update_recursive(cfg, new_cfg)
     cfg.PATHS.RESULT_DIR.PATH_ = os.path.join(cfg.PATHS.RESULT_DIR.PATH, "results", str(job_id))
     cfg.PATHS.RESULT_DIR.OUTPUT_LOG = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "log")
+    cfg.PATHS.RESULT_DIR.OUTPUT_CHART = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "chart")
     cfg.PATHS.RESULT_DIR.OUTPUT_RAW = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_raw")
     cfg.PATHS.RESULT_DIR.OUTPUT_INSTANCES = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_instances")
     cfg.PATHS.RESULT_DIR.OUTPUT_POST_PROCESSING = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_post_processing")

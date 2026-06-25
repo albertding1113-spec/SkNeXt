@@ -40,8 +40,8 @@ def main():
         ),
     )
     args = parser.parse_args()
-    print("SkNeXt version:", __version__)
-    print("All input args: \n", vars(args))
+    print("SkNeXt version:", __version__, flush=True)
+    print("All input args: \n", vars(args), flush=True)
     _sknext = SkNeXt(**vars(args))
     _sknext.run()
     sys.exit(0)

@@ -128,3 +128,6 @@ def test_zarr_nczyx_to_tif():
         output_axes="CZYX",
         overwrite=True,
     )
+
+if __name__ == "__main__":
+    test_zarr_nczyx_to_tif()

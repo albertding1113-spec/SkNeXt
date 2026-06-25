@@ -28,6 +28,7 @@ torchmetrics
 pytorch-msssim
 tensorboardX
 tensorboard
+matplotlib
 
 # Progress display
 tqdm

@@ -40,7 +40,7 @@ class SkNeXt:
         assert torch.cuda.is_available(), "CUDA device not available."
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
-        print(f"Using device: {self.device} \n GPU name: {torch.cuda.get_device_name(self.device)}")
+        print(f"Using device: {self.device} \n GPU name: {torch.cuda.get_device_name(self.device)}", flush=True)
 
 
     def run(self):
