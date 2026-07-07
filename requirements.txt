@@ -18,6 +18,7 @@ scikit-image
 opencv-python-headless
 Pillow
 tifffile
+h5py
 
 # Zarr v3 storage
 zarr
@@ -32,3 +33,6 @@ matplotlib
 
 # Progress display
 tqdm
+
+# Skeleton
+navis

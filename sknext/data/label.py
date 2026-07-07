@@ -3,9 +3,11 @@ import torch
 import numpy as np
 from typing import Literal
 from scipy.ndimage import binary_dilation, binary_erosion, generate_binary_structure
+from scipy import ndimage as ndi
 from skimage.measure import regionprops
 from skimage.morphology import skeletonize
-from skimage.segmentation import find_boundaries
+from skimage.segmentation import find_boundaries, watershed as skimage_watershed
+from skimage.filters import threshold_otsu
 
 
 def generate_channels_from_labels(labels_dict: dict[np.ndarray], # ZYX
@@ -263,3 +265,245 @@ def calc_affinities_from_mask(labels: np.ndarray, affinities: dict) -> np.ndarra
     return affinity_maps.astype('uint8')
 
 
+def watershed_with_sk(
+    raw_logits: np.ndarray,
+    ch_names: list[str],
+    seed_chs: list[str],
+    seed_chs_thresh: list[float | str],
+    topo_surface_ch: str,
+    growth_mask_chs: list[str],
+    growth_mask_chs_thresh: list[float | str],
+    skeleton_label: np.ndarray | None = None,
+) -> np.ndarray:
+    """Convert F/C/P predictions into an instance-label image by watershed.
+
+    When ``skeleton_label`` is provided, it must be a spatial label image in
+    which 0 is background and every positive integer is a skeleton/neuronal ID.
+    A connected seed component is retained only when it overlaps at least one
+    positive skeleton ID. The retained seed inherits that skeleton ID, so the
+    watershed result preserves the skeleton IDs instead of generating new,
+    sequential instance IDs.
+
+    If one connected seed component overlaps multiple skeleton IDs, the seed is
+    split by nearest overlapping skeleton voxel. This prevents a connected seed
+    from merging multiple skeleton-associated neurons into one marker.
+
+    Parameters
+    ----------
+    raw_logits:
+        Network output in ``CZYX``, ``ZYXC``, ``CYX`` or ``YXC`` order. Values
+        may be probabilities in ``[0, 1]`` or raw logits. Values outside
+        ``[0, 1]`` cause the complete input to be converted with sigmoid.
+    ch_names:
+        Channel names corresponding to the channel axis of ``raw_logits``.
+    seed_chs:
+        Channels used to construct the seed mask. Conditions are combined with
+        logical AND. For channel ``C``, values at or below the threshold are
+        retained; for other channels, values above the threshold are retained.
+    seed_chs_thresh:
+        One threshold per seed channel. Each value may be a number in ``[0, 1]``
+        or ``"auto"`` for Otsu thresholding. An empty list means all ``"auto"``.
+    topo_surface_ch:
+        Channel used as watershed elevation. ``C`` is used directly; positive
+        evidence channels such as ``F`` and ``P`` are inverted to ``1 - p``.
+    growth_mask_chs:
+        Channels defining the region in which markers may grow. Conditions are
+        combined with logical AND.
+    growth_mask_chs_thresh:
+        One threshold per growth-mask channel. An empty list means all
+        ``"auto"``.
+    skeleton_label:
+        Optional integer skeleton-label image with the same spatial shape as the
+        prediction. ``0`` means background and positive values are skeleton IDs.
+        Every skeleton voxel is used directly as a watershed marker. A predicted
+        seed component is retained only if it overlaps a positive skeleton ID; the
+        retained component inherits that ID. Predicted seed components without any
+        skeleton overlap are discarded.
+
+    Returns
+    -------
+    np.ndarray
+        Watershed instance labels in ``ZYX`` or ``YX`` order, dtype ``uint16``.
+        Background is 0. Without ``skeleton_label``, instances are numbered from
+        1. With ``skeleton_label``, positive output IDs match skeleton IDs.
+    """
+    raw_logits = np.asarray(raw_logits)
+    ch_names = list(ch_names)
+
+    if raw_logits.ndim != 4:
+        raise ValueError("raw_logits must be a channel-first/channel-last 3D array: (C,Z,Y,X), or (Z,Y,X,C).")
+    if not ch_names:
+        raise ValueError("ch_names must not be empty.")
+    if len(set(ch_names)) != len(ch_names):
+        raise ValueError(f"ch_names contains duplicate names: {ch_names!r}.")
+
+    # Normalize to channel-first: C + spatial dimensions.
+    if raw_logits.shape[0] == len(ch_names):
+        probability = raw_logits
+    elif raw_logits.shape[-1] == len(ch_names):
+        probability = np.moveaxis(raw_logits, -1, 0)
+    else:
+        raise ValueError(f"Cannot locate the channel axis: raw_logits.shape={raw_logits.shape}, len(ch_names)={len(ch_names)}.")
+
+    probability = probability.astype(np.float32, copy=False)
+    probability = np.nan_to_num(probability,nan=0.0,posinf=1.0,neginf=0.0,)
+    # SkNeXt uses linear output heads. Convert raw logits when needed.
+    if np.any(probability < 0.0) or np.any(probability > 1.0):
+        raise ValueError("raw logits must be in range [0, 1].")
+
+    channel_index = {name: index for index, name in enumerate(ch_names)}
+
+    def require_channels(names: list[str], argument_name: str) -> None:
+        missing = [name for name in names if name not in channel_index]
+        if missing:
+            raise ValueError(f"{argument_name} contains unavailable channels {missing}; available channels are {ch_names}.")
+
+    require_channels(seed_chs, "seed_chs")
+    require_channels([topo_surface_ch], "topo_surface_ch")
+    require_channels(growth_mask_chs, "growth_mask_chs")
+
+    def normalize_thresholds(
+        thresholds: list[float | str],
+        channels: list[str],
+        argument_name: str,
+    ) -> list[float | str]:
+        if not thresholds:
+            return ["auto"] * len(channels)
+        result = list(thresholds)
+        if len(result) != len(channels):
+            raise ValueError(f"{argument_name} must have one value per channel: got {len(result)} thresholds for {len(channels)} channels.")
+        return result
+
+    seed_chs_thresh = normalize_thresholds(seed_chs_thresh, seed_chs,"seed_chs_thresh",)
+    growth_mask_chs_thresh = normalize_thresholds(growth_mask_chs_thresh, growth_mask_chs,"growth_mask_chs_thresh",)
+
+    def resolve_threshold(channel: np.ndarray, value: float | str) -> float:
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text == "auto":
+                finite = channel[np.isfinite(channel)]
+                if finite.size == 0:
+                    return 0.5
+                if float(finite.min()) == float(finite.max()):
+                    return 0.5
+                return float(threshold_otsu(finite))
+            try:
+                threshold = float(text)
+            except ValueError as error:
+                raise ValueError(f"Threshold must be a number or 'auto', got {value!r}.") from error
+        elif isinstance(value, (int, float, np.integer, np.floating)):
+            threshold = float(value)
+        else:
+            raise TypeError("Threshold must be a number or 'auto', got {type(value).__name__}.")
+        if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"Threshold must be finite and within [0, 1], got {threshold}.")
+        return threshold
+
+    def threshold_channel(
+        channel_name: str,
+        threshold_value: float | str,
+    ) -> np.ndarray:
+        channel = probability[channel_index[channel_name]]
+        threshold = resolve_threshold(channel, threshold_value)
+        # C is boundary probability: low C means object interior.
+        if channel_name == "C":
+            return channel <= threshold
+        # F/P and semantic channels are positive evidence maps.
+        return channel > threshold
+
+    spatial_shape = probability.shape[1:]
+
+    seed_mask = np.ones(spatial_shape, dtype=bool)
+    for channel_name, threshold_value in zip(seed_chs, seed_chs_thresh):
+        seed_mask &= threshold_channel(channel_name, threshold_value)
+    growth_mask = np.ones(spatial_shape, dtype=bool)
+    for channel_name, threshold_value in zip(growth_mask_chs, growth_mask_chs_thresh,):
+        growth_mask &= threshold_channel(channel_name, threshold_value)
+    # Face-connected components: 4-connectivity in 2D and 6-connectivity in 3D.
+    connectivity = ndi.generate_binary_structure(seed_mask.ndim, 1)
+
+    if skeleton_label is None:
+        # Standard mode: markers must stay inside the allowed growth region.
+        seed_mask &= growth_mask
+        if not np.any(seed_mask) or not np.any(growth_mask):
+            return np.zeros(spatial_shape, dtype=np.uint16)
+        markers, marker_count = ndi.label(seed_mask, structure=connectivity)
+        if marker_count == 0:
+            return np.zeros(spatial_shape, dtype=np.uint16)
+        markers = markers.astype(np.int64, copy=False)
+    else:
+        skeleton_label = np.asarray(skeleton_label)
+        if skeleton_label.shape != spatial_shape:
+            raise ValueError(f"skeleton_label must have the same spatial shape as the prediction: expected {spatial_shape}, got {skeleton_label.shape}.")
+        if not (np.issubdtype(skeleton_label.dtype, np.integer) or np.issubdtype(skeleton_label.dtype, np.bool_)):
+            if not np.issubdtype(skeleton_label.dtype, np.number):
+                raise TypeError(f"skeleton_label must be an integer ID label image, got dtype={skeleton_label.dtype}.")
+            if not np.all(np.isfinite(skeleton_label)):
+                raise ValueError("skeleton_label contains NaN or infinite values.")
+            rounded = np.rint(skeleton_label)
+            if not np.array_equal(skeleton_label, rounded):
+                raise ValueError("skeleton_label must contain integer-valued skeleton IDs.")
+            skeleton_label = rounded
+        if np.any(skeleton_label < 0): raise ValueError("skeleton_label cannot contain negative IDs.")
+
+        max_skeleton_id = int(np.max(skeleton_label, initial=0))
+        if max_skeleton_id > np.iinfo(np.uint16).max:
+            raise OverflowError(f"skeleton_label contains an ID larger than uint16 can represent: {max_skeleton_id}.")
+        skeleton_label = skeleton_label.astype(np.uint16, copy=False)
+        skeleton_region = skeleton_label > 0
+        if not np.any(skeleton_region):
+            # Skeleton-constrained mode has no valid marker IDs. Predicted seeds
+            # are intentionally not allowed to create independent instances.
+            return np.zeros(spatial_shape, dtype=np.uint16)
+        # Skeleton voxels are markers themselves. Include them in the watershed
+        # mask even when the predicted growth mask misses part of a skeleton.
+        growth_mask |= skeleton_region
+        seed_mask &= growth_mask
+        markers = np.zeros(spatial_shape, dtype=np.int64)
+        # Retain only connected predicted seed components that overlap at least
+        # one skeleton ID. The full retained seed inherits the overlapping ID.
+        if np.any(seed_mask):
+            seed_components, seed_component_count = ndi.label(seed_mask, structure=connectivity,)
+            component_slices = ndi.find_objects(seed_components)
+            for component_id, component_slice in enumerate(component_slices, start=1,):
+                if component_slice is None:
+                    continue
+                component_local = (seed_components[component_slice] == component_id)
+                skeleton_local = skeleton_label[component_slice]
+                overlap_local = component_local & (skeleton_local > 0)
+                skeleton_ids = np.unique(skeleton_local[overlap_local])
+                if skeleton_ids.size == 0:
+                    # Predicted seeds without skeleton overlap are discarded.
+                    continue
+                marker_local = markers[component_slice]
+                if skeleton_ids.size == 1:
+                    marker_local[component_local] = int(skeleton_ids[0])
+                    continue
+                # If one connected predicted seed touches multiple skeleton IDs,
+                # split it according to the nearest overlapping skeleton voxel.
+                overlap_ids = np.where(overlap_local, skeleton_local,0,)
+                _, nearest_indices = ndi.distance_transform_edt(overlap_ids == 0, return_indices=True,)
+                nearest_skeleton_ids = overlap_ids[tuple(nearest_indices)]
+                marker_local[component_local] = (nearest_skeleton_ids[component_local])
+        # Merge the complete skeleton extent into the marker image. Skeleton IDs
+        # take precedence at skeleton voxels and also work when no predicted seed
+        # overlaps a given skeleton. Disconnected regions carrying the same ID are
+        # intentionally treated as parts of the same final instance.
+        markers[skeleton_region] = skeleton_label[skeleton_region].astype(np.int64,copy=False,)
+
+    topography = probability[channel_index[topo_surface_ch]]
+    if topo_surface_ch == "C":
+        elevation = topography
+    else:
+        # Watershed grows from low basins; F/P confidence is high inside objects.
+        elevation = 1.0 - topography
+
+    instances = skimage_watershed(
+        image=elevation.astype(np.float32, copy=False),
+        markers=markers,
+        mask=growth_mask,
+        connectivity=connectivity,
+        watershed_line=False,)
+    if np.max(instances, initial=0) > np.iinfo(np.uint16).max:
+        raise OverflowError("Watershed output IDs exceed uint16 range.")
+    return instances.astype(np.uint16, copy=False)

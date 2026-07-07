@@ -3,20 +3,29 @@ import torch
 import os
 import re
 import math
+import shutil
 from datetime import datetime
+import zarr
+from numcodecs import Blosc
 import matplotlib
+import json
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from typing import Any, Callable, Iterable, Sequence
 from sknext.run.base_workflow import Base_Workflow
-from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder
-from sknext.data.datasetIO import tif_list_to_zarr
+from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder, patch_coordinates_iter
+from sknext.data.datasetIO import tif_list_to_zarr, detect_path_type, IMSReader, ZarrIOManager
 from sknext.data.data_loader import ZarrPatchLoader
+from sknext.data.label import watershed_with_sk
+from sknext.data.preprocessing import reflect_padding_img, preprocess_img
+from sknext.data.postprocessing import post_processing_instance, post_processing_semantic
 from sknext.model.unext_v2 import U_NeXt_V2
 from sknext.model.scheduler import build_onecycle_scheduler, build_warmup_cosine_scheduler
 from sknext.utils.utils import get_cfg_value, time_str
 from sknext.model.loss import instance_segmentation_loss, instance_segmentation_metrics
 from sknext.utils.model_info import print_model_parameters, profile_forward_memory
-from tifffile import tifffile
+from sknext.skeleton.skeleton import SkeletonManager
 
 
 class Segmentation_Workflow(Base_Workflow):
@@ -171,6 +180,9 @@ class Segmentation_Workflow(Base_Workflow):
         else:
             self.model.eval()
 
+    def create_skeleton(self):
+        self.skeleton_manager = SkeletonManager(self.skeleton_path)
+
     def load_checkpoint(self):
         assert hasattr(self, "model") and self.model is not None, (
             "self.model is None. Please call set_model() before loading checkpoint.")
@@ -200,6 +212,64 @@ class Segmentation_Workflow(Base_Workflow):
                       "model_name": self.model_name,}
         torch.save(checkpoint, self.checkpoint_file)
         print(f"{time_str()} Model checkpoint saved to: {self.checkpoint_file}", flush=True)
+
+    def create_reader(self):
+        self.chunk = (1, *self.patch_size[0:3])
+        self.infer_path = Path(self.infer_path)
+        assert self.infer_path.exists(), "Infer path does not exist."
+        file_type = detect_path_type(self.infer_path)
+        if file_type == "zarr":
+            self.infer_reader = ZarrIOManager(self.infer_path, mode="r")
+        elif file_type == "ims":
+            self.infer_reader = IMSReader(self.infer_path)
+        else: raise FileNotFoundError(f"file type {file_type} is not supported.")
+
+    def create_writer(self):
+        self.infer_gt_path = Path(self.infer_gt_path)
+        if self.infer_gt_path.exists():
+            file_type = detect_path_type(self.infer_gt_path)
+            if file_type == "zarr": pass
+            elif file_type == "dir":
+                self.infer_gt_path = self.infer_gt_path / f"result{self.job_id}.ome.zarr"
+        else:
+            self.infer_gt_path.mkdir(parents=True, exist_ok=True)
+            if self.infer_gt_path.suffix == ".zarr": pass
+            elif self.infer_gt_path.is_dir():
+                self.infer_gt_path = self.infer_gt_path / f"result{self.job_id}.ome.zarr"
+        self.infer_writer = ZarrIOManager(self.infer_gt_path,
+                                          shape=(self.postpro_channel_num, *self.infer_reader.shape[1:4]),
+                                          dtype="uint16",
+                                          chunks=self.chunk,
+                                          mode="a",
+                                          channel_names=self.postpro_channel_info)
+
+
+    def define_postprocess_channels(self):
+        self.postpro_channel_num = 0
+        self.postpro_channel_info = []
+        self.instance_num = 0
+        self.semantic_num = 0
+        for channel in self.channels:
+            if channel in ["F", "C", "P"]:
+                self.instance_num += 1
+            if channel in ["A"]:
+                a_opts = self.channels_extra_opts.get("A",{"z_affinities": [1], "y_affinities": [1], "x_affinities": [1]})
+                z_aff = a_opts.get("z_affinities", [1])
+                y_aff = a_opts.get("y_affinities", [1])
+                x_aff = a_opts.get("x_affinities", [1])
+                assert len(z_aff) == len(y_aff) == len(x_aff), "z/y/x affinities should have the same length."
+                self.instance_num += 3 * len(z_aff)
+            if "S." in channel:
+                self.semantic_num += 1
+                self.postpro_channel_num += 1
+                self.postpro_channel_info.append(channel.replace("S.", ""))
+        if self.instance_num:
+            self.postpro_channel_num += 1
+            self.postpro_channel_info = tuple(["Infer_instance",] + self.postpro_channel_info)
+
+    def close_reader_writer(self):
+        self.infer_reader.close()
+        self.infer_writer.close()
 
     def train(self):
         print(f"{time_str()} preparing training data", flush=True)
@@ -323,8 +393,185 @@ class Segmentation_Workflow(Base_Workflow):
                     # Preserve the latest partial interval before stopping.
                     return
 
+    @torch.no_grad()
     def infer(self):
-        pass
+        # create and load model
+        print(f"{time_str()} preparing model", flush=True)
+        self.set_model()
+        print_model_parameters(self.model)
+        profile_forward_memory(self.model, input_shape=(self.batch_size, self.patch_size[-1], *self.patch_size[:-1],),
+                               device=self.device)
+        self.load_checkpoint()
+        self.model.eval()
+        self.define_postprocess_channels()
+        print(f"{time_str()} creating reader, writer and skeleton_manager", flush=True)
+        # create reader
+        self.create_reader()
+        # create writer
+        self.create_writer()
+        # create coordinate_iter
+        coord_iter = patch_coordinates_iter(self.infer_reader.shape[1:4], self.patch_size[0:3], self.infer_overlap, self.infer_padding)
+        # create skeleton-manager
+        self.create_skeleton()
+        # load saved infer log
+        self.load_infer_log()
+
+        try:
+            coord_list = []
+            skeleton_list = []
+            patch_num = -1
+            # start predict
+            for coord in coord_iter:
+                patch_num += 1
+                if patch_num < self.inferred_patch_num: continue
+                cropped = self.skeleton_manager.crop_skeletons(coord) # navis.NeuronList
+                if len(cropped) > 0:
+                    coord_list.append(coord)
+                    skeleton_list.append(cropped)
+                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] {len(cropped):04d} skeleton(s) in this patch", flush=True)
+                else:
+                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] no skeleton in this patch", flush=True)
+                if len(coord_list) == self.batch_size:
+                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] start inferring", flush=True)
+                    self._infer_one_batch(coord_list, skeleton_list)
+                    coord_list=[]
+                    skeleton_list=[]
+                    self.inferred_patch_num = patch_num
+                    self.save_infer_log()
+                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] results saved", flush=True)
+        finally:
+            try:
+                # build pyramid
+                self.infer_writer.build_pyramid(factors=[(1, 2, 2), (1, 4, 4), (2, 8, 8), ], mode="nearest")
+            finally:
+                # close reader and writer
+                self.close_reader_writer()
+
+    def _infer_one_batch(self, coord_list, skeleton_list):
+        raw_patch = self._get_infer_patch(coord_list)  # uint16/8
+        raw_patch = preprocess_img(np.transpose(raw_patch, (1, 0, 2, 3, 4)), self.preprocess_dict)  # float32 CBZYX
+        raw_patch = np.transpose(raw_patch, (1, 0, 2, 3, 4))
+        patch_tensor = torch.from_numpy(raw_patch.astype('float32')).to(self.device, non_blocking=True)
+        pred_patch = self.model(patch_tensor)
+        pred_patch = torch.sigmoid(pred_patch).cpu().numpy()
+
+        result_patch = np.zeros((self.batch_size, self.postpro_channel_num, *pred_patch[0].shape[1:]),
+                                dtype='uint16')  # B(postpro_num)ZYX
+        for i in range(len(coord_list)):
+            _pred = pred_patch[i]  # (instance_num+semantic_num)ZYX
+            _coord = coord_list[i]
+            _skeleton = skeleton_list[i]
+            _skeleton_label = self.skeleton_manager.create_cropped_skeleton_mask(_skeleton, _coord)
+            _start_id = 0
+            # reconstruct instance and post-processing
+            if self.instance_num:
+                result_patch[i, _start_id, ...] = watershed_with_sk(
+                    _pred[0:self.instance_num, ...],
+                    self.channels[0:self.instance_num],
+                    self.watershed_seed_channels,
+                    self.watershed_seed_channels_thresh,
+                    self.watershed_topographic_channel,
+                    self.watershed_growth_mask_channels,
+                    self.watershed_growth_mask_channels_thresh,
+                    skeleton_label=_skeleton_label)
+                result_patch[i, _start_id, ...] = post_processing_instance(result_patch[i, _start_id, ...], self.postprocess_dict)
+                _start_id += 1
+            # reconstruct semantic and post-processing
+            if self.semantic_num:
+                result_patch[i, _start_id:, ...] = np.uint16(_pred[self.instance_num:, ...] > 0.5)
+                result_patch[i, _start_id:, ...] = post_processing_semantic(result_patch[i, _start_id:, ...], self.postprocess_dict)
+        # start writing
+        self._writer_infer_patch(result_patch, coord_list)
+
+    def _get_infer_patch(self, coord_list):
+        img = np.zeros((self.batch_size, self.patch_size[3], *self.patch_size[0:3]), dtype=self.infer_reader.dtype)
+        for i in range(self.batch_size):
+            _coord = coord_list[i]
+            for j in range(self.patch_size[3]):
+                _img = self.infer_reader[self.infer_channel[j], _coord[0, 0]:_coord[0, 1], _coord[1, 0]:_coord[1, 1], _coord[2, 0]:_coord[2, 1]]
+                if _img.shape[1:] != img.shape[2:]:
+                    _img = reflect_padding_img(_img, img.shape[2:])
+                img[i, j, ...] = _img
+        return img
+
+    def _writer_infer_patch(self, result_patch, coord_list):
+        for i in range(result_patch.shape[0]): # BCZYX
+            _coord = coord_list[i]
+            _patch = result_patch[i, :, 0:_coord[0,1]-_coord[0,0], 0:_coord[1,1]-_coord[1,0], 0:_coord[2, 1]-_coord[2, 0]]
+            self.infer_writer.write_block(_patch, start=(0, _coord[0,0], _coord[1,0], _coord[2, 0]))
+
+    def save_infer_log(self) -> Path:
+        self.infer_log_path = Path(self.cfg.PATHS.RESULT_DIR.INFER_LOG)
+        self.infer_log_path.mkdir(parents=True, exist_ok=True)
+        log_path = self.infer_log_path / f"infer_log_{int(self.job_id):02d}.json"
+        payload = {
+            "job_id": int(self.job_id),
+            "inferred_patch_num": self.inferred_patch_num,
+            "ome_zarr_path": str(self.infer_gt_path),
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),}
+        temporary_path = log_path.with_name(f".{log_path.name}.{os.getpid()}.tmp")
+        try:
+            with temporary_path.open(
+                    mode="w",
+                    encoding="utf-8",
+                    newline="\n",
+            ) as file:
+                json.dump(
+                    payload,
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, log_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        return log_path
+
+    def load_infer_log(self):
+        """Load saved inference progress.
+
+        Returns ``(0, None)`` when no inference log exists. A malformed or
+        incompatible log raises an exception instead of silently restarting
+        from zero, because doing so could overwrite an existing partial
+        result.
+
+        Returns
+        -------
+        tuple[int, pathlib.Path or None]
+            ``(inferred_patch_num, ome_zarr_path)``.
+        """
+        self.inferred_patch_num = 0
+        log_path = Path(self.infer_log_path) / f"infer_log_{int(self.job_id):02d}.json"
+        if not log_path.exists():
+            return
+        if not log_path.is_file():
+            return
+        try:
+            with log_path.open(mode="r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Inference log is not valid JSON: {log_path}") from error
+        except OSError as error:
+            raise RuntimeError(f"Unable to read inference log: {log_path}") from error
+        saved_job_id = payload.get("job_id")
+        if isinstance(saved_job_id, bool) or not isinstance(saved_job_id, int) or saved_job_id != int(self.job_id):
+            raise ValueError(f"Inference log belongs to a different job: saved job_id={saved_job_id!r}, current job_id={self.job_id!r}.")
+        inferred_patch_num = payload.get("inferred_patch_num")
+        if isinstance(inferred_patch_num, bool) or not isinstance(inferred_patch_num, int) or inferred_patch_num < 0:
+            raise ValueError( f"Inference log contains an invalid inferred_patch_num: {inferred_patch_num!r}.")
+        self.inferred_patch_num = inferred_patch_num
+
+        infer_gt_path = payload.get("ome_zarr_path")
+        if not isinstance(infer_gt_path, str) or not infer_gt_path.strip():
+            raise ValueError("Inference log contains an invalid ome_zarr_path.")
+        infer_gt_path = Path(infer_gt_path)
+        assert infer_gt_path.samefile(self.infer_gt_path), "zarr path in config file and log file are different."
+
 
     def run(self):
         if self.cfg.TRAIN.ENABLE:

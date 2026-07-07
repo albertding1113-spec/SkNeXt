@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Dict
 from sknext.config.config import SkNeXt_Config, update_config, load_config
 from sknext.utils.utils import set_seed
-from sknext.run.workflow import Segmentation_Workflow
+from sknext.run.networkflow import Segmentation_Workflow
 
 
 class SkNeXt:

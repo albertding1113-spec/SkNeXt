@@ -2,6 +2,7 @@ from pathlib import Path
 import numpy as np
 import zarr
 import tifffile
+import h5py
 import hashlib
 import sys
 import struct
@@ -105,10 +106,10 @@ def test_zarr_nczyx_to_tif():
     手动测试函数：把保存好的 zarr 导出为 tif。
     根据你的路径修改 zarr_path 和 output_dir。
     """
-    zarr_path = r"E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\train\train.ome.zarr"
+    zarr_path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\train\train.ome.zarr"
 
     # 导出 raw patches
-    raw_output_dir = r"E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\debug_raw_tif"
+    raw_output_dir = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\debug_raw_tif"
     zarr_nczyx_to_tif(
         zarr_path=zarr_path,
         output_dir=raw_output_dir,
@@ -119,7 +120,7 @@ def test_zarr_nczyx_to_tif():
     )
 
     # 导出 label patches
-    label_output_dir = r"E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\debug_label_tif"
+    label_output_dir = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\debug_label_tif"
     zarr_nczyx_to_tif(
         zarr_path=zarr_path,
         output_dir=label_output_dir,
@@ -129,5 +130,60 @@ def test_zarr_nczyx_to_tif():
         overwrite=True,
     )
 
+def ims_dataset_info_reader():
+    ims_path = r"G:\Albert\data\260407_single_stack_imaris\Dense_Corpus_X155266.500_Y39850.800_Z08382.508.ims"
+    with h5py.File(ims_path, "r") as ims:
+        # 根目录属性
+        print("Root attributes:")
+        for key, value in ims.attrs.items():
+            print(key, value)
+        def print_structure(name, obj):
+            if isinstance(obj, h5py.Group):
+                print(f"[Group]   /{name}")
+            elif isinstance(obj, h5py.Dataset):
+                print(
+                    f"[Dataset] /{name}\n"
+                    f"          shape={obj.shape}\n"
+                    f"          dtype={obj.dtype}\n"
+                    f"          chunks={obj.chunks}\n"
+                    f"          compression={obj.compression}"
+                )
+            for key, value in obj.attrs.items():
+                print(f"          @{key}={value}")
+        ims.visititems(print_structure)
+        # 读取原始分辨率、第一个时间点、第一个通道
+        data_path = (
+            "/DataSet/ResolutionLevel 0/"
+            "TimePoint 0/Channel 0/Data"
+        )
+        if data_path in ims:
+            dataset = ims[data_path]
+            print("Image dataset information:")
+            print("shape:", dataset.shape)
+            print("dtype:", dataset.dtype)
+            print("chunks:", dataset.chunks)
+            print("compression:", dataset.compression)
+            # 只读取一个小区域，避免加载完整图像
+            small_block = dataset[0:10, 0:256, 0:256]
+            print("Small block shape:", small_block.shape)
+
 if __name__ == "__main__":
-    test_zarr_nczyx_to_tif()
+    import os
+    import site
+    import sys
+
+    print("Python executable:")
+    print(sys.executable)
+
+    print("\nPython version:")
+    print(sys.version)
+
+    print("\nEnvironment prefix:")
+    print(sys.prefix)
+
+    print("\nSite-packages:")
+    for path in site.getsitepackages():
+        print(path)
+
+    print("\nPATH:")
+    print(os.environ.get("PATH"))

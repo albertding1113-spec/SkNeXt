@@ -94,6 +94,130 @@ def calculate_patch_coordinates(img_shape: tuple[int]|list[int], # CZYX / ZYX
     return patch_coordinates
 
 
+def patch_coordinates_iter(
+    img_shape: tuple[int, int, int] | list[int],
+    patch_size: tuple[int, int, int] | list[int],
+    overlap: tuple[int, int, int] | list[int],
+    padding: tuple[int, int, int] | list[int],
+) -> Iterator[np.ndarray]:
+    """
+    Generate 3D patch coordinates lazily.
+
+    Parameters
+    ----------
+    img_shape : sequence of int
+        Image shape in ZYX order.
+
+    patch_size : sequence of int
+        Patch size in ZYX order.
+
+    overlap : sequence of int
+        Overlap size in voxels, in ZYX order.
+
+    padding : sequence of int
+        Invalid border width on each side of a predicted patch,
+        in ZYX order.
+
+    Yields
+    ------
+    np.ndarray
+        Coordinate array with shape (3, 2):
+        [
+            [z_min, z_max],
+            [y_min, y_max],
+            [x_min, x_max],
+        ]
+        Maximum coordinates are exclusive, so they can be used
+        directly for NumPy slicing.
+    """
+    if len(img_shape) != 3:
+        raise ValueError("img_shape must contain three values in ZYX order.")
+    if len(patch_size) != 3:
+        raise ValueError("patch_size must contain three values in ZYX order.")
+    if len(overlap) != 3:
+        raise ValueError("overlap must contain three values in ZYX order.")
+    if len(padding) != 3:
+        raise ValueError("padding must contain three values in ZYX order.")
+    img_shape_array = np.asarray(img_shape, dtype=np.int64)
+    patch_size_array = np.asarray(patch_size, dtype=np.int64)
+    overlap_array = np.asarray(overlap, dtype=np.int64)
+    padding_array = np.asarray(padding, dtype=np.int64)
+    if np.any(img_shape_array <= 0):
+        raise ValueError(f"All image dimensions must be positive, got {img_shape_array.tolist()}.")
+    if np.any(patch_size_array <= 0):
+        raise ValueError(f"All patch dimensions must be positive, got {patch_size_array.tolist()}.")
+    if np.any(overlap_array < 0):
+        raise ValueError(f"overlap must be non-negative, got {overlap_array.tolist()}.")
+    if np.any(padding_array < 0):
+        raise ValueError(f"padding must be non-negative, got {padding_array.tolist()}.")
+    # Distance between the starting positions of adjacent patches.
+    step = (patch_size_array - 2 * padding_array - overlap_array)
+    if np.any(step <= 0):
+        raise ValueError(f"patch_size - 2 * padding - overlap must be positive on every axis, but got step={step.tolist()}.")
+
+    def axis_start_positions(
+        axis_size: int,
+        axis_patch_size: int,
+        axis_step: int,
+    ) -> list[int]:
+        """
+        Generate patch starting positions along one axis.
+
+        The final patch is aligned with the end of the image so that it
+        normally retains the requested patch size.
+        """
+        # The image is smaller than one patch. The returned coordinate
+        # will be clipped to the image boundary, and the caller can pad it.
+        if axis_size <= axis_patch_size:
+            return [0]
+        last_start = axis_size - axis_patch_size
+        starts = list(range(0,last_start + 1,axis_step,))
+        # Ensure that the final patch reaches the image boundary.
+        if starts[-1] != last_start:
+            starts.append(last_start)
+        return starts
+
+    z_starts = axis_start_positions(
+        int(img_shape_array[0]),
+        int(patch_size_array[0]),
+        int(step[0]),
+    )
+    y_starts = axis_start_positions(
+        int(img_shape_array[1]),
+        int(patch_size_array[1]),
+        int(step[1]),
+    )
+    x_starts = axis_start_positions(
+        int(img_shape_array[2]),
+        int(patch_size_array[2]),
+        int(step[2]),
+    )
+
+    for z_min in z_starts:
+        z_max = min(
+            z_min + int(patch_size_array[0]),
+            int(img_shape_array[0]),
+        )
+        for y_min in y_starts:
+            y_max = min(
+                y_min + int(patch_size_array[1]),
+                int(img_shape_array[1]),
+            )
+            for x_min in x_starts:
+                x_max = min(
+                    x_min + int(patch_size_array[2]),
+                    int(img_shape_array[2]),
+                )
+                yield np.asarray(
+                    [
+                        [z_min, z_max],
+                        [y_min, y_max],
+                        [x_min, x_max],
+                    ],
+                    dtype=np.int64,
+                )
+
+
 def patch_coordinates_generator(img:np.ndarray, # CZYX / ZYX
                                 patch_coordinates:np.ndarray)->Iterator[np.ndarray, np.ndarray]:
     if img.ndim == 4:

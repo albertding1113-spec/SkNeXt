@@ -4,10 +4,10 @@ import numpy as np
 
 def preprocess_img(img: np.ndarray,
                    preprocess_dict:dict) -> np.ndarray:
-    assert img.ndim == 4, "img must be 4D in CZYX axes."
+    assert img.ndim in (4, 5), "img must be 4D in CZYX axes or 5D in CBZYX axes."
 
     for i in range(img.shape[0]):
-        new_img = img[i, :, :, :].copy()
+        new_img = img[i, ...].copy()
         # start percentile_clip_img
         perc_clip = preprocess_dict.get("perc_clip", False)
         perc_clip_range = preprocess_dict.get("perc_clip_range", None)
@@ -21,7 +21,7 @@ def preprocess_img(img: np.ndarray,
             new_img = normalize_img(new_img, norm_type)
         if i==0:
             returned_img = np.zeros_like(img, dtype=new_img.dtype)
-        returned_img[i, :, :, :] = new_img
+        returned_img[i, ...] = new_img
     return returned_img
 
 
