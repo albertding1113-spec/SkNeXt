@@ -14,7 +14,7 @@ import tifffile
 class SkeletonManager():
     def __init__(self,
                  sk_path: str | Path,
-                 node_distance: float | Iterable[float] = [3,20,20],):
+                 node_distance: float | Iterable[float] = [3,10,10],):
         self.path = Path(sk_path)
         assert self.path.exists() and self.path.is_dir(), "skeleton path does not exist"
         self.skeletons = navis.read_swc(sk_path)

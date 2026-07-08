@@ -68,7 +68,7 @@ class Base_Workflow(ABC):
         self.lr_scheduler_name = cfg.TRAIN.LR_SCHEDULER.NAME
         self.min_lr = cfg.TRAIN.LR_SCHEDULER.MIN_LR
         self.warmup_cosine_decay_epochs = cfg.TRAIN.LR_SCHEDULER.WARMUP_COSINE_DECAY_EPOCHS
-        self.infer_log_path = cfg.PATHS.RESULT_DIR.INFER_LOG
+        self.infer_log_path = cfg.PATHS.INFER.INFER_LOG
 
 
     def get_preprocess_dict(self):

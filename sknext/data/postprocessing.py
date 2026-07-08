@@ -3,40 +3,118 @@ from scipy import ndimage as ndi
 from typing import Literal, Sequence
 
 
-def post_processing_instance(label:np.ndarray, process_dict: dict):
-    assert label.ndim == 4 # CZYX
+def post_processing_instance(label: np.ndarray, process_dict: dict):
+    """
+    Post-process instance segmentation labels.
+
+    Supported input shapes:
+    - 3D: ZYX
+    - 4D: CZYX
+
+    Returns
+    -------
+    np.ndarray
+        Same shape and dtype as input.
+    """
+    label = np.asarray(label)
+
+    if label.ndim not in (3, 4):
+        raise ValueError(
+            f"`label` must be 3D ZYX or 4D CZYX, but got shape {label.shape}."
+        )
+
     output = label.copy()
-    channel_num = label.shape[0]
-    fill_holes = process_dict.get("fill_holes", False)
-    if fill_holes:
-        for i in range(channel_num):
-            output[i,:,:,:] = fill_instance_holes(output[i,:,:,:])
+
+    fill_holes = bool(process_dict.get("fill_holes", False))
+
     remove_small = process_dict.get("remove_small", -1)
-    if remove_small > 0:
-        for i in range(channel_num):
-            output[i,:,:,:] = remove_small_instances(output[i,:,:,:], remove_small)
+    remove_small = -1 if remove_small is None else int(remove_small)
+
     remove_large = process_dict.get("remove_large", -1)
-    if remove_large > 0:
-        for i in range(channel_num):
-            output[i,:,:,:] = remove_large_instances(output[i,:,:,:], remove_large)
+    remove_large = -1 if remove_large is None else int(remove_large)
+
+    def _process_one_channel(one_label: np.ndarray) -> np.ndarray:
+        """Process one ZYX instance-label volume."""
+        processed = one_label.copy()
+
+        if fill_holes:
+            processed = fill_instance_holes(processed)
+
+        if remove_small > 0:
+            processed = remove_small_instances(processed, remove_small)
+
+        if remove_large > 0:
+            processed = remove_large_instances(processed, remove_large)
+
+        return processed
+
+    # 3D: ZYX
+    if label.ndim == 3:
+        output = _process_one_channel(output)
+
+    # 4D: CZYX
+    else:
+        channel_num = output.shape[0]
+        for c in range(channel_num):
+            output[c, :, :, :] = _process_one_channel(output[c, :, :, :])
+
     return output
 
 def post_processing_semantic(label: np.ndarray, process_dict: dict):
-    assert label.ndim == 4 #CZYX
+    """
+    Post-process semantic segmentation labels.
+
+    Supported input shapes:
+    - 3D: ZYX
+    - 4D: CZYX
+
+    Notes
+    -----
+    For 3D input, the function treats it as one semantic label volume.
+    For 4D input, each channel is processed independently.
+    """
+    label = np.asarray(label)
+
+    if label.ndim not in (3, 4):
+        raise ValueError(
+            f"`label` must be 3D ZYX or 4D CZYX, but got shape {label.shape}."
+        )
+
     output = label.copy()
-    channel_num = label.shape[0]
-    fill_holes = process_dict.get("fill_holes", False)
-    if fill_holes:
-        for i in range(channel_num):
-            output[i, :, :, :] = fill_semantic_holes(output[i, :, :, :])
+
+    fill_holes = bool(process_dict.get("fill_holes", False))
+
     remove_small = process_dict.get("remove_small", -1)
-    if remove_small > 0:
-        for i in range(channel_num):
-            output[i, :, :, :] = remove_small_semantics(output[i, :, :, :], remove_small)
+    remove_small = -1 if remove_small is None else int(remove_small)
+
     remove_large = process_dict.get("remove_large", -1)
-    if remove_large > 0:
-        for i in range(channel_num):
-            output[i, :, :, :] = remove_large_semantics(output[i, :, :, :], remove_large)
+    remove_large = -1 if remove_large is None else int(remove_large)
+
+    def _process_one_channel(one_label: np.ndarray) -> np.ndarray:
+        """Process one ZYX semantic-label volume."""
+        processed = one_label.copy()
+
+        if fill_holes:
+            processed = fill_semantic_holes(processed)
+
+        if remove_small > 0:
+            processed = remove_small_semantics(processed, remove_small)
+
+        if remove_large > 0:
+            processed = remove_large_semantics(processed, remove_large)
+
+        return processed
+
+    # 3D: ZYX
+    if label.ndim == 3:
+        output = _process_one_channel(output)
+
+    # 4D: CZYX
+    else:
+        channel_num = output.shape[0]
+        for c in range(channel_num):
+            output[c, :, :, :] = _process_one_channel(output[c, :, :, :])
+
     return output
 
 def fill_instance_holes(

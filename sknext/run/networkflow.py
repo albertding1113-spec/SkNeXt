@@ -428,17 +428,16 @@ class Segmentation_Workflow(Base_Workflow):
                 if len(cropped) > 0:
                     coord_list.append(coord)
                     skeleton_list.append(cropped)
-                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] {len(cropped):04d} skeleton(s) in this patch", flush=True)
-                else:
-                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] no skeleton in this patch", flush=True)
+                    print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] {len(cropped):04d} skeleton(s) in this patch", flush=True)
+                # else: print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] no skeleton in this patch", flush=True)
                 if len(coord_list) == self.batch_size:
-                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] start inferring", flush=True)
+                    print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] start inferring", flush=True)
                     self._infer_one_batch(coord_list, skeleton_list)
                     coord_list=[]
                     skeleton_list=[]
                     self.inferred_patch_num = patch_num
                     self.save_infer_log()
-                    print(f"{time_str()} [PATCH{patch_num:06d}] [INFER] results saved", flush=True)
+                    print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] results saved", flush=True)
         finally:
             try:
                 # build pyramid
@@ -501,7 +500,7 @@ class Segmentation_Workflow(Base_Workflow):
             self.infer_writer.write_block(_patch, start=(0, _coord[0,0], _coord[1,0], _coord[2, 0]))
 
     def save_infer_log(self) -> Path:
-        self.infer_log_path = Path(self.cfg.PATHS.RESULT_DIR.INFER_LOG)
+        self.infer_log_path = Path(self.cfg.PATHS.INFER.INFER_LOG)
         self.infer_log_path.mkdir(parents=True, exist_ok=True)
         log_path = self.infer_log_path / f"infer_log_{int(self.job_id):02d}.json"
         payload = {

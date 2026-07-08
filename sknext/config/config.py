@@ -24,7 +24,6 @@ class SkNeXt_Config:
         _C.PATHS.RESULT_DIR.PATH = './result'
         _C.PATHS.RESULT_DIR.PATH_ = os.path.join(_C.PATHS.RESULT_DIR.PATH, "results", str(job_id))
         _C.PATHS.RESULT_DIR.OUTPUT_LOG = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "log")
-        _C.PATHS.RESULT_DIR.INFER_LOG = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "infer_log")
         _C.PATHS.RESULT_DIR.OUTPUT_CHART = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "chart")
         _C.PATHS.RESULT_DIR.OUTPUT_RAW = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "output_raw")
         _C.PATHS.RESULT_DIR.OUTPUT_INSTANCES = os.path.join(_C.PATHS.RESULT_DIR.PATH_, "output_instances")
@@ -147,6 +146,8 @@ class SkNeXt_Config:
         _C.DATA.INFER.INPUT_AXES_ORDER = "TCZYX"
         # 3.3.1 SKELETON
         _C.DATA.INFER.SKELETON_PATH = "./skeleton/"
+        # Infer log
+        _C.PATHS.INFER.INFER_LOG = os.path.join(Path(_C.DATA.INFER.PATH).parent, "infer_log")
 
         # 5. AUGMENTOR
         _C.AUGMENTOR = CN()
@@ -379,7 +380,7 @@ def update_config(cfg:CN, new_cfg:CN, job_id:Optional[str|int]) -> CN:
     _update_recursive(cfg, new_cfg)
     cfg.PATHS.RESULT_DIR.PATH_ = os.path.join(cfg.PATHS.RESULT_DIR.PATH, "results", str(job_id))
     cfg.PATHS.RESULT_DIR.OUTPUT_LOG = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "log")
-    cfg.PATHS.RESULT_DIR.INFER_LOG = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "infer_log")
+    cfg.PATHS.INFER.INFER_LOG = os.path.join(Path(cfg.DATA.INFER.PATH).parent, "infer_log")
     cfg.PATHS.RESULT_DIR.OUTPUT_CHART = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "chart")
     cfg.PATHS.RESULT_DIR.OUTPUT_RAW = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_raw")
     cfg.PATHS.RESULT_DIR.OUTPUT_INSTANCES = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_instances")

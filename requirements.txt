@@ -23,6 +23,7 @@ h5py
 # Zarr v3 storage
 zarr
 numcodecs
+dask
 
 # Training metrics, losses, and logging
 torchmetrics
