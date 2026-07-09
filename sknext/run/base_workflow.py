@@ -68,8 +68,17 @@ class Base_Workflow(ABC):
         self.lr_scheduler_name = cfg.TRAIN.LR_SCHEDULER.NAME
         self.min_lr = cfg.TRAIN.LR_SCHEDULER.MIN_LR
         self.warmup_cosine_decay_epochs = cfg.TRAIN.LR_SCHEDULER.WARMUP_COSINE_DECAY_EPOCHS
-        self.infer_log_path = cfg.PATHS.INFER.INFER_LOG
-
+        self.infer_log_path = cfg.DATA.INFER.INFER_LOG
+        self.channels = self.cfg.TASK.CHANNELS
+        self.channels_extra_opts = cfg.TASK.CHANNELS_EXTRA_OPTS[0] if len(cfg.TASK.CHANNELS_EXTRA_OPTS[0]) else {}
+        self.channel_weights = cfg.TASK.CHANNEL_WEIGHTS
+        self.watershed_seed_channels = cfg.TASK.WATERSHED.SEED_CHANNELS
+        self.watershed_seed_channels_thresh = cfg.TASK.WATERSHED.SEED_CHANNELS_THRESH
+        self.watershed_topographic_channel = cfg.TASK.WATERSHED.TOPOGRAPHIC_SURFACE_CHANNEL
+        self.watershed_growth_mask_channels = cfg.TASK.WATERSHED.GROWTH_MASK_CHANNELS
+        self.watershed_growth_mask_channels_thresh = cfg.TASK.WATERSHED.GROWTH_MASK_CHANNELS_THRESH
+        self.block_factor = cfg.DATA.INFER.BLOCK_FACTOR
+        self.block_size = np.int64(np.array(self.block_factor)* np.array(self.patch_size[0:3]))
 
     def get_preprocess_dict(self):
         preprocess_dict = {}

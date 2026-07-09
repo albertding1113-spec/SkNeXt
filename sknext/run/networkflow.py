@@ -31,14 +31,6 @@ from sknext.skeleton.skeleton import SkeletonManager
 class Segmentation_Workflow(Base_Workflow):
     def __init__(self, cfg, device:torch.device, job_id:int):
         super(Segmentation_Workflow, self).__init__(cfg, device, job_id)
-        self.channels = self.cfg.TASK.CHANNELS
-        self.channels_extra_opts = cfg.TASK.CHANNELS_EXTRA_OPTS[0] if len(cfg.TASK.CHANNELS_EXTRA_OPTS[0]) else {}
-        self.channel_weights = cfg.TASK.CHANNEL_WEIGHTS
-        self.watershed_seed_channels = cfg.TASK.WATERSHED.SEED_CHANNELS
-        self.watershed_seed_channels_thresh = cfg.TASK.WATERSHED.SEED_CHANNELS_THRESH
-        self.watershed_topographic_channel = cfg.TASK.WATERSHED.TOPOGRAPHIC_SURFACE_CHANNEL
-        self.watershed_growth_mask_channels = cfg.TASK.WATERSHED.GROWTH_MASK_CHANNELS
-        self.watershed_growth_mask_channels_thresh = cfg.TASK.WATERSHED.GROWTH_MASK_CHANNELS_THRESH
         self.best_val_loss = float("inf")
         # Store the same scalar values that are written to SummaryWriter.
         # Structure: {"Loss": {"train_loss": [(epoch, value), ...], "val_loss": [(epoch, value), ...]}}
@@ -410,94 +402,94 @@ class Segmentation_Workflow(Base_Workflow):
         # create writer
         self.create_writer()
         # create coordinate_iter
-        coord_iter = patch_coordinates_iter(self.infer_reader.shape[1:4], self.patch_size[0:3], self.infer_overlap, self.infer_padding)
+        coord_iter = patch_coordinates_iter(self.infer_reader.shape[1:4], self.block_size)
+        total_block_num = int(np.prod(np.ceil(
+            np.array(self.infer_reader.shape[1:4], dtype="float32") / np.array(self.block_size, dtype="float32"))))
         # create skeleton-manager
         self.create_skeleton()
         # load saved infer log
         self.load_infer_log()
 
         try:
-            coord_list = []
-            skeleton_list = []
-            patch_num = -1
+            block_num = -1
             # start predict
             for coord in coord_iter:
-                patch_num += 1
-                if patch_num < self.inferred_patch_num: continue
-                cropped = self.skeleton_manager.crop_skeletons(coord) # navis.NeuronList
-                if len(cropped) > 0:
-                    coord_list.append(coord)
-                    skeleton_list.append(cropped)
-                    print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] {len(cropped):04d} skeleton(s) in this patch", flush=True)
-                # else: print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] no skeleton in this patch", flush=True)
-                if len(coord_list) == self.batch_size:
-                    print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] start inferring", flush=True)
-                    self._infer_one_batch(coord_list, skeleton_list)
-                    coord_list=[]
-                    skeleton_list=[]
-                    self.inferred_patch_num = patch_num
+                block_num += 1
+                if block_num < self.inferred_block_num: continue
+                cropped_skeleton = self.skeleton_manager.crop_skeletons(coord) # navis.NeuronList
+                if len(cropped_skeleton) > 0:
+                    print(f"{time_str()} [BLOCK{block_num:07d}/{total_block_num:07d}] [INFER] {len(cropped_skeleton):04d} skeleton(s) in this block, start inferring", flush=True)
+                    self._infer_one_block(coord, cropped_skeleton)
+                    self.inferred_block_num = block_num + 1
                     self.save_infer_log()
-                    print(f"{time_str()} [PATCH{patch_num:08d}] [INFER] results saved", flush=True)
+                    print(f"{time_str()} [BLOCK{block_num:07d}/{total_block_num:07d}] [INFER] results saved", flush=True)
+                else: self.save_infer_log()
         finally:
             try:
                 # build pyramid
+                print(f"{time_str()}, start building pyramid", flush=True)
                 self.infer_writer.build_pyramid(factors=[(1, 2, 2), (1, 4, 4), (2, 8, 8), ], mode="nearest")
             finally:
                 # close reader and writer
                 self.close_reader_writer()
 
-    def _infer_one_batch(self, coord_list, skeleton_list):
-        raw_patch = self._get_infer_patch(coord_list)  # uint16/8
-        raw_patch = preprocess_img(np.transpose(raw_patch, (1, 0, 2, 3, 4)), self.preprocess_dict)  # float32 CBZYX
-        raw_patch = np.transpose(raw_patch, (1, 0, 2, 3, 4))
-        patch_tensor = torch.from_numpy(raw_patch.astype('float32')).to(self.device, non_blocking=True)
-        pred_patch = self.model(patch_tensor)
-        pred_patch = torch.sigmoid(pred_patch).cpu().numpy()
+    def _infer_one_block(self, coord, skeleton):
+        block_size = np.array((self.patch_size[3], *coord[:,1]-coord[:,0]))
+        block_raw = np.zeros((block_size), dtype=self.infer_reader.dtype) # CZYX
+        for i in range(self.patch_size[3]):
+            block_raw[i, ...] = self.infer_reader[self.infer_channel[i], coord[0, 0]:coord[0, 1], coord[1, 0]:coord[1, 1], coord[2, 0]:coord[2, 1]]
+        block_raw = preprocess_img(block_raw, self.preprocess_dict)
+        block_pred = np.zeros((self.out_channel_num, *block_size[1:4]), dtype='float32')
+        block_result = np.zeros((self.postpro_channel_num, *block_size[1:4]), dtype='uint16')
+        p_coord_iter = patch_coordinates_iter(block_size[1:4], self.patch_size[0:3], self.infer_overlap, self.infer_padding)
+        # start inferring block
+        p_coord_list = []
+        for _p_coord in p_coord_iter:
+            p_coord_list.append(_p_coord)
+            if len(p_coord_list) == self.batch_size:
+                block_pred = self._infer_one_batch(block_pred, block_raw, p_coord_list)
+                p_coord_list = []
+        if len(p_coord_list) > 0:
+            block_pred = self._infer_one_batch(block_pred, block_raw, p_coord_list)
+        # start post_processing
+        skeleton_label = self.skeleton_manager.create_cropped_skeleton_mask(skeleton, coord)
+        _start_id = 0
+        if self.instance_num:
+            block_result[_start_id, ...] = watershed_with_sk(
+                        block_pred[0:self.instance_num, ...],
+                        self.channels[0:self.instance_num],
+                        self.watershed_seed_channels,
+                        self.watershed_seed_channels_thresh,
+                        self.watershed_topographic_channel,
+                        self.watershed_growth_mask_channels,
+                        self.watershed_growth_mask_channels_thresh,
+                        skeleton_label=skeleton_label)
+            block_result[_start_id, ...] = post_processing_instance(block_result[_start_id, ...], self.postprocess_dict)
+            _start_id += 1
+        if self.semantic_num:
+            block_result[_start_id:, ...] = np.uint16(block_pred[self.instance_num:, ...] > 0.5)
+            block_result[_start_id:, ...] = post_processing_semantic(block_result[_start_id:, ...], self.postprocess_dict)
+        # writing block to writer
+        self.infer_writer.write_block(block_result,  start=(0, coord[0,0], coord[1,0], coord[2, 0]))
 
-        result_patch = np.zeros((self.batch_size, self.postpro_channel_num, *pred_patch[0].shape[1:]),
-                                dtype='uint16')  # B(postpro_num)ZYX
-        for i in range(len(coord_list)):
-            _pred = pred_patch[i]  # (instance_num+semantic_num)ZYX
-            _coord = coord_list[i]
-            _skeleton = skeleton_list[i]
-            _skeleton_label = self.skeleton_manager.create_cropped_skeleton_mask(_skeleton, _coord)
-            _start_id = 0
-            # reconstruct instance and post-processing
-            if self.instance_num:
-                result_patch[i, _start_id, ...] = watershed_with_sk(
-                    _pred[0:self.instance_num, ...],
-                    self.channels[0:self.instance_num],
-                    self.watershed_seed_channels,
-                    self.watershed_seed_channels_thresh,
-                    self.watershed_topographic_channel,
-                    self.watershed_growth_mask_channels,
-                    self.watershed_growth_mask_channels_thresh,
-                    skeleton_label=_skeleton_label)
-                result_patch[i, _start_id, ...] = post_processing_instance(result_patch[i, _start_id, ...], self.postprocess_dict)
-                _start_id += 1
-            # reconstruct semantic and post-processing
-            if self.semantic_num:
-                result_patch[i, _start_id:, ...] = np.uint16(_pred[self.instance_num:, ...] > 0.5)
-                result_patch[i, _start_id:, ...] = post_processing_semantic(result_patch[i, _start_id:, ...], self.postprocess_dict)
-        # start writing
-        self._writer_infer_patch(result_patch, coord_list)
 
-    def _get_infer_patch(self, coord_list):
-        img = np.zeros((self.batch_size, self.patch_size[3], *self.patch_size[0:3]), dtype=self.infer_reader.dtype)
-        for i in range(self.batch_size):
-            _coord = coord_list[i]
-            for j in range(self.patch_size[3]):
-                _img = self.infer_reader[self.infer_channel[j], _coord[0, 0]:_coord[0, 1], _coord[1, 0]:_coord[1, 1], _coord[2, 0]:_coord[2, 1]]
-                if _img.shape[1:] != img.shape[2:]:
-                    _img = reflect_padding_img(_img, img.shape[2:])
-                img[i, j, ...] = _img
-        return img
+    def _infer_one_batch(self, block_pred, block_raw, p_coord_list):
+        patch_raw = np.zeros((self.batch_size, self.patch_size[3], *self.patch_size[0:3]), dtype=block_raw.dtype) # BCZYX
+        for i in range(len(p_coord_list)):
+            _coord = p_coord_list[i]
+            _patch = block_raw[:, _coord[0, 0]:_coord[0, 1], _coord[1, 0]:_coord[1, 1], _coord[2, 0]:_coord[2, 1]] #CZYX
+            if _patch.shape[1:4] != patch_raw.shape[2:5]:
+                _patch = reflect_padding_img(_patch, patch_raw.shape[2:5])
+            patch_raw[i, ...] = _patch
+        patch_tensor = torch.from_numpy(patch_raw.astype('float32')).to(self.device, non_blocking=True)
+        patch_pred = self.model(patch_tensor) # B(out_channel_num)ZYX
+        patch_pred = torch.sigmoid(patch_pred).cpu().numpy()
+        for i in range(len(p_coord_list)):
+            _coord = p_coord_list[i]
+            block_pred[:, _coord[0, 0]:_coord[0, 1], _coord[1, 0]:_coord[1, 1], _coord[2, 0]:_coord[2, 1]] = patch_pred[
+                i, :, 0:_coord[0, 1] - _coord[0, 0], 0:_coord[1, 1] - _coord[1, 0], 0:_coord[2, 1] - _coord[2, 0]]
+        return block_pred
 
-    def _writer_infer_patch(self, result_patch, coord_list):
-        for i in range(result_patch.shape[0]): # BCZYX
-            _coord = coord_list[i]
-            _patch = result_patch[i, :, 0:_coord[0,1]-_coord[0,0], 0:_coord[1,1]-_coord[1,0], 0:_coord[2, 1]-_coord[2, 0]]
-            self.infer_writer.write_block(_patch, start=(0, _coord[0,0], _coord[1,0], _coord[2, 0]))
 
     def save_infer_log(self) -> Path:
         self.infer_log_path = Path(self.cfg.PATHS.INFER.INFER_LOG)
@@ -505,7 +497,7 @@ class Segmentation_Workflow(Base_Workflow):
         log_path = self.infer_log_path / f"infer_log_{int(self.job_id):02d}.json"
         payload = {
             "job_id": int(self.job_id),
-            "inferred_patch_num": self.inferred_patch_num,
+            "inferred_block_num": self.inferred_block_num,
             "ome_zarr_path": str(self.infer_gt_path),
             "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),}
         temporary_path = log_path.with_name(f".{log_path.name}.{os.getpid()}.tmp")
@@ -542,9 +534,9 @@ class Segmentation_Workflow(Base_Workflow):
         Returns
         -------
         tuple[int, pathlib.Path or None]
-            ``(inferred_patch_num, ome_zarr_path)``.
+            ``(inferred_block_num, ome_zarr_path)``.
         """
-        self.inferred_patch_num = 0
+        self.inferred_block_num = 0
         log_path = Path(self.infer_log_path) / f"infer_log_{int(self.job_id):02d}.json"
         if not log_path.exists():
             return
@@ -560,10 +552,10 @@ class Segmentation_Workflow(Base_Workflow):
         saved_job_id = payload.get("job_id")
         if isinstance(saved_job_id, bool) or not isinstance(saved_job_id, int) or saved_job_id != int(self.job_id):
             raise ValueError(f"Inference log belongs to a different job: saved job_id={saved_job_id!r}, current job_id={self.job_id!r}.")
-        inferred_patch_num = payload.get("inferred_patch_num")
-        if isinstance(inferred_patch_num, bool) or not isinstance(inferred_patch_num, int) or inferred_patch_num < 0:
-            raise ValueError( f"Inference log contains an invalid inferred_patch_num: {inferred_patch_num!r}.")
-        self.inferred_patch_num = inferred_patch_num
+        inferred_block_num = payload.get("inferred_block_num")
+        if isinstance(inferred_block_num, bool) or not isinstance(inferred_block_num, int) or inferred_block_num < 0:
+            raise ValueError( f"Inference log contains an invalid inferred_block_num: {inferred_block_num!r}.")
+        self.inferred_block_num = inferred_block_num
 
         infer_gt_path = payload.get("ome_zarr_path")
         if not isinstance(infer_gt_path, str) or not infer_gt_path.strip():

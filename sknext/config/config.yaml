@@ -34,7 +34,6 @@ DATA:
         PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer'
         GT_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer\label'
         CHANNEL: [0]
-        CHANNEL_NAME: 'result0'
         SKELETON_PATH: 'E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\infer'
 
 AUGMENTOR:

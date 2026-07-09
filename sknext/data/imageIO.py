@@ -97,8 +97,8 @@ def calculate_patch_coordinates(img_shape: tuple[int]|list[int], # CZYX / ZYX
 def patch_coordinates_iter(
     img_shape: tuple[int, int, int] | list[int],
     patch_size: tuple[int, int, int] | list[int],
-    overlap: tuple[int, int, int] | list[int],
-    padding: tuple[int, int, int] | list[int],
+    overlap: tuple[int, int, int] | list[int] = (0,0,0),
+    padding: tuple[int, int, int] | list[int] = (0,0,0),
 ) -> Iterator[np.ndarray]:
     """
     Generate 3D patch coordinates lazily.

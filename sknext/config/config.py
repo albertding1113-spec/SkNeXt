@@ -132,6 +132,8 @@ class SkNeXt_Config:
         _C.DATA.INFER = CN()
         _C.DATA.INFER.PATH = "./raw/"
         _C.DATA.INFER.GT_PATH = "./label/"
+        # Infer log
+        _C.DATA.INFER.INFER_LOG = os.path.join(Path(_C.DATA.INFER.PATH).parent, "infer_log")
         # Whether to write results into original "hdf5"/"imaris"/"ome-zarr" files.
         _C.DATA.INFER.RESULT_INTO_FILE = True
         # Index of channel in "hdf5"/"imaris"/"ome-zarr" file used when inferring.
@@ -142,12 +144,13 @@ class SkNeXt_Config:
         _C.DATA.INFER.OVERLAP = (0, 0, 0)
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
         _C.DATA.INFER.PADDING = (0, 0, 0)
+        # Block used in inferring and watershed. Block size = BLOCK_FACTOR * PATCH_SIZE
+        _C.DATA.INFER.BLOCK_FACTOR = (6, 4, 4)
         # Order of the axes of the image when using Zarr/hdf5 images.
         _C.DATA.INFER.INPUT_AXES_ORDER = "TCZYX"
         # 3.3.1 SKELETON
         _C.DATA.INFER.SKELETON_PATH = "./skeleton/"
-        # Infer log
-        _C.PATHS.INFER.INFER_LOG = os.path.join(Path(_C.DATA.INFER.PATH).parent, "infer_log")
+
 
         # 5. AUGMENTOR
         _C.AUGMENTOR = CN()
@@ -380,7 +383,7 @@ def update_config(cfg:CN, new_cfg:CN, job_id:Optional[str|int]) -> CN:
     _update_recursive(cfg, new_cfg)
     cfg.PATHS.RESULT_DIR.PATH_ = os.path.join(cfg.PATHS.RESULT_DIR.PATH, "results", str(job_id))
     cfg.PATHS.RESULT_DIR.OUTPUT_LOG = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "log")
-    cfg.PATHS.INFER.INFER_LOG = os.path.join(Path(cfg.DATA.INFER.PATH).parent, "infer_log")
+    cfg.DATA.INFER.INFER_LOG = os.path.join(Path(cfg.DATA.INFER.PATH).parent, "infer_log")
     cfg.PATHS.RESULT_DIR.OUTPUT_CHART = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "chart")
     cfg.PATHS.RESULT_DIR.OUTPUT_RAW = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_raw")
     cfg.PATHS.RESULT_DIR.OUTPUT_INSTANCES = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_instances")
