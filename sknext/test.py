@@ -6,6 +6,8 @@ import h5py
 import hashlib
 import sys
 import struct
+import os
+import site
 
 def zarr_nczyx_to_tif(
     zarr_path: str | Path,
@@ -106,7 +108,7 @@ def test_zarr_nczyx_to_tif():
     手动测试函数：把保存好的 zarr 导出为 tif。
     根据你的路径修改 zarr_path 和 output_dir。
     """
-    zarr_path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\train\train.ome.zarr"
+    zarr_path = r"G:\Albert\data\260618_SkNeXt_dataset\train\train.ome.zarr"
 
     # 导出 raw patches
     raw_output_dir = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\debug_raw_tif"
@@ -168,22 +170,4 @@ def ims_dataset_info_reader():
             print("Small block shape:", small_block.shape)
 
 if __name__ == "__main__":
-    import os
-    import site
-    import sys
-
-    print("Python executable:")
-    print(sys.executable)
-
-    print("\nPython version:")
-    print(sys.version)
-
-    print("\nEnvironment prefix:")
-    print(sys.prefix)
-
-    print("\nSite-packages:")
-    for path in site.getsitepackages():
-        print(path)
-
-    print("\nPATH:")
-    print(os.environ.get("PATH"))
+    test_zarr_nczyx_to_tif()

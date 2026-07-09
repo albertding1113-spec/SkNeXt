@@ -4,6 +4,7 @@ import os
 import re
 import math
 import shutil
+import traceback
 from datetime import datetime
 import zarr
 from numcodecs import Blosc
@@ -424,11 +425,15 @@ class Segmentation_Workflow(Base_Workflow):
                     self.save_infer_log()
                     print(f"{time_str()} [BLOCK{block_num:07d}/{total_block_num:07d}] [INFER] results saved", flush=True)
                 else: self.save_infer_log()
+        except Exception as e:
+            print(f"Error type：{type(e).__name__}")
+            print(f"Error message：{e}")
+            traceback.print_exc()
         finally:
             try:
                 # build pyramid
                 print(f"{time_str()}, start building pyramid", flush=True)
-                self.infer_writer.build_pyramid(factors=[(1, 2, 2), (1, 4, 4), (2, 8, 8), ], mode="nearest")
+                self.infer_writer.build_pyramid(factors=[(1, 2, 2), (2, 4, 4), (4, 8, 8), (8, 16, 16), (16, 32, 32)], mode="nearest")
             finally:
                 # close reader and writer
                 self.close_reader_writer()
