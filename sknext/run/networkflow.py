@@ -206,7 +206,7 @@ class Segmentation_Workflow(Base_Workflow):
         print(f"{time_str()} Model checkpoint saved to: {self.checkpoint_file}", flush=True)
 
     def create_reader(self):
-        self.chunk = (1, *self.patch_size[0:3])
+        self.chunk = (1, self.patch_size[0]*2, self.patch_size[1]*2, self.patch_size[2]*2)
         self.infer_path = Path(self.infer_path)
         assert self.infer_path.exists(), "Infer path does not exist."
         file_type = detect_path_type(self.infer_path)
