@@ -406,7 +406,7 @@ class Segmentation_Workflow(Base_Workflow):
         self.create_writer()
         # create coordinate_iter
         coord_iter = patch_coordinates_iter(self.infer_reader.shape[1:4], self.c_block_size)
-        total_block_num = int(np.prod(np.ceil(
+        self.total_block_num = int(np.prod(np.ceil(
             np.array(self.infer_reader.shape[1:4], dtype="float32") / np.array(self.c_block_size, dtype="float32"))))
         # create skeleton-manager
         self.create_skeleton()
@@ -423,12 +423,12 @@ class Segmentation_Workflow(Base_Workflow):
                 coord, coord_in_block = get_coord_after_padding(self.infer_reader.shape[1:4], c_coord, self.block_padding)
                 cropped_skeleton = self.skeleton_manager.crop_skeletons(coord) # navis.NeuronList
                 if len(cropped_skeleton) > 0:
-                    print(f"{time_str()} [BLOCK{block_num:07d}/{total_block_num:07d}] [INFER] {len(cropped_skeleton):04d} skeleton(s) in this block, start inferring", flush=True)
+                    print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] {len(cropped_skeleton):04d} skeleton(s) in this block, start inferring", flush=True)
                     block_result = self._infer_one_block(coord, cropped_skeleton)
                     self.infer_writer.write_block(
                         block_result[:, coord_in_block[0,0]:coord_in_block[0,1], coord_in_block[1,0]:coord_in_block[1,1], coord_in_block[2,0]:coord_in_block[2,1]],
                         start=(0, c_coord[0,0], c_coord[1,0], c_coord[2, 0]))
-                    print(f"{time_str()} [BLOCK{block_num:07d}/{total_block_num:07d}] [INFER] results saved", flush=True)
+                    print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] results saved", flush=True)
                 self.inferred_block_num = block_num + 1
                 self.save_infer_log()
             infer_completed = True
@@ -465,7 +465,9 @@ class Segmentation_Workflow(Base_Workflow):
                 p_coord_list = []
         if len(p_coord_list) > 0:
             block_pred = self._infer_one_batch(block_pred, block_raw, p_coord_list)
+        print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] end inferring", flush=True)
         # start post_processing
+        print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] start post-processing",flush=True)
         skeleton_label = self.skeleton_manager.create_cropped_skeleton_mask(skeleton, coord)
         _start_id = 0
         if self.instance_num:
