@@ -78,7 +78,10 @@ class Base_Workflow(ABC):
         self.watershed_growth_mask_channels = cfg.TASK.WATERSHED.GROWTH_MASK_CHANNELS
         self.watershed_growth_mask_channels_thresh = cfg.TASK.WATERSHED.GROWTH_MASK_CHANNELS_THRESH
         self.block_factor = cfg.DATA.INFER.BLOCK_FACTOR
+        self.block_central = cfg.DATA.INFER.BLOCK_CENTRAL_FACTOR
         self.block_size = np.int64(np.array(self.block_factor)* np.array(self.patch_size[0:3]))
+        self.c_block_size = np.int64(np.array(self.block_central) * np.array(self.patch_size[0:3]))
+        self.block_padding = np.int64(np.round((self.block_size - self.c_block_size)/2))
 
     def get_preprocess_dict(self):
         preprocess_dict = {}

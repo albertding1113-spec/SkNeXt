@@ -232,3 +232,72 @@ def patch_coordinates_generator(img:np.ndarray, # CZYX / ZYX
             patch_coordinates[i, 1, 0]:patch_coordinates[i, 1, 1],
             patch_coordinates[i, 2, 0]:patch_coordinates[i, 2, 1]]
             yield one_patch, patch_coordinates[i, :, :]
+
+
+def get_coord_after_padding(img_shape: tuple[int, int, int] | list[int, int, int],
+                            coord: np.ndarray,
+                            padding: tuple[int, int, int] | list[int, int, int] | np.ndarray)->tuple(np.ndarray):
+    """
+        Expand a 3D coordinate by padding while clipping it to image boundaries.
+
+        Parameters
+        ----------
+        img_shape : tuple or list of int
+            Image shape in ZYX order: (Z, Y, X).
+
+        coord : np.ndarray
+            Coordinate array with shape (3, 2):
+
+            [
+                [z_min, z_max],
+                [y_min, y_max],
+                [x_min, x_max],
+            ]
+
+            Maximum coordinates are exclusive.
+
+        padding : tuple, list or np.ndarray
+            Padding size in ZYX order: (z_padding, y_padding, x_padding).
+
+        Returns
+        -------
+        np.ndarray
+            Padded coordinates with shape (3, 2):
+
+            [
+                [z_min_padded, z_max_padded],
+                [y_min_padded, y_max_padded],
+                [x_min_padded, x_max_padded],
+            ]
+
+            Coordinates are clipped to the valid image range.
+        """
+    img_shape_array = np.asarray(img_shape, dtype=np.int64)
+    coord_array = np.asarray(coord, dtype=np.int64)
+    padding_array = np.asarray(padding, dtype=np.int64)
+    if img_shape_array.shape != (3,):
+        raise ValueError(f"`img_shape` must contain three values in ZYX order, but got shape {img_shape_array.shape}.")
+    if coord_array.shape != (3, 2):
+        raise ValueError(f"`coord` must have shape (3, 2), formatted as [[zmin, zmax], [ymin, ymax], [xmin, xmax]], but got shape {coord_array.shape}.")
+    if padding_array.shape != (3,):
+        raise ValueError("`padding` must contain three values in ZYX order, "f"but got shape {padding_array.shape}.")
+    if np.any(img_shape_array <= 0):
+        raise ValueError(f"All values in `img_shape` must be positive, got {img_shape_array.tolist()}.")
+    if np.any(padding_array < 0):
+        raise ValueError(f"All values in `padding` must be non-negative, got {padding_array.tolist()}.")
+    coord_min = coord_array[:, 0]
+    coord_max = coord_array[:, 1]
+    if np.any(coord_min < 0):
+        raise ValueError(f"Coordinate minimum values must be non-negative, got {coord_min.tolist()}.")
+    if np.any(coord_min >= coord_max):
+        raise ValueError(f"Every minimum coordinate must be smaller than its corresponding maximum coordinate, got {coord_array.tolist()}.")
+    if np.any(coord_max > img_shape_array):
+        raise ValueError(f"`coord` exceeds the image boundaries: coord={coord_array.tolist()}, img_shape={img_shape_array.tolist()}.")
+    padded_coord = np.empty((3, 2), dtype=np.int64)
+    padded_coord[:, 0] = np.maximum(coord_min - padding_array,0,)
+    padded_coord[:, 1] = np.minimum(coord_max + padding_array, img_shape_array,)
+    # Coordinates of the original region relative to the padded image.
+    center_coord_in_padded = np.empty((3, 2), dtype=np.int64)
+    center_coord_in_padded[:, 0] = (coord_min - padded_coord[:, 0])
+    center_coord_in_padded[:, 1] = (coord_max - padded_coord[:, 0])
+    return padded_coord, center_coord_in_padded

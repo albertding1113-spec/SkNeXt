@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import Any, Callable, Iterable, Sequence
 from sknext.run.base_workflow import Base_Workflow
-from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder, patch_coordinates_iter
+from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder, patch_coordinates_iter, get_coord_after_padding
 from sknext.data.datasetIO import tif_list_to_zarr, detect_path_type, IMSReader, ZarrIOManager
 from sknext.data.data_loader import ZarrPatchLoader
 from sknext.data.label import watershed_with_sk
@@ -102,7 +102,7 @@ class Segmentation_Workflow(Base_Workflow):
 
     def define_activations_and_channels(self):
         self.out_channel_num = 0
-        self.output_channel_info = []
+        self.output_channel_names = []
         for channel in self.channels:
             if channel == "A":
                 a_opts = self.channels_extra_opts.get("A", {"z_affinities": [1], "y_affinities": [1], "x_affinities": [1]})
@@ -111,20 +111,20 @@ class Segmentation_Workflow(Base_Workflow):
                 x_aff = a_opts.get("x_affinities", [1])
                 assert len(z_aff) == len(y_aff) == len(x_aff), "z/y/x affinities should have the same length."
                 self.out_channel_num += 3 * len(z_aff)
-                self.output_channel_info += [f"A_z_{d}" for d in z_aff] + [f"A_y_{d}" for d in y_aff] + [f"A_x_{d}" for d in x_aff]
+                self.output_channel_names += [f"A_z_{d}" for d in z_aff] + [f"A_y_{d}" for d in y_aff] + [f"A_x_{d}" for d in x_aff]
             else:
                 self.out_channel_num += 1
-                self.output_channel_info += [channel]
+                self.output_channel_names += [channel]
         self.head_activations = list(["linear"] * self.out_channel_num)
 
     def set_loss_metrics(self):
         self.loss_func = instance_segmentation_loss(channel_weights=self.channel_weights,
-                                                    channel_names=self.output_channel_info,
+                                                    channel_names=self.output_channel_names,
                                                     bce_weight=1.0,
                                                     dice_weight=1.0,
                                                     auto_balance=True)
         self.loss_func.to(self.device)
-        self.metric = instance_segmentation_metrics(self.output_channel_info)
+        self.metric = instance_segmentation_metrics(self.output_channel_names)
 
     def set_optimizer_scheduler(self):
         assert self.optimizer_name in ["SGD", "ADAM", "ADAMW"], "Unknown optimizer."
@@ -158,7 +158,7 @@ class Segmentation_Workflow(Base_Workflow):
                                yx_down=self.yx_down,
                                output_channels=[self.out_channel_num],
                                separated_decoders=False,
-                               output_channel_info=["+".join(self.output_channel_info)],
+                               output_channel_info=["+".join(self.output_channel_names)],
                                explicit_activations=False,
                                head_activations=list(self.head_activations),
                                stochastic_depth_prob=self.sd_prob,
@@ -278,6 +278,7 @@ class Segmentation_Workflow(Base_Workflow):
         self.set_model()
         print_model_parameters(self.model)
         profile_forward_memory(self.model, input_shape=(self.batch_size,self.patch_size[-1],*self.patch_size[:-1],), device=self.device)
+        torch.cuda.empty_cache()
         print(f"{time_str()} preparing optimizer and scheduler", flush=True)
         self.set_optimizer_scheduler()
         print(f"{time_str()} preparing loss function and metrics", flush=True)
@@ -394,6 +395,7 @@ class Segmentation_Workflow(Base_Workflow):
         print_model_parameters(self.model)
         profile_forward_memory(self.model, input_shape=(self.batch_size, self.patch_size[-1], *self.patch_size[:-1],),
                                device=self.device)
+        torch.cuda.empty_cache()
         self.load_checkpoint()
         self.model.eval()
         self.define_postprocess_channels()
@@ -403,9 +405,9 @@ class Segmentation_Workflow(Base_Workflow):
         # create writer
         self.create_writer()
         # create coordinate_iter
-        coord_iter = patch_coordinates_iter(self.infer_reader.shape[1:4], self.block_size)
+        coord_iter = patch_coordinates_iter(self.infer_reader.shape[1:4], self.c_block_size)
         total_block_num = int(np.prod(np.ceil(
-            np.array(self.infer_reader.shape[1:4], dtype="float32") / np.array(self.block_size, dtype="float32"))))
+            np.array(self.infer_reader.shape[1:4], dtype="float32") / np.array(self.c_block_size, dtype="float32"))))
         # create skeleton-manager
         self.create_skeleton()
         # load saved infer log
@@ -413,27 +415,34 @@ class Segmentation_Workflow(Base_Workflow):
 
         try:
             block_num = -1
+            infer_completed = False
             # start predict
-            for coord in coord_iter:
+            for c_coord in coord_iter:
                 block_num += 1
                 if block_num < self.inferred_block_num: continue
+                coord, coord_in_block = get_coord_after_padding(self.infer_reader.shape[1:4], c_coord, self.block_padding)
                 cropped_skeleton = self.skeleton_manager.crop_skeletons(coord) # navis.NeuronList
                 if len(cropped_skeleton) > 0:
                     print(f"{time_str()} [BLOCK{block_num:07d}/{total_block_num:07d}] [INFER] {len(cropped_skeleton):04d} skeleton(s) in this block, start inferring", flush=True)
-                    self._infer_one_block(coord, cropped_skeleton)
-                    self.inferred_block_num = block_num + 1
-                    self.save_infer_log()
+                    block_result = self._infer_one_block(coord, cropped_skeleton)
+                    self.infer_writer.write_block(
+                        block_result[:, coord_in_block[0,0]:coord_in_block[0,1], coord_in_block[1,0]:coord_in_block[1,1], coord_in_block[2,0]:coord_in_block[2,1]],
+                        start=(0, c_coord[0,0], c_coord[1,0], c_coord[2, 0]))
                     print(f"{time_str()} [BLOCK{block_num:07d}/{total_block_num:07d}] [INFER] results saved", flush=True)
-                else: self.save_infer_log()
+                self.inferred_block_num = block_num + 1
+                self.save_infer_log()
+            infer_completed = True
         except Exception as e:
             print(f"Error type：{type(e).__name__}")
             print(f"Error message：{e}")
             traceback.print_exc()
+            raise
         finally:
             try:
-                # build pyramid
-                print(f"{time_str()}, start building pyramid", flush=True)
-                self.infer_writer.build_pyramid(factors=[(1, 2, 2), (2, 4, 4), (4, 8, 8), (8, 16, 16), (16, 32, 32)], mode="nearest")
+                if infer_completed:
+                    # build pyramid
+                    print(f"{time_str()}, All inference completed, start building pyramid", flush=True)
+                    self.infer_writer.build_pyramid(factors=[(1, 2, 2), (2, 4, 4), (4, 8, 8), (8, 16, 16), (16, 32, 32)], mode="nearest")
             finally:
                 # close reader and writer
                 self.close_reader_writer()
@@ -462,7 +471,7 @@ class Segmentation_Workflow(Base_Workflow):
         if self.instance_num:
             block_result[_start_id, ...] = watershed_with_sk(
                         block_pred[0:self.instance_num, ...],
-                        self.channels[0:self.instance_num],
+                        self.output_channel_names[0:self.instance_num],
                         self.watershed_seed_channels,
                         self.watershed_seed_channels_thresh,
                         self.watershed_topographic_channel,
@@ -474,9 +483,7 @@ class Segmentation_Workflow(Base_Workflow):
         if self.semantic_num:
             block_result[_start_id:, ...] = np.uint16(block_pred[self.instance_num:, ...] > 0.5)
             block_result[_start_id:, ...] = post_processing_semantic(block_result[_start_id:, ...], self.postprocess_dict)
-        # writing block to writer
-        self.infer_writer.write_block(block_result,  start=(0, coord[0,0], coord[1,0], coord[2, 0]))
-
+        return block_result
 
     def _infer_one_batch(self, block_pred, block_raw, p_coord_list):
         patch_raw = np.zeros((self.batch_size, self.patch_size[3], *self.patch_size[0:3]), dtype=block_raw.dtype) # BCZYX
@@ -497,7 +504,7 @@ class Segmentation_Workflow(Base_Workflow):
 
 
     def save_infer_log(self) -> Path:
-        self.infer_log_path = Path(self.cfg.PATHS.INFER.INFER_LOG)
+        self.infer_log_path = Path(self.cfg.DATA.INFER.INFER_LOG)
         self.infer_log_path.mkdir(parents=True, exist_ok=True)
         log_path = self.infer_log_path / f"infer_log_{int(self.job_id):02d}.json"
         payload = {
@@ -561,7 +568,6 @@ class Segmentation_Workflow(Base_Workflow):
         if isinstance(inferred_block_num, bool) or not isinstance(inferred_block_num, int) or inferred_block_num < 0:
             raise ValueError( f"Inference log contains an invalid inferred_block_num: {inferred_block_num!r}.")
         self.inferred_block_num = inferred_block_num
-
         infer_gt_path = payload.get("ome_zarr_path")
         if not isinstance(infer_gt_path, str) or not infer_gt_path.strip():
             raise ValueError("Inference log contains an invalid ome_zarr_path.")
