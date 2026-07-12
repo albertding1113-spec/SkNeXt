@@ -145,9 +145,9 @@ class SkNeXt_Config:
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
         _C.DATA.INFER.PADDING = (0, 0, 0)
         # Block used in inferring and watershed. Block size = BLOCK_FACTOR * PATCH_SIZE
-        _C.DATA.INFER.BLOCK_FACTOR = (8, 6, 6)
+        _C.DATA.INFER.BLOCK_FACTOR = (10, 8, 8)
         # Central part of block writen into results after inferring and watershed.
-        _C.DATA.INFER.BLOCK_CENTRAL_FACTOR = (7, 5, 5)
+        _C.DATA.INFER.BLOCK_CENTRAL_FACTOR = (9, 7, 7)
         # Order of the axes of the image when using Zarr/hdf5 images.
         _C.DATA.INFER.INPUT_AXES_ORDER = "TCZYX"
         # 3.3.1 SKELETON

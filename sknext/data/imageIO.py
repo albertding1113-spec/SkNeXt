@@ -217,6 +217,30 @@ def patch_coordinates_iter(
                     dtype=np.int64,
                 )
 
+def central_block_coordinates_iter(
+    img_shape: tuple[int, int, int],
+    central_block_size: tuple[int, int, int],
+):
+    z_size, y_size, x_size = map(int, img_shape)
+    bz, by, bx = map(int, central_block_size)
+
+    for z0 in range(0, z_size, bz):
+        z1 = min(z0 + bz, z_size)
+
+        for y0 in range(0, y_size, by):
+            y1 = min(y0 + by, y_size)
+
+            for x0 in range(0, x_size, bx):
+                x1 = min(x0 + bx, x_size)
+
+                yield np.asarray(
+                    [
+                        [z0, z1],
+                        [y0, y1],
+                        [x0, x1],
+                    ],
+                    dtype=np.int64,
+                )
 
 def patch_coordinates_generator(img:np.ndarray, # CZYX / ZYX
                                 patch_coordinates:np.ndarray)->Iterator[np.ndarray, np.ndarray]:

@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import Any, Callable, Iterable, Sequence
 from sknext.run.base_workflow import Base_Workflow
-from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder, patch_coordinates_iter, get_coord_after_padding
+from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder, patch_coordinates_iter, get_coord_after_padding, central_block_coordinates_iter
 from sknext.data.datasetIO import tif_list_to_zarr, detect_path_type, IMSReader, ZarrIOManager
 from sknext.data.data_loader import ZarrPatchLoader
 from sknext.data.label import watershed_with_sk
@@ -207,7 +207,7 @@ class Segmentation_Workflow(Base_Workflow):
         print(f"{time_str()} Model checkpoint saved to: {self.checkpoint_file}", flush=True)
 
     def create_reader(self):
-        self.chunk = (1, self.patch_size[0]*2, self.patch_size[1]*2, self.patch_size[2]*2)
+        self.chunk = (1, self.patch_size[0]*2, self.patch_size[1]*4, self.patch_size[2]*4)
         self.infer_path = Path(self.infer_path)
         assert self.infer_path.exists(), "Infer path does not exist."
         file_type = detect_path_type(self.infer_path)
@@ -405,7 +405,7 @@ class Segmentation_Workflow(Base_Workflow):
         # create writer
         self.create_writer()
         # create coordinate_iter
-        coord_iter = patch_coordinates_iter(self.infer_reader.shape[1:4], self.c_block_size)
+        coord_iter = central_block_coordinates_iter(self.infer_reader.shape[1:4], self.c_block_size)
         self.total_block_num = int(np.prod(np.ceil(
             np.array(self.infer_reader.shape[1:4], dtype="float32") / np.array(self.c_block_size, dtype="float32"))))
         # create skeleton-manager
@@ -465,7 +465,6 @@ class Segmentation_Workflow(Base_Workflow):
                 p_coord_list = []
         if len(p_coord_list) > 0:
             block_pred = self._infer_one_batch(block_pred, block_raw, p_coord_list)
-        print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] end inferring", flush=True)
         # start post_processing
         print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] start post-processing",flush=True)
         skeleton_label = self.skeleton_manager.create_cropped_skeleton_mask(skeleton, coord)
