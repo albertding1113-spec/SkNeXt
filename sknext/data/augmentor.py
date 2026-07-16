@@ -15,6 +15,122 @@ from scipy.ndimage import median_filter, shift as shift_nd
 from skimage.transform import AffineTransform, ProjectiveTransform, warp
 
 # img:NDArray #ZYXC, float32
+def cutout(
+    img: NDArray,                    # ZYXC / YXC
+    mask: Optional[NDArray] = None,  # ZYXC / YXC，也兼容 ZYX / YX
+    values: tuple[float, float] = (0.01, 0.05),
+    size: tuple[float, float] = (0.05, 0.30),
+) -> Union[
+    NDArray,
+    Tuple[NDArray, Optional[NDArray]],
+]:
+    """
+    Randomly replace one cuboid/rectangular region with low-percentile
+    image signals and set the corresponding mask region to zero.
+
+    Parameters
+    ----------
+    img : NDArray
+        Image in ZYXC or YXC order.
+
+    mask : NDArray, optional
+        Corresponding label in ZYXC/YXC order.
+        A label without a channel axis, such as ZYX/YX, is also supported.
+
+    values : tuple of float, default=(0.01, 0.05)
+        Percentile interval used to generate the replacement signal.
+
+        Both formats are accepted:
+        - (0.01, 0.05): 1st to 5th percentile
+        - (1, 5): 1st to 5th percentile
+
+        Percentiles are calculated independently for each image channel.
+
+    size : tuple of float, default=(0.05, 0.30)
+        Minimum and maximum side-length ratio of the cutout region.
+        One random ratio is sampled independently for every spatial axis.
+
+    Returns
+    -------
+    NDArray or tuple
+        If mask is None:
+            augmented_img
+
+        Otherwise:
+            augmented_img, augmented_mask
+    """
+    img = np.asarray(img)
+    if img.ndim not in (3, 4):
+        raise ValueError(f"`img` must be YXC or ZYXC, but got shape {img.shape}.")
+    if not np.issubdtype(img.dtype, np.number):
+        raise TypeError(f"`img` must have a numeric dtype, but got {img.dtype}.")
+    if len(values) != 2:
+        raise ValueError("`values` must contain exactly two values.")
+    value_low = float(values[0])
+    value_high = float(values[1])
+    if value_low > value_high:
+        raise ValueError(f"`values[0]` must not exceed `values[1]`, got {values}.")
+    # Accept either fractions [0, 1] or percentile values [0, 100].
+    if 0.0 <= value_low <= value_high <= 1.0:
+        percentile_low = value_low * 100.0
+        percentile_high = value_high * 100.0
+    elif 0.0 <= value_low <= value_high <= 100.0:
+        percentile_low = value_low
+        percentile_high = value_high
+    else:
+        raise ValueError("`values` must be inside [0, 1] or [0, 100].")
+    if len(size) != 2:
+        raise ValueError("`size` must contain exactly two values.")
+    size_low = float(size[0])
+    size_high = float(size[1])
+    if not (0.0 < size_low <= size_high <= 1.0):
+        raise ValueError(f"`size` must satisfy 0 < min <= max <= 1, got {size}.")
+    spatial_shape = img.shape[:-1]
+    spatial_ndim = len(spatial_shape)
+    # Randomly determine the cutout size along every spatial axis.
+    cutout_shape = []
+    for axis_size in spatial_shape:
+        ratio = float(np.random.uniform(size_low, size_high))
+        region_size = max(1, int(round(axis_size * ratio)))
+        region_size = min(region_size, axis_size)
+        cutout_shape.append(region_size)
+    # Randomly determine the starting coordinate.
+    starts = [int(np.random.randint(0, axis_size - region_size + 1)) for axis_size, region_size in zip(spatial_shape, cutout_shape,)]
+    spatial_slices = tuple(slice(start, start + region_size) for start, region_size in zip(starts, cutout_shape))
+    img_out = img.copy()
+    # Calculate the low-percentile interval independently for each channel.
+    spatial_axes = tuple(range(spatial_ndim))
+    percentile_bounds = np.percentile(img.astype(np.float32, copy=False), q=(percentile_low, percentile_high), axis=spatial_axes,)
+    channel_low_values = np.asarray(percentile_bounds[0])
+    channel_high_values = np.asarray(percentile_bounds[1])
+    # Fill each channel with its own low-intensity random signal.
+    for channel_index in range(img.shape[-1]):
+        low_signal = float(channel_low_values[channel_index])
+        high_signal = float(channel_high_values[channel_index])
+        if high_signal > low_signal:
+            fill_value = float(np.random.uniform(low_signal, high_signal))
+        else:
+            fill_value = low_signal
+        img_out[spatial_slices + (channel_index,)] = fill_value
+    if mask is None:
+        return img_out
+
+    mask = np.asarray(mask)
+    # Mask with channel axis: ZYXC / YXC.
+    if mask.ndim == img.ndim:
+        if mask.shape[:-1] != spatial_shape:
+            raise ValueError(f"The spatial shape of `mask` must match `img`: img spatial shape={spatial_shape}, mask spatial shape={mask.shape[:-1]}.")
+        mask_slices = spatial_slices + (slice(None),)
+    # Mask without channel axis: ZYX / YX.
+    elif mask.ndim == img.ndim - 1:
+        if mask.shape != spatial_shape:
+            raise ValueError(f"The spatial shape of `mask` must match `img`: img spatial shape={spatial_shape}, mask shape={mask.shape}.")
+        mask_slices = spatial_slices
+    else:
+        raise ValueError(f"`mask` must either have the same dimensions as `img` or omit only the final channel dimension. Got img shape={img.shape}, mask shape={mask.shape}.")
+    mask_out = mask.copy()
+    mask_out[mask_slices] = 0
+    return img_out, mask_out
 
 def brightness(
     img: NDArray,

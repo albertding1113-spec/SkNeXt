@@ -164,6 +164,8 @@ class SkNeXt_Config:
         _C.AUGMENTOR.SHUFFLE_TRAIN_DATA_EACH_EPOCH = True
         # Flag to shuffle the validation data on every epoch
         _C.AUGMENTOR.SHUFFLE_VAL_DATA_EACH_EPOCH = False
+        # Cut out one subregion.
+        _C.AUGMENTOR.CUT_OUT = False
         # Random rotation between a defined range
         _C.AUGMENTOR.RANDOM_ROT = False
         # Range of random rotations

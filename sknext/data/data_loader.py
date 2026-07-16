@@ -30,6 +30,7 @@ class ZarrPatchLoader:
         self.augmentor_flag = get_cfg_value(self.cfg, "AUGMENTOR.ENABLE", True)
         self.da_prob = get_cfg_value(cfg, "AUGMENTOR.DA_PROB", 0.5)
         #augmentor
+        self.cut_out = get_cfg_value(self.cfg, "AUGMENTOR.CUT_OUT", False)
         self.g_blur = get_cfg_value(self.cfg, "AUGMENTOR.G_BLUR", False)
         self.g_sigma = get_cfg_value(self.cfg, "AUGMENTOR.G_SIGMA", (1.0, 2.0))
         self.median_blur = get_cfg_value(self.cfg, "AUGMENTOR.MEDIAN_BLUR", False)
@@ -77,6 +78,8 @@ class ZarrPatchLoader:
         return raw_patch, label_patch
 
     def patch_augment(self, patch: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray]:
+        if self.g_blur and random.uniform(0, 1) < self.da_prob / 5:
+            patch, mask = cutout(patch, mask)
         if self.g_blur and random.uniform(0, 1) < self.da_prob:
             patch = gaussian_blur(patch, self.g_sigma)
         if self.median_blur and random.uniform(0, 1) < self.da_prob:
