@@ -82,7 +82,7 @@ class SkNeXt_Config:
         _C.DATA.PATCH_SIZE = (20, 256, 256, 1)
         # Whether to reshape the dimensions that does not satisfy the patch shape selected by padding it with reflect.
         _C.DATA.REFLECT_TO_COMPLETE_SHAPE = True
-        # 3.1. NORMALIZATION
+        # 4.1. NORMALIZATION
         _C.DATA.NORMALIZATION = CN()
         # Whether to apply a percentage clip before normalization.
         _C.DATA.NORMALIZATION.PERC_CLIP = CN()
@@ -92,7 +92,7 @@ class SkNeXt_Config:
         _C.DATA.NORMALIZATION.PERC_CLIP.UPPER_PERC = -1.0
         # Normalization methods. Options: "scale_range", 'zero_mean_unit_variance'.
         _C.DATA.NORMALIZATION.TYPE = "zero_mean_unit_variance"
-        # 3.2. TRAIN
+        # 4.2. TRAIN
         _C.DATA.TRAIN = CN()
         # PATH organization
         # --- raw
@@ -120,7 +120,7 @@ class SkNeXt_Config:
         _C.DATA.TRAIN.OVERLAP = (0, 0, 0)
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
         _C.DATA.TRAIN.PADDING = (0, 0, 0)
-        # 3.3. VALIDATE
+        # 4.3. VALIDATE
         _C.DATA.VAL = CN()
         _C.DATA.VAL.PATH = "./raw/"
         _C.DATA.VAL.GT_PATH = "./label/"
@@ -128,7 +128,7 @@ class SkNeXt_Config:
         _C.DATA.VAL.OVERLAP = (0, 0, 0)
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
         _C.DATA.VAL.PADDING = (0, 0, 0)
-        # 3.3. INFER
+        # 4.3. INFER
         _C.DATA.INFER = CN()
         _C.DATA.INFER.PATH = "./raw/"
         _C.DATA.INFER.GT_PATH = "./label/"
@@ -141,7 +141,7 @@ class SkNeXt_Config:
         # Name of channel created in "hdf5"/"imaris"/"ome-zarr" file to save results.
         _C.DATA.INFER.CHANNEL_NAME = "result0"
         # Percentage of overlap in (z,y,x) when cropping. Tuple of floats between range [0, 1).
-        _C.DATA.INFER.OVERLAP = (0, 0, 0)
+        _C.DATA.INFER.OVERLAP = (0.125, 0.125, 0.125)
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
         _C.DATA.INFER.PADDING = (0, 0, 0)
         # Block used in inferring and watershed. Block size = BLOCK_FACTOR * PATCH_SIZE
@@ -150,9 +150,8 @@ class SkNeXt_Config:
         _C.DATA.INFER.BLOCK_CENTRAL_FACTOR = (9, 7, 7)
         # Order of the axes of the image when using Zarr/hdf5 images.
         _C.DATA.INFER.INPUT_AXES_ORDER = "TCZYX"
-        # 3.3.1 SKELETON
+        # 4.3.1 SKELETON
         _C.DATA.INFER.SKELETON_PATH = "./skeleton/"
-
 
         # 5. AUGMENTOR
         _C.AUGMENTOR = CN()

@@ -220,9 +220,26 @@ def write_tiff_to_n5_dataset(
     voxel_size: Sequence[float] | None = None,
     voxel_unit: str = "um",
     is_label: bool = False,
-) -> None:
+    sanitize_special_label_values: bool = True,
+) -> int | None:
     """
     将一个 TIFF 分块写入指定的 N5 dataset。
+
+    当 ``is_label=True`` 时，会在分块写入过程中计算真实最大标签 ID，
+    并将其保存为 N5 dataset 的 ``maxId`` 属性，供 Paintera 初始化
+    ID service 使用。
+
+    Parameters
+    ----------
+    sanitize_special_label_values:
+        仅对 label 生效。True 时，将负值以及无符号整数顶部的四个
+        Paintera 保留值转换为背景 0，避免 ``-3`` 转为 uint32 后变成
+        ``4294967293``。False 时，一旦检测到这些值就抛出异常。
+
+    Returns
+    -------
+    int | None
+        label dataset 返回写入的 ``maxId``；raw dataset 返回 None。
     """
     tif_path = Path(tif_path)
 
@@ -243,13 +260,24 @@ def write_tiff_to_n5_dataset(
         else:
             n5_dtype = np.dtype(output_dtype)
 
-        if is_label and not (
-            np.issubdtype(n5_dtype, np.integer)
-            or np.issubdtype(n5_dtype, np.bool_)
-        ):
-            raise TypeError(
-                f"Label dataset 必须使用整数类型，当前输出类型为 {n5_dtype}。"
-            )
+        if is_label:
+            if not (
+                np.issubdtype(data.dtype, np.integer)
+                or np.issubdtype(data.dtype, np.bool_)
+            ):
+                raise TypeError(
+                    "Label TIFF 必须使用整数类型，"
+                    f"当前输入类型为 {data.dtype}。"
+                )
+
+            if not (
+                np.issubdtype(n5_dtype, np.integer)
+                or np.issubdtype(n5_dtype, np.bool_)
+            ):
+                raise TypeError(
+                    "Label dataset 必须使用整数类型，"
+                    f"当前输出类型为 {n5_dtype}。"
+                )
 
         if chunks is None:
             chunk_shape = get_default_chunks(shape, axes)
@@ -317,13 +345,81 @@ def write_tiff_to_n5_dataset(
         print(f"  总块数     ：{total_chunks}")
 
         previous_percent = -1
+        max_label_id = 0
+        sanitized_label_voxels = 0
 
         for chunk_index, block_slices in enumerate(
             iter_chunk_slices(shape, chunk_shape),
             start=1,
         ):
+            source_block = np.asarray(data[block_slices])
+
+            if is_label:
+                # 先在源 dtype 上处理特殊值，避免负数转换为 uint32 后回绕。
+                if np.issubdtype(source_block.dtype, np.signedinteger):
+                    special_mask = source_block < 0
+                elif (
+                    np.issubdtype(source_block.dtype, np.unsignedinteger)
+                    and np.issubdtype(n5_dtype, np.unsignedinteger)
+                ):
+                    # 只识别“目标 dtype”顶部的四个 Paintera 保留值。
+                    # 例如输出 uint32 时识别 4294967292~4294967295；
+                    # 不会误删 uint16 中合法的 65532~65535。
+                    output_info = np.iinfo(n5_dtype)
+                    reserved_start = int(output_info.max) - 3
+                    reserved_end = int(output_info.max)
+                    special_mask = (
+                        (source_block >= reserved_start)
+                        & (source_block <= reserved_end)
+                    )
+                else:
+                    special_mask = np.zeros(source_block.shape, dtype=bool)
+
+                special_count = int(np.count_nonzero(special_mask))
+
+                if special_count > 0:
+                    if not sanitize_special_label_values:
+                        special_values = np.unique(source_block[special_mask])
+                        raise ValueError(
+                            f"Label TIFF 中检测到 {special_count} 个特殊/负标签值："
+                            f"{special_values[:16].tolist()}。"
+                            "请清理这些值，或设置 "
+                            "sanitize_special_label_values=True。"
+                        )
+
+                    source_block = source_block.copy()
+                    source_block[special_mask] = 0
+                    sanitized_label_voxels += special_count
+
+                if source_block.size > 0:
+                    local_max_id = int(source_block.max())
+                    max_label_id = max(max_label_id, local_max_id)
+
+                # 在转换前检查目标 dtype，避免静默溢出或截断。
+                if np.issubdtype(n5_dtype, np.bool_):
+                    if local_max_id > 1:
+                        raise OverflowError(
+                            f"Label 最大值 {local_max_id} 不能写入 bool。"
+                        )
+                else:
+                    output_info = np.iinfo(n5_dtype)
+                    if local_max_id > int(output_info.max):
+                        raise OverflowError(
+                            f"Label 最大值 {local_max_id} 超出输出类型 "
+                            f"{n5_dtype} 的范围。"
+                        )
+
+                    # 避免真实 label ID 占用 Paintera 的顶部四个保留值。
+                    if np.issubdtype(n5_dtype, np.unsignedinteger):
+                        paintera_reserved_start = int(output_info.max) - 3
+                        if local_max_id >= paintera_reserved_start:
+                            raise ValueError(
+                                f"Label ID {local_max_id} 落入 {n5_dtype} 的 "
+                                "Paintera 保留值范围。请改用更大的整数类型。"
+                            )
+
             block = np.ascontiguousarray(
-                data[block_slices],
+                source_block,
                 dtype=n5_dtype,
             )
 
@@ -341,11 +437,25 @@ def write_tiff_to_n5_dataset(
                 )
                 previous_percent = percent
 
+        if is_label:
+            # Paintera 会从 label dataset 本身读取该属性。
+            dataset.attrs["maxId"] = int(max_label_id)
+            dataset.attrs["backgroundId"] = 0
+
+            print(f"  maxId      ：{max_label_id}")
+            if sanitized_label_voxels > 0:
+                print(
+                    "  已转背景值 ："
+                    f"{sanitized_label_voxels} 个特殊/负标签体素"
+                )
+
         del dataset
         del data
         gc.collect()
 
         print(f"Dataset '{dataset_name}' 写入完成。")
+
+        return int(max_label_id) if is_label else None
 
 
 def raw_and_label_tif_to_n5(
@@ -371,6 +481,7 @@ def raw_and_label_tif_to_n5(
     n_threads: int = 8,
     check_spatial_shape: bool = True,
     overwrite: bool = False,
+    sanitize_special_label_values: bool = True,
 ) -> None:
     """
     将原始 TIFF 和 Label TIFF 写入同一个 N5 文件。
@@ -423,6 +534,10 @@ def raw_and_label_tif_to_n5(
         支持：
             raw: CZYX，label: ZYX
             raw: ZYX，label: ZYX
+
+    sanitize_special_label_values:
+        是否把 label 中的负值和 Paintera 顶部保留值转换为背景 0。
+        推荐保持 True，避免 ``-3`` 被写成 ``4294967293``。
     """
     raw_tif_path = Path(raw_tif_path)
     label_tif_path = Path(label_tif_path)
@@ -538,7 +653,7 @@ def raw_and_label_tif_to_n5(
             is_label=False,
         )
 
-        write_tiff_to_n5_dataset(
+        label_max_id = write_tiff_to_n5_dataset(
             tif_path=label_tif_path,
             n5_file=n5_file,
             dataset_name=label_dataset_name,
@@ -551,6 +666,7 @@ def raw_and_label_tif_to_n5(
             voxel_size=label_voxel_size,
             voxel_unit=voxel_unit,
             is_label=True,
+            sanitize_special_label_values=sanitize_special_label_values,
         )
 
     finally:
@@ -562,13 +678,14 @@ def raw_and_label_tif_to_n5(
     print(f"N5 输出路径：{n5_path}")
     print(f"原始图像路径：/{raw_dataset_name}")
     print(f"标签图像路径：/{label_dataset_name}")
+    print(f"标签 maxId ：{label_max_id}")
 
 
 if __name__ == "__main__":
     raw_and_label_tif_to_n5(
-        raw_tif_path=r"G:\Albert\data\260424_iterative_proofreading_training\raw\0009\0009_8bit.tif",
-        label_tif_path=r"G:\Albert\data\260424_iterative_proofreading_training\raw\0009\0009_infer.tif",
-        n5_path=r"G:\Albert\data\260424_iterative_proofreading_training\raw\0009\0009_paintera_data.n5",
+        raw_tif_path=r"G:\Albert\data\260424_iterative_proofreading_training\raw\0012\0012.tif",
+        label_tif_path=r"G:\Albert\data\260424_iterative_proofreading_training\raw\0012\0012_infer.tif",
+        n5_path=r"G:\Albert\data\260424_iterative_proofreading_training\raw\0012\0012_paintera_data.n5",
 
         # N5 内部的 dataset 名称
         raw_dataset_name="raw",
@@ -596,5 +713,8 @@ if __name__ == "__main__":
         voxel_unit="um",
 
         n_threads=8,
+
+        # 将负值和 Paintera 的保留值转为背景 0，避免出现 4294967293。
+        sanitize_special_label_values=True,
         overwrite=True,
     )

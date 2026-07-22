@@ -448,23 +448,63 @@ class Segmentation_Workflow(Base_Workflow):
                 self.close_reader_writer()
 
     def _infer_one_block(self, coord, skeleton):
-        block_size = np.array((self.patch_size[3], *coord[:,1]-coord[:,0]))
-        block_raw = np.zeros((block_size), dtype=self.infer_reader.dtype) # CZYX
+        block_size = np.array((self.patch_size[3], *(coord[:, 1] - coord[:, 0])), dtype=np.int64)
+        block_raw = np.zeros(tuple(block_size), dtype=self.infer_reader.dtype)  # CZYX
         for i in range(self.patch_size[3]):
-            block_raw[i, ...] = self.infer_reader[self.infer_channel[i], coord[0, 0]:coord[0, 1], coord[1, 0]:coord[1, 1], coord[2, 0]:coord[2, 1]]
+            block_raw[i, ...] = self.infer_reader[self.infer_channel[i], coord[0, 0]:coord[0, 1], coord[1, 0]:coord[1, 1], coord[2, 0]:coord[2, 1],]
         block_raw = preprocess_img(block_raw, self.preprocess_dict)
-        block_pred = np.zeros((self.out_channel_num, *block_size[1:4]), dtype='float32')
-        block_result = np.zeros((self.postpro_channel_num, *block_size[1:4]), dtype='uint16')
-        p_coord_iter = patch_coordinates_iter(block_size[1:4], self.patch_size[0:3], self.infer_overlap, self.infer_padding)
-        # start inferring block
-        p_coord_list = []
-        for _p_coord in p_coord_iter:
-            p_coord_list.append(_p_coord)
-            if len(p_coord_list) == self.batch_size:
-                block_pred = self._infer_one_batch(block_pred, block_raw, p_coord_list)
-                p_coord_list = []
-        if len(p_coord_list) > 0:
-            block_pred = self._infer_one_batch(block_pred, block_raw, p_coord_list)
+        # Accumulate weighted probabilities instead of allowing a later patch to overwrite an earlier prediction in overlapping regions.
+        block_pred_sum = np.zeros((self.out_channel_num, *block_size[1:4]), dtype=np.float32,)
+        # The same spatial blending weight is used for every output channel.
+        block_weight_sum = np.zeros(tuple(block_size[1:4]), dtype=np.float32)
+        block_result = np.zeros((self.postpro_channel_num, *block_size[1:4]),dtype=np.uint16,)
+        all_patch_coords = list(
+            patch_coordinates_iter(block_size[1:4], self.patch_size[0:3], self.infer_overlap, self.infer_padding,))
+        if not all_patch_coords:
+            raise RuntimeError(f"No inference patches were generated for block shape {tuple(block_size[1:4])}.")
+        # Determine the real overlap on both sides of every patch. This is
+        # derived from the generated coordinates rather than assuming that the
+        # requested overlap is always exact; the final end-aligned patch can
+        # have a larger overlap than intermediate patches.
+        axis_intervals = []
+        axis_interval_indices = []
+        for axis in range(3):
+            intervals = sorted(
+                {(int(p_coord[axis, 0]), int(p_coord[axis, 1])) for p_coord in all_patch_coords},
+                key=lambda interval: (interval[0], interval[1]),)
+            axis_intervals.append(intervals)
+            axis_interval_indices.append({interval: index for index, interval in enumerate(intervals)})
+        patch_overlap_widths = []
+        for p_coord in all_patch_coords:
+            overlap_widths = np.zeros((3, 2), dtype=np.int64)
+            for axis in range(3):
+                current_interval = (int(p_coord[axis, 0]), int(p_coord[axis, 1]),)
+                interval_index = axis_interval_indices[axis][current_interval]
+                intervals = axis_intervals[axis]
+                if interval_index > 0:
+                    previous_interval = intervals[interval_index - 1]
+                    overlap_widths[axis, 0] = max(0, previous_interval[1] - current_interval[0],)
+                if interval_index + 1 < len(intervals):
+                    next_interval = intervals[interval_index + 1]
+                    overlap_widths[axis, 1] = max(0, current_interval[1] - next_interval[0],)
+            patch_overlap_widths.append(overlap_widths)
+
+        for batch_start in range(0, len(all_patch_coords), self.batch_size):
+            batch_end = min(batch_start + self.batch_size, len(all_patch_coords),)
+            block_pred_sum, block_weight_sum = self._infer_one_batch(
+                block_pred_sum,
+                block_weight_sum,
+                block_raw,
+                all_patch_coords[batch_start:batch_end],
+                patch_overlap_widths[batch_start:batch_end],)
+        uncovered_mask = block_weight_sum <= 0
+        if np.any(uncovered_mask):
+            uncovered_voxels = int(np.count_nonzero(uncovered_mask))
+            raise RuntimeError(f"Patch blending left {uncovered_voxels} block voxels without any prediction weight. Check PATCH_SIZE, OVERLAP and PADDING.")
+        block_pred = block_pred_sum / block_weight_sum[None, ...]
+        # Numerical roundoff during weighted accumulation can move probabilities
+        # a few ULPs outside the sigmoid range.
+        np.clip(block_pred, 0.0, 1.0, out=block_pred)
         # start post_processing
         print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] start post-processing",flush=True)
         skeleton_label = self.skeleton_manager.create_cropped_skeleton_mask(skeleton, coord)
@@ -486,23 +526,75 @@ class Segmentation_Workflow(Base_Workflow):
             block_result[_start_id:, ...] = post_processing_semantic(block_result[_start_id:, ...], self.postprocess_dict)
         return block_result
 
-    def _infer_one_batch(self, block_pred, block_raw, p_coord_list):
-        patch_raw = np.zeros((self.batch_size, self.patch_size[3], *self.patch_size[0:3]), dtype=block_raw.dtype) # BCZYX
-        for i in range(len(p_coord_list)):
-            _coord = p_coord_list[i]
-            _patch = block_raw[:, _coord[0, 0]:_coord[0, 1], _coord[1, 0]:_coord[1, 1], _coord[2, 0]:_coord[2, 1]] #CZYX
-            if _patch.shape[1:4] != patch_raw.shape[2:5]:
-                _patch = reflect_padding_img(_patch, patch_raw.shape[2:5])
-            patch_raw[i, ...] = _patch
-        patch_tensor = torch.from_numpy(patch_raw.astype('float32')).to(self.device, non_blocking=True)
-        patch_pred = self.model(patch_tensor) # B(out_channel_num)ZYX
-        patch_pred = torch.sigmoid(patch_pred).cpu().numpy()
-        for i in range(len(p_coord_list)):
-            _coord = p_coord_list[i]
-            block_pred[:, _coord[0, 0]:_coord[0, 1], _coord[1, 0]:_coord[1, 1], _coord[2, 0]:_coord[2, 1]] = patch_pred[
-                i, :, 0:_coord[0, 1] - _coord[0, 0], 0:_coord[1, 1] - _coord[1, 0], 0:_coord[2, 1] - _coord[2, 0]]
-        return block_pred
+    def _infer_one_batch(
+        self,
+        block_pred_sum,
+        block_weight_sum,
+        block_raw,
+        p_coord_list,
+        p_overlap_widths,
+    ):
+        current_batch_size = len(p_coord_list)
+        if current_batch_size == 0:
+            return block_pred_sum, block_weight_sum
+        if current_batch_size != len(p_overlap_widths):
+            raise ValueError("p_coord_list and p_overlap_widths must have the same length.")
+        patch_raw = np.zeros((current_batch_size, self.patch_size[3], *self.patch_size[0:3],), dtype=block_raw.dtype,)  # BCZYX
+        for i, p_coord in enumerate(p_coord_list):
+            patch = block_raw[
+                :, p_coord[0, 0]:p_coord[0, 1], p_coord[1, 0]:p_coord[1, 1],p_coord[2, 0]:p_coord[2, 1],]  # CZYX
+            if patch.shape[1:4] != patch_raw.shape[2:5]:
+                patch = reflect_padding_img(patch, patch_raw.shape[2:5])
+            patch_raw[i, ...] = patch
 
+        patch_tensor = torch.from_numpy(patch_raw.astype(np.float32, copy=False)).to(self.device, non_blocking=True)
+        patch_pred = self.model(patch_tensor)  # B(out_channel_num)ZYX
+        patch_pred = torch.sigmoid(patch_pred).cpu().numpy().astype(np.float32, copy=False,)
+
+        def make_axis_weight(
+            axis_length: int,
+            left_overlap: int,
+            right_overlap: int,
+        ) -> np.ndarray:
+            """Create complementary linear feathering weights for one axis."""
+            axis_weight = np.ones(axis_length, dtype=np.float32)
+            left_overlap = min(max(int(left_overlap), 0), axis_length)
+            right_overlap = min(max(int(right_overlap), 0), axis_length)
+            if left_overlap > 0:
+                # Excluding exact 0/1 endpoints prevents zero-weight voxels and
+                # still produces complementary ramps for adjacent patches.
+                left_ramp = np.linspace(
+                    0.0,
+                    1.0,
+                    left_overlap + 2,
+                    dtype=np.float32,
+                )[1:-1]
+                axis_weight[:left_overlap] *= left_ramp
+            if right_overlap > 0:
+                right_ramp = np.linspace(
+                    1.0,
+                    0.0,
+                    right_overlap + 2,
+                    dtype=np.float32,
+                )[1:-1]
+                axis_weight[-right_overlap:] *= right_ramp
+            return axis_weight
+
+        for i, (p_coord, overlap_widths) in enumerate(zip(p_coord_list, p_overlap_widths)):
+            patch_shape = (int(p_coord[0, 1] - p_coord[0, 0]), int(p_coord[1, 1] - p_coord[1, 0]), int(p_coord[2, 1] - p_coord[2, 0]),)
+            z_weight = make_axis_weight(patch_shape[0], overlap_widths[0, 0], overlap_widths[0, 1],)
+            y_weight = make_axis_weight(patch_shape[1], overlap_widths[1, 0], overlap_widths[1, 1],)
+            x_weight = make_axis_weight(patch_shape[2],overlap_widths[2, 0], overlap_widths[2, 1],)
+            patch_weight = (z_weight[:, None, None] * y_weight[None, :, None] * x_weight[None, None, :])
+            block_slices = (
+                slice(int(p_coord[0, 0]), int(p_coord[0, 1])),
+                slice(int(p_coord[1, 0]), int(p_coord[1, 1])),
+                slice(int(p_coord[2, 0]), int(p_coord[2, 1])),
+            )
+            valid_patch_pred = patch_pred[i, :, :patch_shape[0], :patch_shape[1], :patch_shape[2],]
+            block_pred_sum[(slice(None), *block_slices)] += valid_patch_pred * patch_weight[None, ...]
+            block_weight_sum[block_slices] += patch_weight
+        return block_pred_sum, block_weight_sum
 
     def save_infer_log(self) -> Path:
         self.infer_log_path = Path(self.cfg.DATA.INFER.INFER_LOG)
