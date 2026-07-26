@@ -78,7 +78,7 @@ class ZarrPatchLoader:
         return raw_patch, label_patch
 
     def patch_augment(self, patch: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray]:
-        if self.g_blur and random.uniform(0, 1) < self.da_prob / 5:
+        if self.cut_out and random.uniform(0, 1) < self.da_prob / 10:
             patch, mask = cutout(patch, mask)
         if self.g_blur and random.uniform(0, 1) < self.da_prob:
             patch = gaussian_blur(patch, self.g_sigma)

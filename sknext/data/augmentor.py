@@ -18,7 +18,7 @@ from skimage.transform import AffineTransform, ProjectiveTransform, warp
 def cutout(
     img: NDArray,                    # ZYXC / YXC
     mask: Optional[NDArray] = None,  # ZYXC / YXC，也兼容 ZYX / YX
-    values: tuple[float, float] = (0.01, 0.05),
+    values: tuple[float, float] = (0, 0.05),
     size: tuple[float, float] = (0.05, 0.30),
 ) -> Union[
     NDArray,
@@ -37,7 +37,7 @@ def cutout(
         Corresponding label in ZYXC/YXC order.
         A label without a channel axis, such as ZYX/YX, is also supported.
 
-    values : tuple of float, default=(0.01, 0.05)
+    values : tuple of float, default=(0, 0.05)
         Percentile interval used to generate the replacement signal.
 
         Both formats are accepted:
@@ -691,11 +691,57 @@ def flip_vertical(image: NDArray, mask: Optional[NDArray] = None, heat: Optional
     return img, mask, heat
 
 
-def gaussian_blur(image: NDArray, sigma: float | tuple = (0.5, 1.5)):
-    if isinstance(sigma, tuple):
-        sigma = random.uniform(sigma[0], sigma[1])
-    return gaussian(image, sigma=sigma)
+def gaussian_blur(
+    image: NDArray,
+    sigma: float | tuple[float, float] = (0.5, 1.5),
+) -> NDArray:
+    """Apply Gaussian blur independently to every image channel.
 
+    Parameters
+    ----------
+    image : NDArray
+        Image in ``YXC`` or ``ZYXC`` order. The final axis is always treated
+        as the channel axis and is never blurred.
+
+    sigma : float or tuple[float, float], default=(0.5, 1.5)
+        Spatial Gaussian standard deviation. A scalar applies that fixed
+        value. A two-value tuple is interpreted as the inclusive sampling
+        range ``(minimum, maximum)`` from which one sigma is selected.
+
+    Returns
+    -------
+    NDArray
+        Blurred image with the same shape and dtype as the input.
+
+    Notes
+    -----
+    ``channel_axis=-1`` prevents Gaussian filtering across the channel axis,
+    so signal from one fluorescence channel cannot leak into another.
+    """
+    image = np.asarray(image)
+    if image.ndim not in (3, 4):
+        raise ValueError(f"`image` must be YXC or ZYXC, but got shape {image.shape}.")
+    if not np.issubdtype(image.dtype, np.number):
+        raise TypeError(f"`image` must have a numeric dtype, but got {image.dtype}.")
+    if isinstance(sigma, (tuple, list, np.ndarray)):
+        if len(sigma) != 2:
+            raise ValueError("When `sigma` is a sequence, it must contain exactly two values: (minimum, maximum).")
+        sigma_low = float(sigma[0])
+        sigma_high = float(sigma[1])
+        if not np.isfinite(sigma_low) or not np.isfinite(sigma_high):
+            raise ValueError("`sigma` values must be finite.")
+        if sigma_low < 0 or sigma_high < sigma_low:
+            raise ValueError(f"`sigma` must satisfy 0 <= minimum <= maximum, but got {tuple(sigma)}.")
+        selected_sigma = random.uniform(sigma_low, sigma_high)
+    else:
+        selected_sigma = float(sigma)
+        if not np.isfinite(selected_sigma) or selected_sigma < 0:
+            raise ValueError(f"`sigma` must be a finite non-negative number, got {sigma}.")
+    if selected_sigma == 0:
+        return image.copy()
+    original_dtype = image.dtype
+    blurred = gaussian(image,sigma=selected_sigma, channel_axis=-1, preserve_range=True,)
+    return blurred.astype(original_dtype, copy=False)
 
 def median_blur(image: NDArray, k_range: Optional[tuple] = None):
     assert image.ndim in (3, 4), f"Image must be 3D or 4D, got {image.shape}"
