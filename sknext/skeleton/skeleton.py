@@ -381,6 +381,122 @@ class SkeletonManager():
         assert(len(result_index) == len(new_skeletons))
         return result_index
 
+    def get_nearest_skeleton_node(
+            self,
+            coordinate: Iterable[float],
+            skeleton_index: int,
+            return_distance: bool = False,
+    ) -> pd.Series | tuple[pd.Series, float]:
+        """Return the skeleton node nearest to a coordinate.
+
+        The target skeleton is selected by its zero-based position in
+        ``self.skeletons``. This method does not use ``skeleton.id``.
+
+        Parameters
+        ----------
+        coordinate : Iterable[float]
+            Query coordinate in ``[z, y, x]`` order.
+
+        skeleton_index : int
+            Zero-based index of the skeleton in ``self.skeletons``.
+
+        return_distance : bool, default=False
+            If ``True``, also return the Euclidean distance from ``coordinate``
+            to the nearest skeleton node.
+
+        Returns
+        -------
+        pandas.Series or tuple[pandas.Series, float]
+            A copy of the nearest row in ``skeleton.nodes``. When
+            ``return_distance=True``, the second value is the Euclidean
+            distance in the same coordinate unit as the skeleton.
+
+        Raises
+        ------
+        TypeError
+            If ``skeleton_index`` is not an integer.
+
+        IndexError
+            If ``skeleton_index`` is outside ``[0, len(self.skeletons))``.
+
+        ValueError
+            If the coordinate is invalid, the selected skeleton has no nodes,
+            or its coordinate columns contain invalid values.
+        """
+        if isinstance(skeleton_index, (bool, np.bool_)) or not isinstance(
+                skeleton_index,
+                (int, np.integer),
+        ):
+            raise TypeError(
+                "skeleton_index must be an integer, "
+                f"but got {type(skeleton_index).__name__}."
+            )
+
+        skeleton_index = int(skeleton_index)
+        skeleton_count = len(self.skeletons)
+        if skeleton_index < 0 or skeleton_index >= skeleton_count:
+            raise IndexError(
+                "skeleton_index is outside the valid range: "
+                f"index={skeleton_index}, skeleton_count={skeleton_count}."
+            )
+
+        coordinate_zyx = np.asarray(coordinate, dtype=np.float64)
+        if coordinate_zyx.shape != (3,):
+            raise ValueError(
+                "coordinate must contain exactly three values in [z, y, x] order."
+            )
+        if not np.all(np.isfinite(coordinate_zyx)):
+            raise ValueError(
+                "coordinate must contain three finite numeric values."
+            )
+
+        skeleton = self.skeletons[skeleton_index]
+        nodes = skeleton.nodes
+        if not isinstance(nodes, pd.DataFrame):
+            raise TypeError(
+                f"Skeleton at index {skeleton_index} does not contain a valid "
+                "nodes DataFrame."
+            )
+        if nodes.empty:
+            raise ValueError(
+                f"Skeleton at index {skeleton_index} contains no nodes."
+            )
+
+        coordinate_columns = ["z", "y", "x"]
+        missing_columns = set(coordinate_columns).difference(nodes.columns)
+        if missing_columns:
+            raise ValueError(
+                f"Skeleton at index {skeleton_index} is missing coordinate "
+                f"columns: {sorted(missing_columns)}."
+            )
+
+        node_coordinates = nodes[coordinate_columns].apply(
+            pd.to_numeric,
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
+        if not np.all(np.isfinite(node_coordinates)):
+            raise ValueError(
+                f"Skeleton at index {skeleton_index} contains non-finite "
+                "node coordinates."
+            )
+
+        coordinate_difference = node_coordinates - coordinate_zyx[None, :]
+        squared_distances = np.einsum(
+            "ij,ij->i",
+            coordinate_difference,
+            coordinate_difference,
+        )
+        nearest_position = int(np.argmin(squared_distances))
+        nearest_node = nodes.iloc[nearest_position].copy()
+
+        if return_distance:
+            nearest_distance = float(
+                np.sqrt(squared_distances[nearest_position])
+            )
+            return nearest_node, nearest_distance
+
+        return nearest_node
+
     def increase_nodes_density(self, max_distance: float | Iterable[float]) -> navis.NeuronList:
         """Increase the node density of all skeletons by linear interpolation.
 
@@ -1252,387 +1368,410 @@ class SkeletonManager():
 
         return mask
 
-    @staticmethod
-    def get_path_to_root(skeleton: navis.TreeNeuron, coordinate: Iterable[float], label: int,
+    def get_path_to_soma_or_root(
+            self,
+            skeleton_index: int,
+            coordinate: Iterable[float],
+            nearest_node_position: int | pd.Series | Iterable[float],
+            soma_label: int = 1,
     ) -> navis.TreeNeuron:
-        """Create a skeleton containing a coordinate-to-root path.
+        """Create the path from a coordinate to the soma or component root.
 
-        A new node is created at ``coordinate`` and connected to the nearest
-        node in ``skeleton``. The returned neuron contains the new node, the
-        nearest node, and all ancestors from that node to its root.
+        The source skeleton is selected using its zero-based index in
+        ``self.skeletons``. A new terminal node is created at ``coordinate``
+        and connected to the supplied nearest skeleton node. The function then
+        follows ``parent_id`` from that node toward the root and stops at the
+        first ancestor whose SWC ``label`` equals ``soma_label``. If no such
+        node exists on the ancestor chain, the path ends at the root of that
+        connected component.
+
+        The returned node table is ordered as::
+
+            soma/root -> ... -> nearest node -> coordinate node
+
+        Following ``parent_id`` from the newly created coordinate node therefore
+        gives::
+
+            coordinate -> nearest node -> ... -> soma/root
 
         Parameters
         ----------
-        skeleton : navis.TreeNeuron
-            Source skeleton.
+        skeleton_index : int
+            Zero-based index of the source skeleton in ``self.skeletons``.
 
         coordinate : Iterable[float]
-            Query coordinate in ``[z, y, x]`` order.
+            Coordinate of the new terminal node in ``[z, y, x]`` order.
 
-        label : int
-            SWC label assigned to the newly created coordinate node. Labels of
-            the original path nodes are retained.
+        nearest_node_position : int, pandas.Series, or Iterable[float]
+            Nearest node specification in one of three forms:
+
+            - integer: zero-based row position in the selected node table;
+            - ``pandas.Series``: a node row containing ``node_id``;
+            - three values: a node coordinate in ``[z, y, x]`` order. The
+              closest node in the selected skeleton is used.
+
+        soma_label : int, default=1
+            SWC compartment label used to identify soma nodes.
 
         Returns
         -------
         navis.TreeNeuron
-            A new neuron containing only the coordinate-to-root path.
+            A new skeleton containing the coordinate node and the unique path
+            to the first soma ancestor, or to the component root if no soma is
+            present on that ancestor chain.
 
         Raises
         ------
+        TypeError
+            If ``skeleton_index`` or ``nearest_node_position`` has an unsupported
+            type, or the selected skeleton does not contain a nodes DataFrame.
+
+        IndexError
+            If ``skeleton_index`` is outside ``[0, len(self.skeletons))``.
+
         ValueError
-            If the skeleton is empty, required columns are missing, node IDs
-            are duplicated, coordinates are invalid, or a cycle is detected.
+            If coordinates, node IDs, parent IDs, or topology are invalid.
         """
-        if not hasattr(skeleton, "nodes"):
+        if isinstance(skeleton_index, (bool, np.bool_)) or not isinstance(
+                skeleton_index,
+                (int, np.integer),
+        ):
             raise TypeError(
-                "skeleton must be a navis.TreeNeuron or an object "
-                "containing a nodes DataFrame."
+                "skeleton_index must be an integer, "
+                f"but got {type(skeleton_index).__name__}."
             )
 
-        # --------------------------------------------------------------
-        # Validate the query coordinate
-        # --------------------------------------------------------------
-        coordinate_zyx = np.asarray(
-            coordinate,
-            dtype=np.float64,
-        )
+        skeleton_index = int(skeleton_index)
+        skeleton_count = len(self.skeletons)
+        if skeleton_index < 0 or skeleton_index >= skeleton_count:
+            raise IndexError(
+                "skeleton_index is outside the valid range: "
+                f"index={skeleton_index}, skeleton_count={skeleton_count}."
+            )
 
+        skeleton = self.skeletons[skeleton_index]
+        if not hasattr(skeleton, "nodes") or not isinstance(
+                skeleton.nodes,
+                pd.DataFrame,
+        ):
+            raise TypeError(
+                f"Skeleton at index {skeleton_index} does not contain a valid "
+                "nodes DataFrame."
+            )
+
+        coordinate_zyx = np.asarray(coordinate, dtype=np.float64)
         if coordinate_zyx.shape != (3,):
             raise ValueError(
-                "coordinate must have the form [z, y, x]."
+                "coordinate must contain exactly three values in [z, y, x] order."
             )
-
         if not np.all(np.isfinite(coordinate_zyx)):
-            raise ValueError(
-                "coordinate must contain three finite values."
-            )
+            raise ValueError("coordinate must contain three finite values.")
 
-        # --------------------------------------------------------------
-        # Validate label
-        # --------------------------------------------------------------
+        if isinstance(soma_label, (bool, np.bool_)):
+            raise ValueError(
+                f"soma_label must be an integer, but got {soma_label!r}."
+            )
         try:
-            label_value = int(label)
+            soma_label_as_float = float(soma_label)
+            soma_label_value = int(soma_label)
         except (TypeError, ValueError) as error:
             raise ValueError(
-                f"label must be an integer, but got {label!r}."
+                f"soma_label must be an integer, but got {soma_label!r}."
             ) from error
-
-        if float(label_value) != float(label):
+        if (
+                not np.isfinite(soma_label_as_float)
+                or soma_label_as_float != soma_label_value
+        ):
             raise ValueError(
-                f"label must be an integer, but got {label!r}."
+                f"soma_label must be an integer, but got {soma_label!r}."
             )
 
-        # --------------------------------------------------------------
-        # Validate node table
-        # --------------------------------------------------------------
         nodes = skeleton.nodes.copy().reset_index(drop=True)
-
         if nodes.empty:
-            raise ValueError("The input skeleton contains no nodes.")
+            raise ValueError(
+                f"Skeleton at index {skeleton_index} contains no nodes."
+            )
 
-        required_columns = {
-            "node_id",
-            "parent_id",
-            "z",
-            "y",
-            "x",
-        }
-
+        required_columns = {"node_id", "parent_id", "z", "y", "x"}
         missing_columns = required_columns.difference(nodes.columns)
-
         if missing_columns:
             raise ValueError(
-                "The skeleton is missing required columns: "
-                f"{sorted(missing_columns)}."
+                f"Skeleton at index {skeleton_index} is missing required "
+                f"columns: {sorted(missing_columns)}."
             )
 
         node_id_values = pd.to_numeric(
             nodes["node_id"],
-            errors="raise",
+            errors="coerce",
         ).to_numpy(dtype=np.float64)
-
-        if not np.all(np.isfinite(node_id_values)):
-            raise ValueError("node_id contains non-finite values.")
-
-        if not np.all(node_id_values == np.floor(node_id_values)):
-            raise ValueError("All node IDs must be integers.")
-
+        if np.any(~np.isfinite(node_id_values)) or np.any(
+                node_id_values != np.floor(node_id_values)
+        ):
+            raise ValueError("All node IDs must be finite integers.")
         node_ids = node_id_values.astype(np.int64)
 
         if len(np.unique(node_ids)) != len(node_ids):
-            duplicate_ids = pd.Series(node_ids)[
+            duplicated_ids = pd.Series(node_ids)[
                 pd.Series(node_ids).duplicated(keep=False)
             ].unique()
-
             raise ValueError(
-                "The skeleton contains duplicate node IDs: "
-                f"{duplicate_ids[:20].tolist()}."
+                "The selected skeleton contains duplicate node IDs: "
+                f"{duplicated_ids[:20].tolist()}."
             )
 
         parent_values = pd.to_numeric(
             nodes["parent_id"],
             errors="coerce",
         ).to_numpy(dtype=np.float64)
+        finite_parent_mask = np.isfinite(parent_values)
+        if np.any(
+                finite_parent_mask
+                & (parent_values != np.floor(parent_values))
+        ):
+            raise ValueError("All finite parent IDs must be integers.")
 
-        node_coordinates = nodes[
-            ["z", "y", "x"]
-        ].to_numpy(dtype=np.float64)
-
+        node_coordinates = nodes[["z", "y", "x"]].apply(
+            pd.to_numeric,
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
         if not np.all(np.isfinite(node_coordinates)):
             raise ValueError(
-                "The skeleton contains non-finite coordinates."
+                "The selected skeleton contains non-finite node coordinates."
             )
 
-        # --------------------------------------------------------------
-        # Find the nearest skeleton node
-        # --------------------------------------------------------------
-        coordinate_difference = (
-                node_coordinates - coordinate_zyx[None, :]
-        )
-
-        squared_distances = np.einsum(
-            "ij,ij->i",
-            coordinate_difference,
-            coordinate_difference,
-        )
-
-        nearest_position = int(np.argmin(squared_distances))
-        nearest_node_id = int(node_ids[nearest_position])
-
-        # --------------------------------------------------------------
-        # Follow parent_id from the nearest node to the root
-        # --------------------------------------------------------------
         id_to_position = {
             int(node_id): position
             for position, node_id in enumerate(node_ids)
         }
 
-        # Stored in nearest-node -> root order.
-        path_node_ids = []
+        if isinstance(nearest_node_position, pd.Series):
+            if "node_id" not in nearest_node_position.index:
+                raise ValueError(
+                    "nearest_node_position Series must contain a 'node_id' field."
+                )
+            nearest_id_value = pd.to_numeric(
+                pd.Series([nearest_node_position["node_id"]]),
+                errors="coerce",
+            ).iloc[0]
+            if (
+                    not np.isfinite(nearest_id_value)
+                    or nearest_id_value != np.floor(nearest_id_value)
+            ):
+                raise ValueError(
+                    "nearest_node_position contains an invalid node_id."
+                )
+            nearest_node_id = int(nearest_id_value)
+            if nearest_node_id not in id_to_position:
+                raise ValueError(
+                    f"Nearest node ID {nearest_node_id} does not exist in "
+                    f"skeleton index {skeleton_index}."
+                )
+            nearest_position = id_to_position[nearest_node_id]
 
+        elif isinstance(nearest_node_position, (bool, np.bool_)):
+            raise TypeError(
+                "nearest_node_position must not be a boolean value."
+            )
+
+        elif isinstance(nearest_node_position, (int, np.integer)):
+            nearest_position = int(nearest_node_position)
+            if nearest_position < 0 or nearest_position >= len(nodes):
+                raise ValueError(
+                    "nearest_node_position is outside the node-table range: "
+                    f"position={nearest_position}, node_count={len(nodes)}."
+                )
+            nearest_node_id = int(node_ids[nearest_position])
+
+        else:
+            try:
+                nearest_coordinate = np.asarray(
+                    nearest_node_position,
+                    dtype=np.float64,
+                )
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "nearest_node_position must be an integer row position, "
+                    "a pandas.Series containing node_id, or a [z, y, x] "
+                    "coordinate."
+                ) from error
+
+            if nearest_coordinate.shape != (3,):
+                raise ValueError(
+                    "A coordinate-form nearest_node_position must contain "
+                    "three values in [z, y, x] order."
+                )
+            if not np.all(np.isfinite(nearest_coordinate)):
+                raise ValueError(
+                    "nearest_node_position coordinate must contain finite values."
+                )
+
+            difference = node_coordinates - nearest_coordinate[None, :]
+            squared_distance = np.einsum(
+                "ij,ij->i",
+                difference,
+                difference,
+            )
+            nearest_position = int(np.argmin(squared_distance))
+            nearest_node_id = int(node_ids[nearest_position])
+
+        if "label" in nodes.columns:
+            label_values = pd.to_numeric(
+                nodes["label"],
+                errors="coerce",
+            ).to_numpy(dtype=np.float64)
+        else:
+            label_values = np.full(len(nodes), np.nan, dtype=np.float64)
+
+        # Trace nearest node -> first soma ancestor, otherwise -> component root.
+        path_node_ids: list[int] = []
         current_node_id = nearest_node_id
-        visited_node_ids = set()
+        visited_node_ids: set[int] = set()
 
         while True:
             if current_node_id in visited_node_ids:
                 raise ValueError(
-                    "A cycle was detected while tracing the path to root. "
+                    "A cycle was detected while tracing the path to soma/root. "
                     f"Repeated node ID: {current_node_id}."
                 )
 
             visited_node_ids.add(current_node_id)
             path_node_ids.append(current_node_id)
-
             current_position = id_to_position[current_node_id]
-            current_parent = parent_values[current_position]
 
-            # Navis/SWC roots normally have parent_id < 0.
+            current_label = label_values[current_position]
+            if (
+                    np.isfinite(current_label)
+                    and current_label == soma_label_value
+            ):
+                break
+
+            current_parent = parent_values[current_position]
             if not np.isfinite(current_parent) or current_parent < 0:
                 break
 
-            if current_parent != np.floor(current_parent):
-                raise ValueError(
-                    f"Node {current_node_id} has a non-integer parent ID: "
-                    f"{current_parent!r}."
-                )
-
             parent_node_id = int(current_parent)
-
-            # A missing parent is treated as the end/root of this component.
+            if parent_node_id == current_node_id:
+                break
             if parent_node_id not in id_to_position:
                 break
 
             current_node_id = parent_node_id
 
-        # Reverse to root -> nearest-node order.
-        root_to_nearest_ids = path_node_ids[::-1]
-
+        endpoint_to_nearest_ids = path_node_ids[::-1]
         path_positions = [
             id_to_position[node_id]
-            for node_id in root_to_nearest_ids
+            for node_id in endpoint_to_nearest_ids
         ]
+        path_nodes = nodes.iloc[path_positions].copy().reset_index(drop=True)
 
-        path_nodes = (
-            nodes.iloc[path_positions]
-            .copy()
-            .reset_index(drop=True)
-        )
-
-        # --------------------------------------------------------------
-        # Rebuild the original path parent relationships
-        # --------------------------------------------------------------
         path_node_ids_array = np.asarray(
-            root_to_nearest_ids,
+            endpoint_to_nearest_ids,
             dtype=np.int64,
         )
-
         path_parent_ids = np.full(
             len(path_node_ids_array),
             -1,
             dtype=np.int64,
         )
-
         if len(path_node_ids_array) > 1:
             path_parent_ids[1:] = path_node_ids_array[:-1]
 
         path_nodes["node_id"] = path_node_ids_array
         path_nodes["parent_id"] = path_parent_ids
 
-        # --------------------------------------------------------------
-        # Create a new node at the supplied coordinate
-        # --------------------------------------------------------------
         maximum_node_id = int(np.max(node_ids))
-
         if maximum_node_id >= np.iinfo(np.int64).max:
             raise OverflowError(
-                "Cannot create a new node ID because node_id has reached "
+                "Cannot create a coordinate node because node_id has reached "
                 "the int64 maximum."
             )
-
         coordinate_node_id = maximum_node_id + 1
 
-        # Use the nearest node as a template so custom columns are retained.
-        coordinate_node = (
-            nodes.iloc[[nearest_position]]
-            .copy()
-            .reset_index(drop=True)
+        coordinate_node = nodes.iloc[[nearest_position]].copy().reset_index(
+            drop=True
         )
-
         coordinate_node["node_id"] = np.asarray(
             [coordinate_node_id],
             dtype=np.int64,
         )
-
         coordinate_node["parent_id"] = np.asarray(
             [nearest_node_id],
             dtype=np.int64,
         )
 
-        # Preserve the original coordinate precision when it is floating point.
         for axis, column in enumerate(["z", "y", "x"]):
             original_dtype = nodes[column].dtype
-
             if pd.api.types.is_float_dtype(original_dtype):
-                value = np.asarray(
+                coordinate_node[column] = np.asarray(
                     [coordinate_zyx[axis]],
                     dtype=original_dtype,
                 )
             else:
-                # Do not truncate a non-integer coordinate into an integer column.
-                value = np.asarray(
+                coordinate_node[column] = np.asarray(
                     [coordinate_zyx[axis]],
                     dtype=np.float64,
                 )
 
-            coordinate_node[column] = value
-
-        if "label" in coordinate_node.columns:
-            label_dtype = nodes["label"].dtype
-
-            if pd.api.types.is_integer_dtype(label_dtype):
-                coordinate_node["label"] = np.asarray(
-                    [label_value],
-                    dtype=label_dtype,
-                )
-            else:
-                coordinate_node["label"] = label_value
-        else:
-            coordinate_node["label"] = label_value
-
-        # The coordinate node is the terminal node of the new path.
         if "type" in coordinate_node.columns:
             coordinate_node["type"] = "end"
 
-        # --------------------------------------------------------------
-        # Combine the root path and coordinate node
-        # --------------------------------------------------------------
         new_nodes = pd.concat(
-            [
-                path_nodes,
-                coordinate_node,
-            ],
+            [path_nodes, coordinate_node],
             ignore_index=True,
             sort=False,
         )
-
         new_nodes["node_id"] = pd.to_numeric(
             new_nodes["node_id"],
             errors="raise",
         ).astype(np.int64)
-
         new_nodes["parent_id"] = pd.to_numeric(
             new_nodes["parent_id"],
             errors="raise",
         ).astype(np.int64)
 
-        # --------------------------------------------------------------
-        # Recalculate Navis topological node types
-        # --------------------------------------------------------------
         if "type" in new_nodes.columns:
-            new_node_ids = new_nodes[
-                "node_id"
-            ].to_numpy(dtype=np.int64)
-
-            new_parent_ids = new_nodes[
-                "parent_id"
-            ].to_numpy(dtype=np.int64)
-
+            new_node_ids = new_nodes["node_id"].to_numpy(dtype=np.int64)
+            new_parent_ids = new_nodes["parent_id"].to_numpy(dtype=np.int64)
             child_counts = pd.Series(
                 new_parent_ids[new_parent_ids >= 0]
             ).value_counts()
 
-            node_types = np.full(
-                len(new_nodes),
-                "slab",
-                dtype=object,
-            )
-
+            node_types = np.full(len(new_nodes), "slab", dtype=object)
             root_mask = new_parent_ids < 0
             node_types[root_mask] = "root"
 
             for position, node_id in enumerate(new_node_ids):
                 if root_mask[position]:
                     continue
-
                 number_of_children = int(
                     child_counts.get(int(node_id), 0)
                 )
-
                 if number_of_children == 0:
                     node_types[position] = "end"
                 elif number_of_children > 1:
                     node_types[position] = "branch"
-                else:
-                    node_types[position] = "slab"
 
             new_nodes["type"] = node_types
 
-        # --------------------------------------------------------------
-        # Build the result without modifying the source skeleton
-        # --------------------------------------------------------------
         result_skeleton = skeleton.copy()
         result_skeleton.nodes = new_nodes
 
-        # Retain connectors only for original nodes included in the path.
         try:
             connectors = skeleton.connectors
-
             if (
                     isinstance(connectors, pd.DataFrame)
                     and not connectors.empty
                     and "node_id" in connectors.columns
             ):
-                retained_ids = set(root_to_nearest_ids)
-
+                retained_ids = set(endpoint_to_nearest_ids)
                 result_skeleton.connectors = connectors.loc[
                     connectors["node_id"].isin(retained_ids)
                 ].copy()
-
         except (AttributeError, TypeError, ValueError):
             pass
 
         return result_skeleton
+
 
 if __name__ == '__main__':
     path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\skeleton1"
