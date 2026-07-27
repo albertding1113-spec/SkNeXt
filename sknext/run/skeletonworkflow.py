@@ -132,4 +132,11 @@ class Skeleton_Workflow():
             self.reader.close()
 
 if __name__ == "__main__":
-    pass
+    sk = Skeleton_Workflow(
+                     skeleton_path = r"G:\Albert\data\260618_SkNeXt_dataset\skeleton2",
+                     file_path = r"G:\260501_250708_fTEEX_region2_test2.ome.zarr",
+                     result_path = r"G:\bouton",
+                     channel=[3],
+                     min_values=[30],
+                     subregion=[[2]])
+    sk.run()
