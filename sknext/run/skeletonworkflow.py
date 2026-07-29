@@ -16,7 +16,7 @@ class Skeleton_Workflow():
                  result_path,
                  channel = [0,1],
                  central_block = (256, 1024, 1024),
-                 block_halo = (32, 128, 128),
+                 block_halo = (64, 128, 128),
                  connectivity = 1,
                  min_values = [10,10],
                  subregion = [[0,1,2,3,4], [3,4]]):
@@ -104,11 +104,11 @@ class Skeleton_Workflow():
             min_coord = [[int(coord[i,0] + comp_slice[i].start), int(coord[i,0] + comp_slice[i].stop)] for i in range(3)]
             saved_json = {"sk_idx": sk_idx, "min_coord": min_coord,}
             path_to_soma = self.skeleton.get_path_to_soma_or_root(sk_idx, r_comp_center, nearest_node)
-            saved_path = self.result_dirs[ch]/str(sk_idx)/f"z{min_coord[0][0]:07d}_y{min_coord[1][0]:07d}_x{min_coord[2][0]:07d}"
+            saved_path = self.result_dirs[ch]/f"{sk_idx:05d}"/f"z{min_coord[0][0]:07d}_y{min_coord[1][0]:07d}_x{min_coord[2][0]:07d}"
             saved_path.mkdir(parents=True, exist_ok=True)
             with open(saved_path/"data.json", "w", encoding="utf-8") as f:
                 json.dump(saved_json, f, ensure_ascii=False, indent=4)
-            tifffile.imwrite(saved_path/"data.tif", one_comp, compression='lzw')
+            tifffile.imwrite(saved_path/"data.tif", one_comp.astype('uint8'), compression='lzw')
             navis.write_swc(path_to_soma, saved_path/"data.swc", labels="label")
 
     def run(self):
