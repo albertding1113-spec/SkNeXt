@@ -66,32 +66,28 @@ def read_one_3D_tif(tif_path: str|Path, output_axes:Literal["ZYX", "CZYX", "ZYXC
     return img
 
 
-def calculate_patch_coordinates(img_shape: tuple[int]|list[int], # CZYX / ZYX
-                                patch_size: tuple[int, int, int]|list[int, int, int],
-                                overlap: tuple[int, int, int]|list[int, int, int],
-                                padding: tuple[int, int, int]|list[int, int, int],) -> np.ndarray:
+def calculate_patch_coordinates(
+        img_shape: tuple[int, int, int] | list[int],
+        patch_size: tuple[int, int, int] | list[int],
+        overlap: tuple[int, int, int] | list[int] = (0, 0, 0),
+        padding: tuple[int, int, int] | list[int] = (0, 0, 0),
+):
     if len(img_shape) == 4:
         img_shape = img_shape[1:]
-    assert len(img_shape) == 3, "Input image must be 3D or 4D."
-    step = np.array(patch_size, dtype='int32') - 2*np.array(padding, dtype='int32') - np.array(overlap, dtype='int32')
-    assert np.all(step > 0), "Step of each patch should be larger than zero."
-    step_count = np.ceil(np.array(img_shape,dtype='float32') / step.astype("float32"))
-    step_count = step_count.astype('uint32')
-    patch_coordinates = np.zeros((np.prod(step_count), 3, 2), dtype="uint32")
-    patch_id = 0
-    for i in range(step_count[0]):
-        z_min = i * step[0]
-        z_max = min((i + 1) * step[0], img_shape[0])
-        for j in range(step_count[1]):
-            y_min = j * step[1]
-            y_max = min((j + 1) * step[1], img_shape[1])
-            for k in range(step_count[2]):
-                x_min = k * step[2]
-                x_max = min((k + 1) * step[2], img_shape[2])
-                patch_coordinates[patch_id, :, 0] = [z_min, y_min, x_min]
-                patch_coordinates[patch_id, :, 1] = [z_max, y_max, x_max]
-                patch_id += 1
-    return patch_coordinates
+
+    coordinates = list(
+        patch_coordinates_iter(
+            img_shape=img_shape,
+            patch_size=patch_size,
+            overlap=overlap,
+            padding=padding,
+        )
+    )
+
+    if not coordinates:
+        return np.empty((0, 3, 2), dtype=np.int64)
+
+    return np.stack(coordinates, axis=0)
 
 
 def patch_coordinates_iter(

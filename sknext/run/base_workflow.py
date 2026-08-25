@@ -31,6 +31,7 @@ class Base_Workflow(ABC):
         self.train_overlap = tuple(cfg.DATA.TRAIN.OVERLAP)
         self.train_overlap = np.int64(np.round(np.array(self.train_overlap) * np.array(self.patch_size[0:3])))
         self.train_padding = tuple(cfg.DATA.TRAIN.PADDING)
+        self.get_filter_dict()
         self.val_path = cfg.DATA.VAL.PATH
         self.val_gt_path = cfg.DATA.VAL.GT_PATH
         self.val_overlap = tuple(cfg.DATA.VAL.OVERLAP)
@@ -82,6 +83,60 @@ class Base_Workflow(ABC):
         self.block_size = np.int64(np.array(self.block_factor)* np.array(self.patch_size[0:3]))
         self.c_block_size = np.int64(np.array(self.block_central) * np.array(self.patch_size[0:3]))
         self.block_padding = np.int64(np.round((self.block_size - self.c_block_size)/2))
+
+    def get_filter_dict(self):
+        """Validate DATA.TRAIN.FILTER and expose it as a plain dictionary.
+
+        The filter is intentionally used only when the training OME-Zarr is
+        created. Validation data remains complete so validation metrics are not
+        biased toward foreground-containing patches.
+        """
+        filter_cfg = self.cfg.DATA.TRAIN.FILTER
+        enable = bool(filter_cfg.ENABLE)
+        props = list(filter_cfg.PROPS)
+        values = list(filter_cfg.VALUES)
+        signs = [str(sign).lower() for sign in filter_cfg.SIGNS]
+
+        if not (len(props) == len(values) == len(signs)):
+            raise ValueError(
+                "DATA.TRAIN.FILTER.PROPS, VALUES and SIGNS must have the same length."
+            )
+
+        supported_props = {"mean", "label_mean"}
+        supported_signs = {"gt", "ge", "lt", "le"}
+        unknown_props = [prop for prop in props if prop not in supported_props]
+        unknown_signs = [sign for sign in signs if sign not in supported_signs]
+        if unknown_props:
+            raise ValueError(
+                f"Unsupported DATA.TRAIN.FILTER.PROPS: {unknown_props}. "
+                f"Supported properties are {sorted(supported_props)}."
+            )
+        if unknown_signs:
+            raise ValueError(
+                f"Unsupported DATA.TRAIN.FILTER.SIGNS: {unknown_signs}. "
+                f"Supported signs are {sorted(supported_signs)}."
+            )
+
+        normalized_values = []
+        for value in values:
+            numeric_value = float(value)
+            if not np.isfinite(numeric_value):
+                raise ValueError(
+                    f"DATA.TRAIN.FILTER.VALUES must be finite numbers, got {value!r}."
+                )
+            normalized_values.append(numeric_value)
+
+        if enable and not props:
+            raise ValueError(
+                "DATA.TRAIN.FILTER.ENABLE is True, but no filter properties were provided."
+            )
+
+        self.filter_dict = {
+            "enable": enable,
+            "props": props,
+            "values": normalized_values,
+            "signs": signs,
+        }
 
     def get_preprocess_dict(self):
         preprocess_dict = {}

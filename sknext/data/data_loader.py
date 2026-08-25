@@ -78,7 +78,7 @@ class ZarrPatchLoader:
         return raw_patch, label_patch
 
     def patch_augment(self, patch: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray]:
-        if self.cut_out and random.uniform(0, 1) < self.da_prob / 10:
+        if self.cut_out and random.uniform(0, 1) < self.da_prob / 5:
             patch, mask = cutout(patch, mask)
         if self.g_blur and random.uniform(0, 1) < self.da_prob:
             patch = gaussian_blur(patch, self.g_sigma)
@@ -111,18 +111,66 @@ class ZarrPatchLoader:
         mask = np.ascontiguousarray(mask)
         return patch, mask
 
-    def __getitem__(self, id: int|slice) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(id, int):
-            img, mask = self.load_one_pair_patch(id)
-            img = torch.from_numpy(img.astype('float32'))
-            mask = torch.from_numpy(mask.astype('float32'))
+    def get_epoch_indices(self, shuffle: bool = False) -> np.ndarray:
+        """Return patch indices for one complete epoch.
+
+        Parameters
+        ----------
+        shuffle : bool, default=False
+            If True, return a new random permutation of all patch indices.
+            Otherwise, return indices in their original Zarr order.
+
+        Notes
+        -----
+        Each patch appears exactly once in the returned array, regardless of
+        whether shuffling is enabled.
+        """
+        if shuffle:
+            return np.random.permutation(self.num_patches).astype(np.int64, copy=False)
+        return np.arange(self.num_patches, dtype=np.int64)
+
+    def _load_index_batch(self, indices) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load an arbitrary collection of patch indices as one tensor batch."""
+        indices = np.asarray(indices)
+        if indices.ndim != 1:
+            raise IndexError(f"Batch indices must be one-dimensional, got shape {indices.shape}.")
+        if indices.size == 0:
+            raise IndexError("Batch indices must not be empty.")
+        if not np.issubdtype(indices.dtype, np.integer):
+            raise TypeError(f"Batch indices must be integers, got dtype {indices.dtype}.")
+
+        imgs = []
+        masks = []
+        for i in indices:
+            img, mask = self.load_one_pair_patch(int(i))
+            imgs.append(torch.from_numpy(img.astype("float32", copy=False)))
+            masks.append(torch.from_numpy(mask.astype("float32", copy=False)))
+
+        return torch.stack(imgs, dim=0), torch.stack(masks, dim=0)
+
+    def __getitem__(
+        self,
+        id: int | np.integer | slice | list[int] | tuple[int, ...] | np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load one patch or an arbitrary batch of patches.
+
+        Integer indexing returns one CZYX image/label pair.
+        Slice/list/tuple/ndarray indexing returns a batch in NCZYX order.
+        """
+        if isinstance(id, (int, np.integer)):
+            img, mask = self.load_one_pair_patch(int(id))
+            img = torch.from_numpy(img.astype("float32", copy=False))
+            mask = torch.from_numpy(mask.astype("float32", copy=False))
             return img, mask
-        elif isinstance(id, slice):
-            indices = range(*id.indices(self.num_patches))
-            imgs = []
-            masks = []
-            for i in indices:
-                img, mask = self.load_one_pair_patch(i)
-                imgs.append(torch.from_numpy(img.astype("float32")))
-                masks.append(torch.from_numpy(mask.astype("float32")))
-            return torch.stack(imgs, dim=0), torch.stack(masks, dim=0)
+
+        if isinstance(id, slice):
+            indices = np.arange(self.num_patches, dtype=np.int64)[id]
+            return self._load_index_batch(indices)
+
+        if isinstance(id, (list, tuple, np.ndarray)):
+            return self._load_index_batch(id)
+
+        raise TypeError(
+            "id must be an int, slice, list, tuple, or one-dimensional integer ndarray, "
+            f"got {type(id).__name__}."
+        )

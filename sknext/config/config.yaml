@@ -6,15 +6,15 @@ PATHS:
         PATH: 'E:\Albert_BigFile\Data\260618_SkNeXt_dataset\result'
 
 TASK:
-    CHANNELS: ["F", "C", "P", "S.soma", "S.spine", "S.bouton"]
-    CHANNELS_EXTRA_OPTS: [{"P":{"type": "skeleton", "dilation": 1}}]
-    CHANNEL_WEIGHTS: [1, 1, 1, 1, 1, 1]
+    CHANNELS: ["F", "P", "S.soma", "S.spine", "S.bouton"]
+    CHANNELS_EXTRA_OPTS: [{"P":{"type": "skeleton", "dilation": 2}}]
+    CHANNEL_WEIGHTS: [1, 1, 1, 1, 1]
     WATERSHED:
-        SEED_CHANNELS: ["C", "P"]
+        SEED_CHANNELS: ["P"]
         SEED_CHANNELS_THRESH: ["auto", "auto"]
         TOPOGRAPHIC_SURFACE_CHANNEL: "F"
         GROWTH_MASK_CHANNELS: ["F"]
-        GROWTH_MASK_CHANNELS_THRESH: [0.1]
+        GROWTH_MASK_CHANNELS_THRESH: [0.3]
 
 DATA:
     PATCH_SIZE: [32, 128, 128, 1]

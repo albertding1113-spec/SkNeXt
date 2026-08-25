@@ -359,10 +359,22 @@ class SkeletonManager():
             raise ValueError("There are no non-empty skeletons to plot.")
 
         number_of_components = len(component_skeletons)
-        colormap = plt.get_cmap(palette, number_of_components)
+
+        colormap = plt.get_cmap(palette)
+
+        # Uniformly sample colors from the colormap
+        color_positions = np.linspace(
+            0.0,
+            1.0,
+            number_of_components,
+        )
+
+        # Randomly assign sampled colors to skeleton components
+        np.random.shuffle(color_positions)
+
         component_colors = [
-            colormap(index)
-            for index in range(number_of_components)
+            colormap(position)
+            for position in color_positions
         ]
 
         viewer = navis.plot3d(
@@ -370,7 +382,12 @@ class SkeletonManager():
             color=component_colors,
             backend="octarine",
         )
+
+        # White background
+        viewer.set_bgcolor("white")
+
         viewer.show(start_loop=True)
+
         return viewer
 
     def get_skeletons_index(self, new_skeletons: navis.NeuronList) -> list[int]:
@@ -1774,12 +1791,13 @@ class SkeletonManager():
 
 
 if __name__ == '__main__':
-    path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\skeleton1"
+    path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\Skeleton1"
     Skeleton = SkeletonManager(path)
-    boudary = np.array([[0, 500],[8000,8200],[8000,8200]])
-    cropped = Skeleton.crop_skeletons(boudary)
-    print(len(cropped))
-    print(type(cropped))
+    viewer = Skeleton.plot3d(palette="Dark2")
+    # boudary = np.array([[0, 500],[8000,8200],[8000,8200]])
+    # cropped = Skeleton.crop_skeletons(boudary)
+    # print(len(cropped))
+    # print(type(cropped))
     # print(Skeleton.get_skeletons_index(cropped))
     # print(cropped[0].nodes)
     # mask = Skeleton.create_cropped_skeleton_mask(cropped, boudary)

@@ -120,57 +120,349 @@ def remove_zarr_if_exists(zarr_path: str | Path):
         raise RuntimeError(f"Unsupported path type: {zarr_path}")
 
 
+def _normalize_patch_filter(filter_dict: dict | None) -> dict:
+    """Validate and normalize patch-filter configuration."""
+    if filter_dict is None:
+        return {"enable": False, "props": [], "values": [], "signs": []}
+    if not isinstance(filter_dict, dict):
+        raise TypeError(
+            f"filter_dict must be a dict or None, got {type(filter_dict).__name__}."
+        )
+
+    enable = bool(filter_dict.get("enable", False))
+    props = list(filter_dict.get("props", []))
+    values = list(filter_dict.get("values", []))
+    signs = [str(sign).lower() for sign in filter_dict.get("signs", [])]
+
+    if not (len(props) == len(values) == len(signs)):
+        raise ValueError(
+            "filter props, values and signs must have the same length."
+        )
+
+    supported_props = {"mean", "label_mean"}
+    supported_signs = {"gt", "ge", "lt", "le"}
+    unknown_props = [prop for prop in props if prop not in supported_props]
+    unknown_signs = [sign for sign in signs if sign not in supported_signs]
+    if unknown_props:
+        raise ValueError(
+            f"Unsupported filter properties: {unknown_props}. "
+            f"Supported properties are {sorted(supported_props)}."
+        )
+    if unknown_signs:
+        raise ValueError(
+            f"Unsupported filter signs: {unknown_signs}. "
+            f"Supported signs are {sorted(supported_signs)}."
+        )
+
+    normalized_values = []
+    for value in values:
+        numeric_value = float(value)
+        if not np.isfinite(numeric_value):
+            raise ValueError(f"Filter values must be finite, got {value!r}.")
+        normalized_values.append(numeric_value)
+
+    if enable and not props:
+        raise ValueError("Patch filtering is enabled, but no properties were provided.")
+
+    return {
+        "enable": enable,
+        "props": props,
+        "values": normalized_values,
+        "signs": signs,
+    }
+
+
+def _crop_patch(img: np.ndarray, coord: np.ndarray) -> np.ndarray:
+    """Crop one ZYX/CZYX patch using a (3, 2) coordinate array."""
+    z0, z1 = map(int, coord[0])
+    y0, y1 = map(int, coord[1])
+    x0, x1 = map(int, coord[2])
+    if img.ndim == 4:
+        return img[:, z0:z1, y0:y1, x0:x1]
+    if img.ndim == 3:
+        return img[z0:z1, y0:y1, x0:x1]
+    raise ValueError(f"img must be CZYX or ZYX, got shape {img.shape}.")
+
+
+def patch_satisfies_filter(
+    raw_img: np.ndarray,
+    gt_img_dict: dict[str, np.ndarray],
+    coord: np.ndarray,
+    patch_size: Sequence[int],
+    filter_dict: dict | None,
+) -> bool:
+    """Return True when a candidate training patch satisfies all filters.
+
+    Supported properties
+    --------------------
+    mean
+        Mean intensity of the original raw patch before preprocessing. For a
+        multi-channel raw image the mean is taken across all channels/voxels.
+
+    label_mean
+        Fraction of spatial voxels occupied by at least one non-zero value in
+        the original GT labels. When several GT label volumes are present they
+        are combined by logical OR before the fraction is calculated.
+
+    Notes
+    -----
+    Candidate patches can be smaller at an image boundary. The same reflect/
+    edge padding used for the saved training patch is applied before filter
+    statistics are calculated, so the statistic describes the actual patch
+    shape written to Zarr.
+    """
+    normalized = _normalize_patch_filter(filter_dict)
+    if not normalized["enable"]:
+        return True
+
+    requested_props = set(normalized["props"])
+    measured: dict[str, float] = {}
+
+    if "mean" in requested_props:
+        raw_patch = _crop_patch(raw_img, coord)
+        raw_patch = reflect_padding_img(raw_patch, tuple(map(int, patch_size)))
+        measured["mean"] = float(np.mean(raw_patch, dtype=np.float64))
+
+    if "label_mean" in requested_props:
+        if not gt_img_dict:
+            raise ValueError(
+                "label_mean filter requires at least one ground-truth label volume."
+            )
+        label_union = None
+        for gt_img in gt_img_dict.values():
+            gt_patch = _crop_patch(gt_img, coord)
+            current_mask = gt_patch != 0
+            if label_union is None:
+                label_union = current_mask.copy()
+            else:
+                label_union |= current_mask
+        assert label_union is not None
+        label_union = reflect_padding_img(
+            label_union,
+            tuple(map(int, patch_size)),
+        )
+        measured["label_mean"] = float(np.mean(label_union, dtype=np.float64))
+
+    comparisons = {
+        "gt": lambda lhs, rhs: lhs > rhs,
+        "ge": lambda lhs, rhs: lhs >= rhs,
+        "lt": lambda lhs, rhs: lhs < rhs,
+        "le": lambda lhs, rhs: lhs <= rhs,
+    }
+
+    for prop, threshold, sign in zip(
+        normalized["props"],
+        normalized["values"],
+        normalized["signs"],
+    ):
+        property_value = measured[prop]
+        if not np.isfinite(property_value):
+            return False
+        if not comparisons[sign](property_value, threshold):
+            return False
+    return True
+
+
+def _update_patch_zarr_metadata(
+    root: zarr.Group,
+    data_raw: zarr.Array,
+    data_label: zarr.Array,
+    filter_dict: dict,
+) -> None:
+    """Synchronize SkNeXt metadata after Zarr arrays have been resized."""
+    metadata = dict(root.attrs.get("sknext", {}))
+    metadata["num_patches"] = int(data_raw.shape[0])
+    arrays = dict(metadata.get("arrays", {}))
+    raw_meta = dict(arrays.get("raw", {}))
+    label_meta = dict(arrays.get("label", {}))
+    raw_meta["shape"] = [int(value) for value in data_raw.shape]
+    label_meta["shape"] = [int(value) for value in data_label.shape]
+    arrays["raw"] = raw_meta
+    arrays["label"] = label_meta
+    metadata["arrays"] = arrays
+    metadata["filter"] = {
+        "enabled": bool(filter_dict["enable"]),
+        "props": list(filter_dict["props"]),
+        "values": [float(value) for value in filter_dict["values"]],
+        "signs": list(filter_dict["signs"]),
+    }
+    root.attrs["sknext"] = metadata
+
+
 def tif_list_to_zarr(
         tif_list: list[Path | str],
         gt_tif_dict: dict[str, Path | str],
         zarr_path: Path | str,
-        patch_size: tuple[int, int, int, int] | list[int, int, int, int],#ZYXC
-        overlap: tuple[int, int, int] | list[int, int, int],
-        padding: tuple[int, int, int] | list[int, int, int],
-        preprocess_dict: dict = {},
-        channels: list[str] = [],
-        channel_extra_opts: dict={},
+        patch_size: tuple[int, int, int, int] | list[int],  # ZYXC
+        overlap: tuple[int, int, int] | list[int],
+        padding: tuple[int, int, int] | list[int],
+        preprocess_dict: dict | None = None,
+        channels: list[str] | tuple[str, ...] = (),
+        channel_extra_opts: dict | None = None,
+        filter_dict: dict | None = None,
 ):
-    for key in gt_tif_dict.keys():
-        assert len(tif_list) == len(gt_tif_dict[key]), "raw and label images must have the same num"
-        if not (key == "instance" or key in channels): raise ValueError(f"Unsupported key name: {key}")
-    patch_num = 0
-    raw_patch_id = 0
-    label_patch_id = 0
-    for i in tqdm(range(len(tif_list))):
-        _tif_path = tif_list[i]
-        _gt_tif_dict = {key:value[i] for key, value in gt_tif_dict.items()}
-        _img = read_one_3D_tif(_tif_path, "CZYX")
-        _gt_img_dict = {key:read_one_3D_tif(value, "ZYX") for key, value in _gt_tif_dict.items()}
-        for _gt_img in _gt_img_dict.values():
-            assert _img.shape[1:] == _gt_img.shape, "raw and label image must have the same shape"
-        _coord = calculate_patch_coordinates(_img.shape, patch_size[0:3], overlap, padding)
-        patch_num += _coord.shape[0]
-        # preprocessing raw images and labels
-        _img = preprocess_img(_img, preprocess_dict)  # float32, CZYX
-        # generate channels from labels
-        _gt_ch_list = generate_channels_from_labels(_gt_img_dict, channels, channel_extra_opts)
-        if i == 0:
-            root, data_raw, data_label = create_patch_ome_zarr(zarr_path, patch_num, patch_size[3], len(_gt_ch_list),
-                                                               patch_size[0:3], raw_dtype=_img.dtype, label_dtype="uint8")
-        elif i > 0:
-            data_raw.resize((patch_num, patch_size[3], *patch_size[0:3]))
-            data_label.resize((patch_num, len(_gt_ch_list), *patch_size[0:3]))
-        for _patch,_ in patch_coordinates_generator(_img, _coord):
-            # reflect_padding
-            _patch = reflect_padding_img(_patch, patch_size[0:3])
-            data_raw[raw_patch_id, :, :, :, :] = _patch
-            raw_patch_id += 1
-        for j,_gt_ch in enumerate(_gt_ch_list):
-            k = label_patch_id
-            for _patch,_ in patch_coordinates_generator(_gt_ch, _coord):
-                # reflect_padding
-                _patch = reflect_padding_img(_patch, patch_size[0:3])
-                data_label[k, j, :, :, :] = _patch
-                k += 1
-        label_patch_id = k
-    return data_raw, data_label
+    """Convert paired TIFF volumes into an NCZYX patch Zarr dataset.
 
+    When ``filter_dict['enable']`` is True, candidate patches that do not
+    satisfy every configured condition are skipped entirely. The Zarr N axis
+    is grown only by the number of accepted patches, so rejected patches never
+    appear as zero-filled samples.
+    """
+    preprocess_dict = {} if preprocess_dict is None else preprocess_dict
+    channel_extra_opts = {} if channel_extra_opts is None else channel_extra_opts
+    filter_dict = _normalize_patch_filter(filter_dict)
+
+    if len(patch_size) != 4:
+        raise ValueError("patch_size must contain four values in ZYXC order.")
+    spatial_patch_size = tuple(map(int, patch_size[0:3]))
+    expected_raw_channels = int(patch_size[3])
+
+    for key in gt_tif_dict.keys():
+        if len(tif_list) != len(gt_tif_dict[key]):
+            raise ValueError("raw and label images must have the same number of files.")
+        if not (key == "instance" or key in channels):
+            raise ValueError(f"Unsupported key name: {key}")
+
+    # Remove an old output immediately. This also prevents a stale dataset from
+    # surviving when every candidate patch is rejected by the filter.
+    remove_zarr_if_exists(zarr_path)
+
+    root = None
+    data_raw = None
+    data_label = None
+    saved_patch_num = 0
+    candidate_patch_num = 0
+    rejected_patch_num = 0
+
+    for i in tqdm(range(len(tif_list))):
+        tif_path = tif_list[i]
+        one_gt_path_dict = {key: value[i] for key, value in gt_tif_dict.items()}
+        raw_img = read_one_3D_tif(tif_path, "CZYX")
+        gt_img_dict = {
+            key: read_one_3D_tif(value, "ZYX")
+            for key, value in one_gt_path_dict.items()
+        }
+
+        if raw_img.shape[0] != expected_raw_channels:
+            raise ValueError(
+                f"Raw channel count ({raw_img.shape[0]}) does not match "
+                f"patch_size C ({expected_raw_channels}) for {tif_path}."
+            )
+        for gt_img in gt_img_dict.values():
+            if raw_img.shape[1:] != gt_img.shape:
+                raise ValueError("raw and label image must have the same spatial shape.")
+
+        coords = calculate_patch_coordinates(
+            raw_img.shape,
+            spatial_patch_size,
+            overlap,
+            padding,
+        )
+        candidate_patch_num += int(coords.shape[0])
+
+        if filter_dict["enable"]:
+            keep_flags = np.fromiter(
+                (
+                    patch_satisfies_filter(
+                        raw_img,
+                        gt_img_dict,
+                        coord,
+                        spatial_patch_size,
+                        filter_dict,
+                    )
+                    for coord in coords
+                ),
+                dtype=bool,
+                count=coords.shape[0],
+            )
+            kept_coords = coords[keep_flags]
+            rejected_patch_num += int(coords.shape[0] - kept_coords.shape[0])
+        else:
+            kept_coords = coords
+
+        kept_num = int(kept_coords.shape[0])
+        if kept_num == 0:
+            continue
+
+        # Expensive preprocessing/channel generation is deferred until we know
+        # this source image contributes at least one patch.
+        processed_img = preprocess_img(raw_img, preprocess_dict)  # float32, CZYX
+        gt_ch_list = generate_channels_from_labels(
+            gt_img_dict,
+            channels,
+            channel_extra_opts,
+        )
+        if len(gt_ch_list) == 0:
+            raise ValueError("No output label channels were generated.")
+
+        old_saved_patch_num = saved_patch_num
+        saved_patch_num += kept_num
+
+        if root is None:
+            root, data_raw, data_label = create_patch_ome_zarr(
+                zarr_path,
+                saved_patch_num,
+                expected_raw_channels,
+                len(gt_ch_list),
+                spatial_patch_size,
+                raw_dtype=processed_img.dtype,
+                label_dtype="uint8",
+                overwrite=False,
+            )
+        else:
+            assert data_raw is not None and data_label is not None
+            if data_label.shape[1] != len(gt_ch_list):
+                raise ValueError(
+                    "Generated label channel count changed between input images: "
+                    f"expected {data_label.shape[1]}, got {len(gt_ch_list)}."
+                )
+            data_raw.resize(
+                (saved_patch_num, expected_raw_channels, *spatial_patch_size)
+            )
+            data_label.resize(
+                (saved_patch_num, len(gt_ch_list), *spatial_patch_size)
+            )
+
+        assert data_raw is not None and data_label is not None
+        for local_index, coord in enumerate(kept_coords):
+            patch_id = old_saved_patch_num + local_index
+
+            raw_patch = _crop_patch(processed_img, coord)
+            raw_patch = reflect_padding_img(raw_patch, spatial_patch_size)
+            data_raw[patch_id, :, :, :, :] = raw_patch
+
+            for channel_index, gt_channel in enumerate(gt_ch_list):
+                label_patch = _crop_patch(gt_channel, coord)
+                label_patch = reflect_padding_img(label_patch, spatial_patch_size)
+                data_label[patch_id, channel_index, :, :, :] = label_patch
+
+    if root is None or data_raw is None or data_label is None:
+        criteria = ", ".join(
+            f"{prop} {sign} {value}"
+            for prop, sign, value in zip(
+                filter_dict["props"],
+                filter_dict["signs"],
+                filter_dict["values"],
+            )
+        )
+        raise ValueError(
+            "No training patches were saved. "
+            f"candidate_patches={candidate_patch_num}, filter_enabled={filter_dict['enable']}, "
+            f"criteria=[{criteria}]."
+        )
+
+    _update_patch_zarr_metadata(root, data_raw, data_label, filter_dict)
+
+    if filter_dict["enable"]:
+        print(
+            "Patch filter summary: "
+            f"candidates={candidate_patch_num}, "
+            f"saved={saved_patch_num}, "
+            f"rejected={rejected_patch_num}",
+            flush=True,
+        )
+
+    return data_raw, data_label
 
 def read_stack_from_ims(
     ims_path: str | Path,

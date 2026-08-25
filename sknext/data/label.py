@@ -4,10 +4,53 @@ import numpy as np
 from typing import Literal
 from scipy.ndimage import binary_dilation, binary_erosion, generate_binary_structure
 from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import shortest_path, connected_components
 from skimage.measure import regionprops
 from skimage.morphology import skeletonize
 from skimage.segmentation import find_boundaries, watershed as skimage_watershed
 from skimage.filters import threshold_otsu
+
+
+def _parse_p_channel_options(extra_opts: dict | None = None) -> tuple[str, str, int, int]:
+    """Validate and normalize options for the P (point/center) channel.
+
+    Returns
+    -------
+    tuple
+        ``(point_type, skeleton_mode, dilation, erosion)``.
+
+    Notes
+    -----
+    ``point_type`` must be either ``"skeleton"`` or ``"centroid"``.
+    ``skeleton_mode`` must be either ``"full"`` or ``"main"``.
+    Invalid values raise immediately instead of silently producing a wrong P channel.
+    """
+    if extra_opts is None:
+        extra_opts = {}
+    if not isinstance(extra_opts, dict):
+        raise TypeError(
+            f"P channel options must be a dict, got {type(extra_opts).__name__}."
+        )
+
+    point_type = extra_opts.get("type", "skeleton")
+    skeleton_mode = extra_opts.get("skeleton_mode", "full")
+    dilation = extra_opts.get("dilation", 0)
+    erosion = extra_opts.get("erosion", 0)
+
+    if point_type not in ("skeleton", "centroid"):
+        raise ValueError(
+            f"Unknown P channel type: {point_type!r}. "
+            "Expected 'skeleton' or 'centroid'."
+        )
+    if skeleton_mode not in ("full", "main"):
+        raise ValueError(
+            f"Unknown P skeleton_mode: {skeleton_mode!r}. "
+            "Expected 'full' or 'main'."
+        )
+
+    return point_type, skeleton_mode, dilation, erosion
 
 
 def generate_channels_from_labels(labels_dict: dict[np.ndarray], # ZYX
@@ -27,14 +70,16 @@ def generate_channels_from_labels(labels_dict: dict[np.ndarray], # ZYX
             _ch_img = mask_dilation_erosion(_ch_img, dilation, erosion)
             ch_img_list.append(_ch_img)
         elif channel == "P":
-            extra_opts = channel_extra_opts.get(channel, {"type": "skeleton"})
-            type =  extra_opts.get("type", "skeleton")
-            dilation = extra_opts.get("dilation", 0)
-            erosion = extra_opts.get("erosion", 0)
+            extra_opts = channel_extra_opts.get(channel, {})
+            point_type, sk_mode, dilation, erosion = _parse_p_channel_options(extra_opts)
             _ch_img = labels_dict["instance"].copy()
-            if type == "skeleton":
-                _ch_img = reconstruct_skeleton_from_mask(_ch_img)
-            elif type == "centroid":
+            if point_type == "skeleton":
+                # Important: main-branch pruning is performed independently for
+                # every instance inside reconstruct_skeleton_from_mask(). This
+                # prevents one large instance from deleting the skeletons of
+                # all other instances in the patch.
+                _ch_img = reconstruct_skeleton_from_mask(_ch_img, mode=sk_mode)
+            else:  # point_type == "centroid"
                 _ch_img = reconstruct_centroid_from_mask(_ch_img)
             _ch_img = mask_dilation_erosion(_ch_img, dilation, erosion)
             ch_img_list.append(_ch_img)
@@ -66,51 +111,6 @@ def generate_channels_from_labels(labels_dict: dict[np.ndarray], # ZYX
             ch_img_list.append(_ch_img)
         else: raise NotImplementedError(f"Unknown channel: f{channel}")
     return ch_img_list
-
-def generate_channels_from_instance_labels(labels: np.ndarray, # ZYX
-                                           channels: list[str]|tuple[str],
-                                           channel_extra_opts: dict = {}) -> list[np.ndarray]:
-    assert labels.ndim == 3, "labels should be a 3d array"
-    ch_img_list = []
-    for channel in channels:
-        assert channel in ["F", "P", "C", "A"], "channel must be one of ['F', 'P', 'C', 'A']."
-        if channel == "F":
-            extra_opts = channel_extra_opts.get(channel, {})
-            dilation = extra_opts.get("dilation", 0)
-            erosion = extra_opts.get("erosion", 0)
-            one_ch_img = (labels > 0).astype(np.uint8)
-            one_ch_img = mask_dilation_erosion(one_ch_img, dilation, erosion)
-            ch_img_list.append(one_ch_img)
-        elif channel == "P":
-            extra_opts = channel_extra_opts.get(channel, {"type": "skeleton"})
-            type =  extra_opts.get("type", "skeleton")
-            dilation = extra_opts.get("dilation", 0)
-            erosion = extra_opts.get("erosion", 0)
-            if type == "skeleton":
-                one_ch_img = reconstruct_skeleton_from_mask(labels)
-            elif type == "centroid":
-                one_ch_img = reconstruct_centroid_from_mask(labels)
-            one_ch_img = mask_dilation_erosion(one_ch_img, dilation, erosion)
-            ch_img_list.append(one_ch_img)
-        elif channel == "C":
-            extra_opts = channel_extra_opts.get(channel, {"mode": "inner"})
-            contour_mode = extra_opts.get("mode", "inner")
-            one_ch_img = reconstruct_contour_from_mask(labels, contour_mode)
-            ch_img_list.append(one_ch_img)
-        elif channel == "A":
-            assert len(channels) == 1, "Affinity channel should be used alone."
-            extra_opts = channel_extra_opts.get(channel, {"z_affinities": [1], "y_affinities": [1], "x_affinities": [1]})
-            z_affinities = extra_opts.get("z_affinities", [1])
-            y_affinities = extra_opts.get("y_affinities", [1])
-            x_affinities = extra_opts.get("x_affinities", [1])
-            assert len(z_affinities) == len(y_affinities) == len(x_affinities), "ZYX affinities should have same length."
-            one_ch_img = calc_affinities_from_mask(labels, {"z_affinities": z_affinities,
-                                                            "y_affinities": y_affinities,
-                                                            "x_affinities": x_affinities})
-            for i in range(one_ch_img.shape[0]):
-                ch_img_list.append(one_ch_img[i, :, :, :])
-    return ch_img_list
-
 
 def mask_dilation_erosion(img: np.ndarray,
                           dilation: int = 0,
@@ -151,15 +151,53 @@ def mask_dilation_erosion(img: np.ndarray,
     return result.astype(original_dtype)
 
 
-def reconstruct_skeleton_from_mask(labels: np.ndarray) -> np.ndarray:
-    assert labels.ndim == 3, "labels should be a 3d array"
-    skeleton_labels = np.zeros_like(labels)
-    props = regionprops(labels)
-    for prop in props:
+def reconstruct_skeleton_from_mask(
+    labels: np.ndarray,
+    mode: Literal["full", "main"] = "full",
+) -> np.ndarray:
+    """Generate a binary skeleton channel from an instance-label volume.
+
+    Each instance is skeletonized independently. When ``mode="main"``,
+    ``skeleton_main_branch`` is also applied independently to each instance
+    before the results are merged. This is essential for multi-instance
+    patches: applying main-branch pruning after merging all skeletons would
+    retain only the largest connected skeleton component and discard the
+    other instances.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        3D instance-label image in ZYX order. Background must be 0 and each
+        positive integer identifies one instance.
+
+    mode : {"full", "main"}, default="full"
+        ``"full"`` keeps the complete skeleton of every instance.
+        ``"main"`` keeps the longest path of every instance skeleton.
+
+    Returns
+    -------
+    np.ndarray
+        Binary uint8 skeleton mask with the same shape as ``labels``.
+    """
+    labels = np.asarray(labels)
+    if labels.ndim != 3:
+        raise ValueError(
+            f"labels should be a 3D ZYX array, got shape {labels.shape}."
+        )
+    if mode not in ("full", "main"):
+        raise ValueError(
+            f"Unknown skeleton mode: {mode!r}. Expected 'full' or 'main'."
+        )
+
+    skeleton_mask = np.zeros(labels.shape, dtype=bool)
+
+    for prop in regionprops(labels):
         instance_id = prop.label
         z0, y0, x0, z1, y1, x1 = prop.bbox
         instance_crop = labels[z0:z1, y0:y1, x0:x1] == instance_id
-        # add padding to avoid border effect
+
+        # Pad each instance independently to reduce skeletonization artifacts
+        # when the instance touches its local bounding-box boundary.
         padded_mask = np.pad(
             instance_crop,
             pad_width=1,
@@ -167,11 +205,15 @@ def reconstruct_skeleton_from_mask(labels: np.ndarray) -> np.ndarray:
             constant_values=False,
         )
         skeleton_crop = skeletonize(padded_mask)
-        # remove padding
         skeleton_crop = skeleton_crop[1:-1, 1:-1, 1:-1]
-        target = skeleton_labels[z0:z1, y0:y1, x0:x1]
-        target[skeleton_crop] = instance_id
-    return (skeleton_labels > 0).astype('uint8')
+
+        if mode == "main":
+            skeleton_crop = skeleton_main_branch(skeleton_crop)
+
+        target = skeleton_mask[z0:z1, y0:y1, x0:x1]
+        target |= skeleton_crop.astype(bool, copy=False)
+
+    return skeleton_mask.astype(np.uint8)
 
 
 def reconstruct_centroid_from_mask(labels:np.ndarray) -> np.ndarray:
@@ -507,3 +549,60 @@ def watershed_with_sk(
     if np.max(instances, initial=0) > np.iinfo(np.uint16).max:
         raise OverflowError("Watershed output IDs exceed uint16 range.")
     return instances.astype(np.uint16, copy=False)
+
+def skeleton_main_branch(sk: np.ndarray) -> np.ndarray:
+    coords = np.argwhere(sk)
+    n = len(coords)
+    if n < 3:
+        return sk.copy()
+
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=np.sqrt(sk.ndim) + 1e-6, output_type="ndarray")
+    if len(pairs) == 0:
+        return sk.copy()
+
+    weights = np.linalg.norm(coords[pairs[:, 0]] - coords[pairs[:, 1]], axis=1)
+    graph = coo_matrix(
+        (
+            np.concatenate([weights, weights]),
+            (
+                np.concatenate([pairs[:, 0], pairs[:, 1]]),
+                np.concatenate([pairs[:, 1], pairs[:, 0]]),
+            ),
+        ),
+        shape=(n, n),
+    ).tocsr()
+
+    # Keep only the largest connected component (skeletonize can leave stray isolated
+    # pixels behind) so the shortest-path search below cannot land on an unreachable node.
+    n_components, comp_labels = connected_components(graph, directed=False)
+    if n_components > 1:
+        main_comp = np.argmax(np.bincount(comp_labels))
+        keep = np.flatnonzero(comp_labels == main_comp)
+        coords = coords[keep]
+        graph = graph[keep][:, keep]
+        if len(coords) < 3:
+            main = np.zeros_like(sk)
+            main[tuple(coords.T)] = True
+            return main
+
+    # Two-pass search for the tree's diameter: the farthest node from an arbitrary
+    # start, then the farthest node from there, are the two ends of the main branch.
+    dist_from_0 = shortest_path(graph, method="D", directed=False, indices=0)
+    end_a = int(np.argmax(dist_from_0))
+    dist_from_a, predecessors = shortest_path(
+        graph, method="D", directed=False, indices=end_a, return_predecessors=True
+    )
+    end_b = int(np.argmax(dist_from_a))
+
+    path_idx = [end_b]
+    while path_idx[-1] != end_a:
+        prev = predecessors[path_idx[-1]]
+        if prev < 0:
+            break
+        path_idx.append(prev)
+
+    main = np.zeros_like(sk)
+    main[tuple(coords[path_idx].T)] = True
+    return main
+

@@ -95,10 +95,12 @@ class Segmentation_Workflow(Base_Workflow):
         self.val_zarr_path = Path(self.val_path).parent / "val.ome.zarr"
         tif_list_to_zarr(self.train_tif_list, self.train_gt_tif_dict, self.train_zarr_path, self.patch_size,
                          self.train_overlap, self.train_padding, self.preprocess_dict, self.channels,
-                         self.channels_extra_opts)
+                         self.channels_extra_opts, filter_dict=self.filter_dict)
+        # Validation data is intentionally not filtered, otherwise the validation
+        # distribution and reported metrics would be biased toward retained patches.
         tif_list_to_zarr(self.val_tif_list, self.val_gt_tif_dict, self.val_zarr_path, self.patch_size,
                          self.val_overlap, self.val_padding, self.preprocess_dict, self.channels,
-                         self.channels_extra_opts)
+                         self.channels_extra_opts, filter_dict=None)
 
     def define_activations_and_channels(self):
         self.out_channel_num = 0
@@ -289,9 +291,17 @@ class Segmentation_Workflow(Base_Workflow):
         best_val_loss = self.best_val_loss  # float('inf')
         best_val_metrics = {}
         epochs_without_improvement = 0
+
+        shuffle_train = bool(get_cfg_value(self.cfg,"AUGMENTOR.SHUFFLE_TRAIN_DATA_EACH_EPOCH",True,))
+        shuffle_val = bool(get_cfg_value(self.cfg,"AUGMENTOR.SHUFFLE_VAL_DATA_EACH_EPOCH",False,))
+        print(f"{time_str()} patch order: train_shuffle={shuffle_train}, val_shuffle={shuffle_val}", flush=True)
+
         for epoch in range(self.epochs):
             epoch_number = epoch + 1
             print(f"{time_str()} [EPOCH{epoch_number:04d}]", flush=True)
+            # Generate a fresh permutation at the beginning of every epoch.
+            # Every training patch is still used exactly once per epoch.
+            train_indices = self.train_patch_loader.get_epoch_indices(shuffle=shuffle_train,)
             self.model.train()
             epoch_train_loss = 0
             epoch_train_metrics = {}  # {"F" 0.0:, "P": 0.0}
@@ -301,7 +311,8 @@ class Segmentation_Workflow(Base_Workflow):
                 self.optimizer.zero_grad()
                 start_ = step * self.batch_size
                 end_ = min((step + 1) * self.batch_size, self.train_patches)
-                img, mask = self.train_patch_loader[start_:end_]
+                batch_indices = train_indices[start_:end_]
+                img, mask = self.train_patch_loader[batch_indices]
                 img = img.to(self.device, non_blocking=True)
                 mask = mask.to(self.device, non_blocking=True)
                 pred = self.model(img)
@@ -330,6 +341,7 @@ class Segmentation_Workflow(Base_Workflow):
             print(f"{time_str()} [EPOCH{epoch_number:04d}] [TRAIN] loss: {epoch_train_loss:.6f}, {metric_str}", flush=True)
 
             # validation
+            val_indices = self.val_patch_loader.get_epoch_indices(shuffle=shuffle_val,)
             self.model.eval()
             epoch_val_loss = 0
             epoch_val_metrics = {}
@@ -338,7 +350,8 @@ class Segmentation_Workflow(Base_Workflow):
                 for step in range(self.val_steps_per_epoch):
                     start_ = step * self.batch_size
                     end_ = min((step + 1) * self.batch_size, self.val_patches)
-                    img, mask = self.val_patch_loader[start_:end_]
+                    batch_indices = val_indices[start_:end_]
+                    img, mask = self.val_patch_loader[batch_indices]
                     img = img.to(self.device, non_blocking=True)
                     mask = mask.to(self.device, non_blocking=True)
                     pred = self.model(img)

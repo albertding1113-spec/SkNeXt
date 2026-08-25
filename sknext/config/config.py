@@ -4,13 +4,6 @@ import copy
 from typing import Dict, Optional
 from pathlib import Path
 
-"""
-待做的事情
-2. 正式在集群上跑起来SkNeXt的训练
-3. 写出ims / hdf5 / ome-zarr文件的reader。ome-zarr格式兼容主流软件
-4. 写出ome-zarr文件的writer
-5. 写出完整的infer流程
-"""
 
 class SkNeXt_Config:
     def __init__(self, job_id:Optional[int|str]):
@@ -45,6 +38,7 @@ class SkNeXt_Config:
         #   "erosion": int. Default: 0.
         # "P" channel options:
         #   "type": str. "skeleton", "centroid". Default: "skeleton".
+        #   "skeleton_mode": "full", "main". Default: "full".
         #   "dilation": int. Default: 0.
         #   "erosion": int. Default: 0.
         # "C" channel options:
@@ -117,9 +111,24 @@ class SkNeXt_Config:
         #   - ...
         _C.DATA.TRAIN.GT_PATH = "./label/"
         # Percentage of overlap in (z,y,x) when cropping. Tuple of floats between range [0, 1).
-        _C.DATA.TRAIN.OVERLAP = (0, 0, 0)
+        _C.DATA.TRAIN.OVERLAP = (0.25, 0.25, 0.25)
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
         _C.DATA.TRAIN.PADDING = (0, 0, 0)
+        # 4.2.1 FILTERS
+        _C.DATA.TRAIN.FILTER = CN()
+        # Use filters to filter out unwanted TRAINING patches before they are
+        # written into train.ome.zarr. Validation patches are not filtered.
+        _C.DATA.TRAIN.FILTER.ENABLE = False
+        # Properties used to filter one patch. Supported: ['mean', 'label_mean'].
+        # mean: mean intensity of the original raw patch (before normalization).
+        # label_mean: fraction of voxels occupied by any non-zero original GT label.
+        _C.DATA.TRAIN.FILTER.PROPS = ['label_mean']
+        # Threshold values corresponding one-to-one with PROPS.
+        _C.DATA.TRAIN.FILTER.VALUES = [1e-6]
+        # Comparison signs corresponding one-to-one with PROPS.
+        # Options: 'gt' (>), 'ge' (>=), 'lt' (<), 'le' (<=).
+        # When several filters are provided, all conditions must be satisfied.
+        _C.DATA.TRAIN.FILTER.SIGNS = ['gt']
         # 4.3. VALIDATE
         _C.DATA.VAL = CN()
         _C.DATA.VAL.PATH = "./raw/"
@@ -301,7 +310,7 @@ class SkNeXt_Config:
         _C.TRAIN.PATIENCE = 100
         # 7.1. LR Scheduler
         _C.TRAIN.LR_SCHEDULER = CN()
-        # Ooptions: "warmupcosine", "onecycle"
+        # Ooptions: "warmupcosine", "one_cycle"
         _C.TRAIN.LR_SCHEDULER.NAME = "warmupcosine"
         # Lower bound on the learning rate used in "warmupcosine"
         _C.TRAIN.LR_SCHEDULER.MIN_LR = 1.E-6
