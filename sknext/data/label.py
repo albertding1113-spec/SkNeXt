@@ -551,17 +551,48 @@ def watershed_with_sk(
     return instances.astype(np.uint16, copy=False)
 
 def skeleton_main_branch(sk: np.ndarray) -> np.ndarray:
+    """Keep the longest path of every disconnected skeleton component.
+
+    A single instance ID can appear as several disconnected pieces inside one
+    cropped patch even though those pieces are connected outside the patch.
+    Therefore disconnected components must *not* compete with each other during
+    main-branch pruning. Each connected skeleton component is pruned
+    independently and all retained paths are merged into the output.
+
+    Parameters
+    ----------
+    sk : np.ndarray
+        2D or 3D binary skeleton mask.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean skeleton mask with the same shape as ``sk``. For every
+        connected component, only its graph-diameter path is retained.
+    """
+    sk = np.asarray(sk, dtype=bool)
     coords = np.argwhere(sk)
     n = len(coords)
+
     if n < 3:
         return sk.copy()
 
+    # Build the voxel-neighbour graph once for the complete skeleton.
+    # r=sqrt(ndim) connects 8-neighbours in 2D and 26-neighbours in 3D.
     tree = cKDTree(coords)
-    pairs = tree.query_pairs(r=np.sqrt(sk.ndim) + 1e-6, output_type="ndarray")
+    pairs = tree.query_pairs(
+        r=np.sqrt(sk.ndim) + 1e-6,
+        output_type="ndarray",
+    )
+
+    # No graph edges: all foreground voxels are isolated. Preserve them.
     if len(pairs) == 0:
         return sk.copy()
 
-    weights = np.linalg.norm(coords[pairs[:, 0]] - coords[pairs[:, 1]], axis=1)
+    weights = np.linalg.norm(
+        coords[pairs[:, 0]] - coords[pairs[:, 1]],
+        axis=1,
+    )
     graph = coo_matrix(
         (
             np.concatenate([weights, weights]),
@@ -573,36 +604,55 @@ def skeleton_main_branch(sk: np.ndarray) -> np.ndarray:
         shape=(n, n),
     ).tocsr()
 
-    # Keep only the largest connected component (skeletonize can leave stray isolated
-    # pixels behind) so the shortest-path search below cannot land on an unreachable node.
-    n_components, comp_labels = connected_components(graph, directed=False)
-    if n_components > 1:
-        main_comp = np.argmax(np.bincount(comp_labels))
-        keep = np.flatnonzero(comp_labels == main_comp)
-        coords = coords[keep]
-        graph = graph[keep][:, keep]
-        if len(coords) < 3:
-            main = np.zeros_like(sk)
-            main[tuple(coords.T)] = True
-            return main
-
-    # Two-pass search for the tree's diameter: the farthest node from an arbitrary
-    # start, then the farthest node from there, are the two ends of the main branch.
-    dist_from_0 = shortest_path(graph, method="D", directed=False, indices=0)
-    end_a = int(np.argmax(dist_from_0))
-    dist_from_a, predecessors = shortest_path(
-        graph, method="D", directed=False, indices=end_a, return_predecessors=True
+    component_num, component_labels = connected_components(
+        graph,
+        directed=False,
     )
-    end_b = int(np.argmax(dist_from_a))
 
-    path_idx = [end_b]
-    while path_idx[-1] != end_a:
-        prev = predecessors[path_idx[-1]]
-        if prev < 0:
-            break
-        path_idx.append(prev)
+    main = np.zeros_like(sk, dtype=bool)
 
-    main = np.zeros_like(sk)
-    main[tuple(coords[path_idx].T)] = True
+    # Important: process EVERY connected component independently.
+    # Previously only the largest component was retained, which deleted valid
+    # same-ID fragments that happened to be disconnected inside the patch.
+    for component_id in range(component_num):
+        keep = np.flatnonzero(component_labels == component_id)
+        component_coords = coords[keep]
+
+        if len(component_coords) <= 2:
+            main[tuple(component_coords.T)] = True
+            continue
+
+        component_graph = graph[keep][:, keep]
+
+        # Two-pass weighted shortest-path search. For a tree this gives the
+        # diameter endpoints; for skeleton graphs with occasional local cycles
+        # it retains the same behaviour as the previous implementation.
+        dist_from_0 = shortest_path(
+            component_graph,
+            method="D",
+            directed=False,
+            indices=0,
+        )
+        end_a = int(np.argmax(dist_from_0))
+
+        dist_from_a, predecessors = shortest_path(
+            component_graph,
+            method="D",
+            directed=False,
+            indices=end_a,
+            return_predecessors=True,
+        )
+        end_b = int(np.argmax(dist_from_a))
+
+        path_idx = [end_b]
+        while path_idx[-1] != end_a:
+            prev = int(predecessors[path_idx[-1]])
+            if prev < 0:
+                # Defensive fallback: this should not occur inside a connected
+                # component, but prevents accidental infinite loops.
+                break
+            path_idx.append(prev)
+
+        main[tuple(component_coords[np.asarray(path_idx)].T)] = True
+
     return main
-

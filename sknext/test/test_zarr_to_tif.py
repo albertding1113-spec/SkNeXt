@@ -69,11 +69,11 @@ def zarr_nczyx_to_tif(
 
 
 def test_zarr_nczyx_to_tif():
-    zarr_path = r"G:\Albert\data\260618_SkNeXt_dataset\train\train.ome.zarr"
+    zarr_path = r"G:\Albert\data\260618_SkNeXt_dataset\train.ome.zarr"
 
     zarr_nczyx_to_tif(
         zarr_path=zarr_path,
-        output_dir=r"E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\debug_raw_tif",
+        output_dir=r"G:\Albert\data\260618_SkNeXt_dataset\tif_test\debug_raw_tif",
         array_name="raw",
         prefix="raw_patch",
         output_axes="CZYX",
@@ -82,7 +82,7 @@ def test_zarr_nczyx_to_tif():
 
     zarr_nczyx_to_tif(
         zarr_path=zarr_path,
-        output_dir=r"E:\Albert_BigFile\Data\260611_SkNeXt_test\tif_test\debug_label_tif",
+        output_dir=r"G:\Albert\data\260618_SkNeXt_dataset\tif_test\debug_label_tif",
         array_name="label",
         prefix="label_patch",
         output_axes="CZYX",
