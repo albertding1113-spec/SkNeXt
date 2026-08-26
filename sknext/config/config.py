@@ -39,6 +39,7 @@ class SkNeXt_Config:
         # "P" channel options:
         #   "type": str. "skeleton", "centroid". Default: "skeleton".
         #   "skeleton_mode": "full", "main". Default: "full".
+        #   For training/validation Zarr creation, skeletonization and "main" pruning are applied independently inside each cropped patch.
         #   "dilation": int. Default: 0.
         #   "erosion": int. Default: 0.
         # "C" channel options:

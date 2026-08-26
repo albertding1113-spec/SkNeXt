@@ -303,10 +303,8 @@ def tif_list_to_zarr(
 ):
     """Convert paired TIFF volumes into an NCZYX patch Zarr dataset.
 
-    When ``filter_dict['enable']`` is True, candidate patches that do not
-    satisfy every configured condition are skipped entirely. The Zarr N axis
-    is grown only by the number of accepted patches, so rejected patches never
-    appear as zero-filled samples.
+    P-channel skeletonization and main-branch pruning are run independently
+    inside each cropped GT patch, not on the full source TIFF.
     """
     preprocess_dict = {} if preprocess_dict is None else preprocess_dict
     channel_extra_opts = {} if channel_extra_opts is None else channel_extra_opts
@@ -323,8 +321,6 @@ def tif_list_to_zarr(
         if not (key == "instance" or key in channels):
             raise ValueError(f"Unsupported key name: {key}")
 
-    # Remove an old output immediately. This also prevents a stale dataset from
-    # surviving when every candidate patch is rejected by the filter.
     remove_zarr_if_exists(zarr_path)
 
     root = None
@@ -333,6 +329,7 @@ def tif_list_to_zarr(
     saved_patch_num = 0
     candidate_patch_num = 0
     rejected_patch_num = 0
+    output_label_channel_num: int | None = None
 
     for i in tqdm(range(len(tif_list))):
         tif_path = tif_list[i]
@@ -384,16 +381,31 @@ def tif_list_to_zarr(
         if kept_num == 0:
             continue
 
-        # Expensive preprocessing/channel generation is deferred until we know
-        # this source image contributes at least one patch.
-        processed_img = preprocess_img(raw_img, preprocess_dict)  # float32, CZYX
-        gt_ch_list = generate_channels_from_labels(
-            gt_img_dict,
+        processed_img = preprocess_img(raw_img, preprocess_dict)
+
+        # Never build label channels on the complete TIFF. Generate the first
+        # patch now only to determine the output-channel count.
+        first_coord = kept_coords[0]
+        first_gt_patch_dict = {
+            key: _crop_patch(gt_img, first_coord)
+            for key, gt_img in gt_img_dict.items()
+        }
+        first_gt_ch_list = generate_channels_from_labels(
+            first_gt_patch_dict,
             channels,
             channel_extra_opts,
         )
-        if len(gt_ch_list) == 0:
+        if len(first_gt_ch_list) == 0:
             raise ValueError("No output label channels were generated.")
+
+        current_label_channel_num = len(first_gt_ch_list)
+        if output_label_channel_num is None:
+            output_label_channel_num = current_label_channel_num
+        elif current_label_channel_num != output_label_channel_num:
+            raise ValueError(
+                "Generated label channel count changed between input images: "
+                f"expected {output_label_channel_num}, got {current_label_channel_num}."
+            )
 
         old_saved_patch_num = saved_patch_num
         saved_patch_num += kept_num
@@ -403,7 +415,7 @@ def tif_list_to_zarr(
                 zarr_path,
                 saved_patch_num,
                 expected_raw_channels,
-                len(gt_ch_list),
+                output_label_channel_num,
                 spatial_patch_size,
                 raw_dtype=processed_img.dtype,
                 label_dtype="uint8",
@@ -411,16 +423,11 @@ def tif_list_to_zarr(
             )
         else:
             assert data_raw is not None and data_label is not None
-            if data_label.shape[1] != len(gt_ch_list):
-                raise ValueError(
-                    "Generated label channel count changed between input images: "
-                    f"expected {data_label.shape[1]}, got {len(gt_ch_list)}."
-                )
             data_raw.resize(
                 (saved_patch_num, expected_raw_channels, *spatial_patch_size)
             )
             data_label.resize(
-                (saved_patch_num, len(gt_ch_list), *spatial_patch_size)
+                (saved_patch_num, output_label_channel_num, *spatial_patch_size)
             )
 
         assert data_raw is not None and data_label is not None
@@ -431,8 +438,29 @@ def tif_list_to_zarr(
             raw_patch = reflect_padding_img(raw_patch, spatial_patch_size)
             data_raw[patch_id, :, :, :, :] = raw_patch
 
-            for channel_index, gt_channel in enumerate(gt_ch_list):
-                label_patch = _crop_patch(gt_channel, coord)
+            # Key change: crop original GT first; P/main pruning therefore sees
+            # only this patch.
+            if local_index == 0:
+                gt_patch_ch_list = first_gt_ch_list
+            else:
+                gt_patch_dict = {
+                    key: _crop_patch(gt_img, coord)
+                    for key, gt_img in gt_img_dict.items()
+                }
+                gt_patch_ch_list = generate_channels_from_labels(
+                    gt_patch_dict,
+                    channels,
+                    channel_extra_opts,
+                )
+
+            if len(gt_patch_ch_list) != output_label_channel_num:
+                raise ValueError(
+                    "Generated label channel count changed between patches: "
+                    f"expected {output_label_channel_num}, got {len(gt_patch_ch_list)}."
+                )
+
+            for channel_index, label_patch in enumerate(gt_patch_ch_list):
+                # Pad the generated channel, not the original instance mask.
                 label_patch = reflect_padding_img(label_patch, spatial_patch_size)
                 data_label[patch_id, channel_index, :, :, :] = label_patch
 
@@ -463,6 +491,7 @@ def tif_list_to_zarr(
         )
 
     return data_raw, data_label
+
 
 def read_stack_from_ims(
     ims_path: str | Path,
