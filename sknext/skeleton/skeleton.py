@@ -1,5 +1,6 @@
 from __future__ import annotations
 import sys
+import re
 import navis
 import networkx as nx
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Iterable
 from collections.abc import Sequence
 import tifffile
 
+import skeleton
+
 
 class SkeletonManager():
     def __init__(self,
@@ -17,12 +20,40 @@ class SkeletonManager():
                  node_distance: float | Iterable[float] = [3,10,10],):
         self.path = Path(sk_path)
         assert self.path.exists() and self.path.is_dir(), "skeleton path does not exist"
-        self.skeletons = navis.read_swc(sk_path)
-        assert len(self.skeletons) > 0, "skeleton files do not exist"
+
+        # Keep an explicit, deterministic mapping between each TreeNeuron and
+        # its source SWC file. NAVis may assign UUID values to TreeNeuron.id,
+        # so file names such as 0001.swc must not be inferred from skeleton.id.
+        self.swc_paths = sorted(
+            self.path.glob("*.swc"),
+            key=self._swc_path_sort_key,
+        )
+        assert len(self.swc_paths) > 0, "skeleton files do not exist"
+
+        loaded_skeletons = []
+        for swc_path in self.swc_paths:
+            one_skeleton = navis.read_swc(swc_path)
+            if isinstance(one_skeleton, navis.NeuronList):
+                if len(one_skeleton) != 1:
+                    raise ValueError(
+                        f"Expected one skeleton in {swc_path}, "
+                        f"but NAVis returned {len(one_skeleton)} neurons."
+                    )
+                one_skeleton = one_skeleton[0]
+            loaded_skeletons.append(one_skeleton)
+
+        self.skeletons = navis.NeuronList(loaded_skeletons)
         self.skeletons = self.fix_skeletons_root(self.skeletons)
-        self._build_id_index_dict()
         self.increase_nodes_density(node_distance)
         self.increase_radius()
+
+        # Re-attach source-file metadata after all constructor-time operations
+        # because some neuron-copy/reconstruction operations may drop custom
+        # attributes. file_id is derived from the SWC file name:
+        # 0001.swc -> 1, 0010.swc -> 10. Non-numeric stems remain strings.
+        self._assign_source_file_metadata()
+        self._build_id_index_dict()
+        self._build_file_id_index_dict()
 
     def __len__(self):
         return len(self.skeletons)
@@ -33,10 +64,61 @@ class SkeletonManager():
     def __iter__(self):
         return iter(self.skeletons)
 
+    @staticmethod
+    def _file_id_from_path(path: str | Path) -> int | str:
+        """Return a stable skeleton ID derived from an SWC file name.
+
+        Examples
+        --------
+        ``0001.swc`` -> ``1``
+        ``0010.swc`` -> ``10``
+        ``neuron_A.swc`` -> ``"neuron_A"``
+        """
+        stem = Path(path).stem
+        if re.fullmatch(r"[+-]?\d+", stem):
+            return int(stem)
+        return stem
+
+    @classmethod
+    def _swc_path_sort_key(cls, path: str | Path):
+        """Sort numeric SWC stems numerically and other stems naturally."""
+        file_id = cls._file_id_from_path(path)
+        if isinstance(file_id, int):
+            return (0, file_id, Path(path).name.lower())
+        return (1, str(file_id).lower(), Path(path).name.lower())
+
+    def _assign_source_file_metadata(self) -> None:
+        if len(self.skeletons) != len(self.swc_paths):
+            raise RuntimeError(
+                "Skeleton/source-file count changed unexpectedly: "
+                f"{len(self.skeletons)} skeletons vs {len(self.swc_paths)} SWC files."
+            )
+
+        self.file_ids = []
+        for skeleton, swc_path in zip(self.skeletons, self.swc_paths):
+            file_id = self._file_id_from_path(swc_path)
+            # Keep both the complete source path and a convenient filename ID
+            # directly on the TreeNeuron. Existing NAVis skeleton.id is left
+            # unchanged because it may be a UUID used elsewhere in the project.
+            skeleton.file = Path(swc_path)
+            skeleton.file_id = file_id
+            self.file_ids.append(file_id)
+
     def _build_id_index_dict(self):
         self.id_index_dict = {}
         for index, skeleton in enumerate(self.skeletons):
             self.id_index_dict.setdefault(skeleton.id, index)
+
+    def _build_file_id_index_dict(self):
+        self.file_id_index_dict = {}
+        for index, file_id in enumerate(self.file_ids):
+            if file_id in self.file_id_index_dict:
+                raise ValueError(
+                    f"Duplicate filename-derived skeleton ID {file_id!r}: "
+                    f"{self.swc_paths[self.file_id_index_dict[file_id]].name!r} and "
+                    f"{self.swc_paths[index].name!r}."
+                )
+            self.file_id_index_dict[file_id] = index
 
     @property
     def shape(self):
@@ -60,10 +142,13 @@ class SkeletonManager():
         for i, skeleton in enumerate(skeletons):
             nodes = skeleton.nodes.copy()
             self_parent_mask = (nodes["node_id"] == nodes["parent_id"])
-            fixed_node_ids = nodes.loc[self_parent_mask, "node_id",].tolist()
             nodes.loc[self_parent_mask, "parent_id"] = -1
-            fixed_skeleton = navis.TreeNeuron(nodes,
-                                              id=getattr(skeleton, "id", None), name=getattr(skeleton, "name", None),)
+
+            # Copy the original neuron instead of creating a fresh TreeNeuron.
+            # This preserves NAVis metadata and any custom attributes such as
+            # source-file information.
+            fixed_skeleton = skeleton.copy()
+            fixed_skeleton.nodes = nodes
             fixed_skeletons.append(fixed_skeleton)
         return navis.NeuronList(fixed_skeletons)
 
@@ -388,6 +473,407 @@ class SkeletonManager():
 
         viewer.show(start_loop=True)
 
+        return viewer
+
+    def _prepare_one_skeleton_plot(
+            self,
+            idx: int,
+            soma_color: str | tuple = "#D62728",
+            dendrite_color: str | tuple = "#1F77B4",
+            axon_color: str | tuple = "#2CA02C",
+            other_color: str | tuple = "#7F7F7F",
+            radius: bool = False,
+    ) -> tuple[navis.NeuronList, list]:
+        """Build compartment-specific neuron objects for plotting one skeleton.
+
+        This helper is shared by :meth:`plot_one_skeleton` and
+        :meth:`plot_skeletons_by_id` so both plotting modes use identical
+        compartment colors and SWC-label handling.
+        """
+        if isinstance(idx, (bool, np.bool_)) or not isinstance(
+                idx, (int, np.integer)
+        ):
+            raise TypeError(
+                "idx must be an integer skeleton index, "
+                f"but got {type(idx).__name__}."
+            )
+
+        idx = int(idx)
+        if idx < 0 or idx >= len(self.skeletons):
+            raise IndexError(
+                f"idx is outside the valid range [0, {len(self.skeletons) - 1}], "
+                f"got {idx}."
+            )
+
+        if not isinstance(radius, (bool, np.bool_)):
+            raise TypeError(
+                f"radius must be a boolean, but got {type(radius).__name__}."
+            )
+
+        skeleton = self.skeletons[idx]
+        nodes = skeleton.nodes
+
+        if not isinstance(nodes, pd.DataFrame):
+            raise TypeError(
+                f"Skeleton at index {idx} does not contain a valid nodes DataFrame."
+            )
+        if nodes.empty:
+            raise ValueError(f"Skeleton at index {idx} contains no nodes.")
+
+        required_columns = {"node_id", "parent_id", "label"}
+        missing_columns = required_columns.difference(nodes.columns)
+        if missing_columns:
+            raise ValueError(
+                f"Skeleton at index {idx} is missing columns: "
+                f"{sorted(missing_columns)}."
+            )
+
+        if radius and "radius" not in nodes.columns:
+            raise ValueError(
+                f"Skeleton at index {idx} has no 'radius' column, so radius=True "
+                "cannot be used."
+            )
+
+        labels = pd.to_numeric(nodes["label"], errors="coerce").to_numpy(
+            dtype=np.float64
+        )
+        node_ids = pd.to_numeric(nodes["node_id"], errors="coerce").to_numpy(
+            dtype=np.float64
+        )
+        parent_ids = pd.to_numeric(nodes["parent_id"], errors="coerce").to_numpy(
+            dtype=np.float64
+        )
+
+        if (
+                np.any(~np.isfinite(node_ids))
+                or np.any(node_ids != np.floor(node_ids))
+        ):
+            raise ValueError(f"Skeleton at index {idx} contains invalid node IDs.")
+
+        node_ids_int = node_ids.astype(np.int64)
+        existing_node_ids = set(node_ids_int.tolist())
+
+        compartment_specs = [
+            ("soma", labels == 1, soma_color),
+            ("dendrite", np.isin(labels, [3, 4]), dendrite_color),
+            ("axon", labels == 2, axon_color),
+            ("other", ~np.isin(labels, [1, 2, 3, 4]), other_color),
+        ]
+
+        compartment_skeletons = []
+        compartment_colors = []
+
+        original_id = getattr(skeleton, "id", idx)
+        original_name = getattr(skeleton, "name", f"skeleton_{idx}")
+
+        for compartment_name, compartment_mask, color in compartment_specs:
+            if not np.any(compartment_mask):
+                continue
+
+            compartment_node_ids = set(
+                node_ids_int[compartment_mask].tolist()
+            )
+
+            # Include the immediate parent of each compartment node. This keeps
+            # the parent-child segment at compartment boundaries visible.
+            boundary_parent_values = parent_ids[compartment_mask]
+            for parent_value in boundary_parent_values:
+                if (
+                        np.isfinite(parent_value)
+                        and parent_value >= 0
+                        and parent_value == np.floor(parent_value)
+                ):
+                    parent_id = int(parent_value)
+                    if parent_id in existing_node_ids:
+                        compartment_node_ids.add(parent_id)
+
+            compartment = navis.subset_neuron(
+                skeleton,
+                subset=list(compartment_node_ids),
+                inplace=False,
+                keep_disc_cn=False,
+            )
+
+            compartment.id = f"{original_id}_{compartment_name}"
+            compartment.name = f"{original_name}_{compartment_name}"
+
+            compartment_skeletons.append(compartment)
+            compartment_colors.append(color)
+
+        if not compartment_skeletons:
+            raise ValueError(
+                f"Skeleton at index {idx} contains no plottable compartment nodes."
+            )
+
+        return navis.NeuronList(compartment_skeletons), compartment_colors
+
+    def plot_one_skeleton(
+            self,
+            idx: int,
+            soma_color: str | tuple = "#D62728",
+            dendrite_color: str | tuple = "#1F77B4",
+            axon_color: str | tuple = "#2CA02C",
+            other_color: str | tuple = "#7F7F7F",
+            linewidth: float = 2.0,
+            radius: bool = False,
+            background_color: str | tuple = "white",
+    ):
+        """Plot one skeleton with independently configurable compartment colors.
+
+        SWC compartment labels are interpreted as:
+            1: soma
+            2: axon
+            3: dendrite
+            4: apical dendrite
+
+        Labels 3 and 4 are displayed together as dendrites. Any other labels
+        are retained and shown using ``other_color``. The selected skeleton is
+        addressed by its zero-based index in ``self.skeletons`` rather than by
+        ``skeleton.id``.
+        """
+        if isinstance(linewidth, (bool, np.bool_)) or not isinstance(
+                linewidth, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError(
+                "linewidth must be a positive numeric value, "
+                f"but got {type(linewidth).__name__}."
+            )
+        linewidth = float(linewidth)
+        if not np.isfinite(linewidth) or linewidth <= 0:
+            raise ValueError(
+                f"linewidth must be finite and greater than zero, got {linewidth}."
+            )
+
+        compartment_skeletons, compartment_colors = (
+            self._prepare_one_skeleton_plot(
+                idx=idx,
+                soma_color=soma_color,
+                dendrite_color=dendrite_color,
+                axon_color=axon_color,
+                other_color=other_color,
+                radius=radius,
+            )
+        )
+
+        viewer = navis.plot3d(
+            compartment_skeletons,
+            color=compartment_colors,
+            linewidth=linewidth,
+            radius=bool(radius),
+            backend="octarine",
+        )
+
+        viewer.set_bgcolor(background_color)
+        viewer.show(start_loop=True)
+
+        return viewer
+
+    def plot_skeletons_by_id(
+            self,
+            start_id: int | str | None = None,
+            soma_color: str | tuple = "#D62728",
+            dendrite_color: str | tuple = "#1F77B4",
+            axon_color: str | tuple = "#2CA02C",
+            other_color: str | tuple = "#7F7F7F",
+            linewidth: float = 2.0,
+            radius: bool = False,
+            background_color: str | tuple = "white",
+            loop: bool = False,
+    ):
+        """Interactively browse skeletons in ascending SWC filename-ID order.
+
+        The browsing ID is derived from each source SWC filename rather than
+        from ``TreeNeuron.id``. This is necessary because NAVis may assign a
+        UUID to ``TreeNeuron.id``. For example:
+
+        ``0001.swc -> file_id=1``
+        ``0002.swc -> file_id=2``
+        ``0010.swc -> file_id=10``
+
+        With the Octarine window focused, pressing Enter replaces the current
+        skeleton with the next one in the same viewer.
+
+        Parameters
+        ----------
+        start_id : int, str or None, default=None
+            Filename-derived skeleton ID from which to start. ``1``, ``"1"``,
+            ``"0001"`` and ``"0001.swc"`` all select ``0001.swc``. If None,
+            browsing starts from the first SWC file in numeric/name order.
+        soma_color, dendrite_color, axon_color, other_color : color-like
+            Colors used for SWC compartments.
+        linewidth : float, default=2.0
+            Skeleton line thickness.
+        radius : bool, default=False
+            If True, render tubes using the SWC radius column.
+        background_color : color-like, default="white"
+            Viewer background color.
+        loop : bool, default=False
+            If True, Enter on the final skeleton wraps to the first skeleton.
+
+        Returns
+        -------
+        object
+            The Octarine viewer.
+        """
+        if isinstance(linewidth, (bool, np.bool_)) or not isinstance(
+                linewidth, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError(
+                "linewidth must be a positive numeric value, "
+                f"but got {type(linewidth).__name__}."
+            )
+        linewidth = float(linewidth)
+        if not np.isfinite(linewidth) or linewidth <= 0:
+            raise ValueError(
+                f"linewidth must be finite and greater than zero, got {linewidth}."
+            )
+
+        if not isinstance(loop, (bool, np.bool_)):
+            raise TypeError(
+                f"loop must be a boolean, but got {type(loop).__name__}."
+            )
+
+        if len(self.skeletons) == 0:
+            raise ValueError("There are no skeletons to plot.")
+
+        # Refresh metadata defensively in case callers replaced self.skeletons
+        # after construction while keeping the same source-file order.
+        if not hasattr(self, "file_ids") or len(self.file_ids) != len(self.skeletons):
+            self._assign_source_file_metadata()
+            self._build_file_id_index_dict()
+
+        ordered_indices = sorted(
+            range(len(self.skeletons)),
+            key=lambda index: self._swc_path_sort_key(self.swc_paths[index]),
+        )
+        ordered_ids = [self.file_ids[index] for index in ordered_indices]
+        ordered_files = [self.swc_paths[index] for index in ordered_indices]
+
+        def _normalize_requested_id(value):
+            if isinstance(value, Path):
+                text = value.name
+            else:
+                text = str(value).strip()
+            if text.lower().endswith(".swc"):
+                text = Path(text).stem
+            if re.fullmatch(r"[+-]?\d+", text):
+                return ("numeric", int(text))
+            return ("text", text.lower())
+
+        if start_id is None:
+            current_position = 0
+        else:
+            requested_key = _normalize_requested_id(start_id)
+            current_position = None
+            for position, (file_id, swc_path) in enumerate(
+                    zip(ordered_ids, ordered_files)
+            ):
+                candidate_keys = {
+                    _normalize_requested_id(file_id),
+                    _normalize_requested_id(swc_path.stem),
+                    _normalize_requested_id(swc_path.name),
+                }
+                if requested_key in candidate_keys:
+                    current_position = position
+                    break
+
+            if current_position is None:
+                preview = [path.name for path in ordered_files[:10]]
+                raise KeyError(
+                    f"Cannot find skeleton file ID {start_id!r}. "
+                    f"Available SWC files start with {preview!r}."
+                )
+
+        def _draw_position(position: int, viewer=None):
+            skeleton_index = ordered_indices[position]
+            file_id = ordered_ids[position]
+            swc_path = ordered_files[position]
+
+            compartment_skeletons, compartment_colors = (
+                self._prepare_one_skeleton_plot(
+                    idx=skeleton_index,
+                    soma_color=soma_color,
+                    dendrite_color=dendrite_color,
+                    axon_color=axon_color,
+                    other_color=other_color,
+                    radius=radius,
+                )
+            )
+
+            if viewer is None:
+                viewer = navis.plot3d(
+                    compartment_skeletons,
+                    color=compartment_colors,
+                    linewidth=linewidth,
+                    radius=bool(radius),
+                    backend="octarine",
+                    viewer="new",
+                    center=True,
+                )
+            else:
+                viewer.clear()
+                navis.plot3d(
+                    compartment_skeletons,
+                    color=compartment_colors,
+                    linewidth=linewidth,
+                    radius=bool(radius),
+                    backend="octarine",
+                    viewer=viewer,
+                    center=True,
+                )
+
+            viewer.set_bgcolor(background_color)
+            print(
+                f"Showing {swc_path.name} (file_id={file_id!r}, "
+                f"list_index={skeleton_index}, "
+                f"{position + 1}/{len(ordered_indices)}). "
+                "Press Enter for the next skeleton.",
+                flush=True,
+            )
+            return viewer
+
+        viewer = _draw_position(current_position)
+
+        def _show_next_skeleton():
+            nonlocal current_position
+            next_position = current_position + 1
+
+            if next_position >= len(ordered_indices):
+                if bool(loop):
+                    next_position = 0
+                else:
+                    print(
+                        "Already showing the last skeleton. Close the viewer "
+                        "to finish, or use loop=True to wrap to the first one.",
+                        flush=True,
+                    )
+                    return
+
+            print("Enter pressed: loading next skeleton...", flush=True)
+            current_position = next_position
+            _draw_position(current_position, viewer=viewer)
+
+        # Bind through Octarine's keyboard dispatcher. Different rendercanvas
+        # versions may report the Enter key under slightly different names.
+        enter_keys = ("Enter", "Return", "NumpadEnter", "KP_Enter")
+        if hasattr(viewer, "bind_key"):
+            for key_name in enter_keys:
+                viewer.bind_key(key_name, _show_next_skeleton)
+        elif hasattr(viewer, "_key_events"):
+            for key_name in enter_keys:
+                viewer._key_events[key_name] = _show_next_skeleton
+        else:
+            raise RuntimeError(
+                "This Octarine Viewer does not expose bind_key() or _key_events; "
+                "keyboard navigation cannot be registered."
+            )
+
+        print(
+            "Keyboard navigation enabled. Click inside the Octarine window "
+            "once, then press Enter.",
+            flush=True,
+        )
+        viewer.show(start_loop=True)
         return viewer
 
     def get_skeletons_index(self, new_skeletons: navis.NeuronList) -> list[int]:
@@ -1791,9 +2277,17 @@ class SkeletonManager():
 
 
 if __name__ == '__main__':
-    path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\Skeleton1"
-    Skeleton = SkeletonManager(path)
-    viewer = Skeleton.plot3d(palette="Dark2")
+    path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\Skeleton2"
+    sk = SkeletonManager(path)
+    sk.plot_skeletons_by_id(start_id=1, soma_color="green", dendrite_color="red", axon_color="blue", linewidth=4.0)
+    # sk.plot_one_skeleton(
+    #     idx=0,
+    #     soma_color="green",
+    #     dendrite_color="red",
+    #     axon_color="blue",
+    #     other_color="gray",
+    #     linewidth=4.0,
+    # )
     # boudary = np.array([[0, 500],[8000,8200],[8000,8200]])
     # cropped = Skeleton.crop_skeletons(boudary)
     # print(len(cropped))
