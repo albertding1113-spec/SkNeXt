@@ -26,6 +26,23 @@ def create_patch_ome_zarr(
     label_dtype: np.dtype | str = "uint8",
     overwrite: bool = True,
 ) -> tuple[zarr.Group, zarr.Array, zarr.Array]:
+    """Create paired raw and label patch arrays in a local Zarr v3 group.
+
+    Args:
+        output_path: Destination store; an existing .zarr store is removed when
+            overwrite is true.
+        num_patches: Positive number of patches to allocate.
+        c_raw: Number of raw image channels.
+        c_label: Number of generated label channels.
+        patch_size: Spatial patch dimensions (Z, Y, X).
+        raw_dtype: NumPy-compatible raw array dtype.
+        label_dtype: NumPy-compatible label array dtype.
+        overwrite: Replace an existing store; otherwise require a new store.
+
+    Returns:
+        (root, raw_array, label_array), with NCZYX layout and per-channel,
+        per-patch chunks. SkNeXt patch metadata is stored on the root group.
+    """
     output_path = Path(output_path)
     assert num_patches > 0, "num_patches must be > 0"
     assert c_raw > 0, "c_raw must be > 0"
@@ -106,6 +123,11 @@ def create_patch_ome_zarr(
 
 
 def remove_zarr_if_exists(zarr_path: str | Path):
+    """Delete the file or directory at zarr_path when it exists.
+
+    Existing paths must have a .zarr suffix. Directories are removed
+    recursively; non-Zarr names raise ValueError and missing paths are ignored.
+    """
     zarr_path = Path(zarr_path)
     if not zarr_path.exists():
         return
@@ -500,6 +522,20 @@ def read_stack_from_ims(
     resolution: int =0,
     timepoint: int = 0,
 ) -> np.ndarray:
+    """Read one bounded ZYX region from an Imaris channel.
+
+    Args:
+        ims_path: Existing Imaris HDF5 file.
+        channel: Physical channel ID.
+        coordinate: Integer [[zmin, ymin, xmin], [zmax, ymax, xmax]] bounds,
+            with exclusive upper limits.
+        resolution: Resolution-level index.
+        timepoint: Time-point index.
+
+    Returns:
+        NumPy array containing the requested region. The file is closed after
+        reading; invalid bounds or missing datasets fail assertions.
+    """
     ims_path = Path(ims_path)
     assert ims_path.is_file(), f"IMS doesn't exist：{ims_path}"
     coord_array = np.asarray(coordinate)
@@ -566,6 +602,17 @@ class IMSReader:
         resolution: int = 0,
         timepoint: int = 0,
     ) -> None:
+        """Open an Imaris file for lazy CZYX reads from selected channels.
+
+        Args:
+            ims_path: Existing .ims file path.
+            channel: Physical channel ID, ordered IDs, or None for all channels.
+            resolution: Nonnegative resolution-level index.
+            timepoint: Nonnegative time-point index.
+
+        Validates that channels have matching 3D shapes. Initialization failures
+        close the file; successful readers must later be closed by the caller.
+        """
         self.ims_path = Path(ims_path)
         if not self.ims_path.is_file(): raise FileNotFoundError(f"IMS file does not exist: {self.ims_path}")
         self.resolution = self._validate_non_negative_int(resolution, "resolution")
@@ -604,6 +651,10 @@ class IMSReader:
 
     @staticmethod
     def _validate_non_negative_int(value: int, name: str) -> int:
+        """Return value as a Python int after checking integer type and nonnegativity.
+
+        name identifies the field in TypeError or ValueError messages.
+        """
         if not isinstance(value, (int, np.integer)):
             raise TypeError(f"{name} must be an integer, got {type(value).__name__}.")
         result = int(value)
@@ -613,6 +664,10 @@ class IMSReader:
 
     @staticmethod
     def _discover_channels(timepoint_group: h5py.Group) -> list[int]:
+        """Return sorted physical channel IDs with Data datasets in timepoint_group.
+
+        Ignores unrelated HDF5 entries and raises ValueError when no channels exist.
+        """
         channel_ids: list[int] = []
         prefix = "Channel "
 
@@ -640,6 +695,11 @@ class IMSReader:
         channel: int | Sequence[int] | None,
         available_channels: Sequence[int],
     ) -> tuple[int, ...]:
+        """Normalize channel against available_channels into an ordered ID tuple.
+
+        None selects every available channel. Rejects empty selections, duplicate
+        IDs, strings, and requests for missing physical channels.
+        """
         available = tuple(int(value) for value in available_channels)
         available_set = set(available)
 
@@ -666,6 +726,7 @@ class IMSReader:
         return selected
 
     def _validate_datasets(self) -> None:
+        """Require selected HDF5 channel datasets to have matching three-dimensional shapes."""
         reference_shape: tuple[int, ...] | None = None
 
         for channel_id, data_path, dataset in zip(
@@ -696,14 +757,17 @@ class IMSReader:
 
     @property
     def ndim(self) -> int:
+        """Return four for the reader's virtual CZYX array."""
         return 4
 
     @property
     def size(self) -> int:
+        """Return the total number of elements across all selected channels."""
         return int(np.prod(self.shape, dtype=np.int64))
 
     @property
     def dtype(self) -> np.dtype:
+        """Return the common NumPy dtype inferred from the selected channel datasets."""
         return np.dtype(self._dtype)
 
     @property
@@ -718,17 +782,21 @@ class IMSReader:
 
     @property
     def closed(self) -> bool:
+        """Return whether the HDF5 file handle is absent or no longer valid."""
         return not hasattr(self, "file") or not self.file.id.valid
 
     def close(self) -> None:
+        """Close the underlying HDF5 file if open; repeated calls are harmless."""
         if hasattr(self, "file") and self.file.id.valid:
             self.file.close()
 
     def _ensure_open(self) -> None:
+        """Raise RuntimeError if the underlying Imaris file has been closed."""
         if self.closed:
             raise RuntimeError("IMSReader has been closed.")
 
     def __enter__(self) -> "IMSReader":
+        """Check that the reader is open and return it for use in a with block."""
         self._ensure_open()
         return self
 
@@ -738,9 +806,14 @@ class IMSReader:
         exc_value: Any,
         traceback: Any,
     ) -> None:
+        """Close the reader on context exit without suppressing an exception.
+
+        exc_type, exc_value, and traceback are supplied by the context protocol.
+        """
         self.close()
 
     def __del__(self) -> None:
+        """Attempt to close the file during finalization, suppressing cleanup errors."""
         try:
             self.close()
         except Exception:
@@ -780,6 +853,12 @@ class IMSReader:
         key: Any,
         shape: Sequence[int],
     ) -> tuple[int | slice, int | slice, int | slice, int | slice]:
+        """Expand a read key to one integer or slice per axis of shape.
+
+        Normalizes negative integer indices and ellipsis, and pads omitted axes
+        with full slices. Rejects out-of-bounds integers, zero slice steps,
+        new axes, and advanced indexing.
+        """
         ndim = len(shape)
         items = list(key if isinstance(key, tuple) else (key,))
 
@@ -835,6 +914,10 @@ class IMSReader:
         key: Sequence[int | slice],
         shape: Sequence[int],
     ) -> tuple[int, ...]:
+        """Return the output shape produced by applying normalized key to shape.
+
+        Integer-indexed axes are removed; sliced axes use Python slice lengths.
+        """
         output: list[int] = []
         for item, axis_size in zip(key, shape):
             if isinstance(item, int):
@@ -966,6 +1049,32 @@ class ZarrIOManager:
         pyramid_policy: PyramidPolicy = "remove",
         consolidate_on_close: bool = True,
     ) -> None:
+        """Open or create a local CZYX OME-Zarr v2 store without replacing existing data.
+
+        Args:
+            path: Store directory.
+            shape: CZYX dimensions, required for creation; checked when reopening.
+            dtype: NumPy-compatible dtype, required for creation.
+            chunks: CZYX chunk sizes, bounded by the array shape.
+            mode: 'a' creates or opens, 'r+' requires a writable existing store,
+                and 'r' opens an existing store read-only.
+            array_path: Array path within the group, or the default level-zero path.
+            voxel_size: Positive physical voxel sizes in ZYX order for creation.
+            unit: Spatial unit used in newly created metadata.
+            image_name: Display name for a new image.
+            channel_names: One label per channel for a new store.
+            channel_colors: One RGB hex color per channel for a new store.
+            channel_windows: Display bounds per channel, as (start, end) or
+                (min, max, start, end).
+            compressor: New-array codec; None selects the default Blosc codec.
+            fill_value: Value for unwritten voxels in newly created arrays.
+            dimension_separator: '/' or '.' for v2 chunk keys.
+            pyramid_policy: 'remove', 'keep', or 'error' when level-zero writes
+                would invalidate existing lower-resolution levels.
+            consolidate_on_close: Consolidate metadata on close when writable.
+
+        Existing layouts are validated and their stored metadata is retained.
+        """
         self.path = Path(path)
         self._closed = False
         self._metadata_dirty = False
@@ -1018,9 +1127,15 @@ class ZarrIOManager:
     # ------------------------------------------------------------------
     @staticmethod
     def _is_existing_zarr_group(path: Path) -> bool:
+        """Return whether path is a directory containing a Zarr v2 .zgroup marker."""
         return path.is_dir() and (path / ".zgroup").is_file()
 
     def _validate_store_path(self, *, mode: str, store_exists: bool) -> None:
+        """Check that the destination is compatible with mode and store_exists.
+
+        Rejects non-directory paths and nonempty directories that are not Zarr v2
+        groups. Read/update modes require an existing store. Creates parent directories.
+        """
         if self.path.exists() and not self.path.is_dir():
             raise ValueError(f"The target path exists but is not a directory: {self.path}")
 
@@ -1055,6 +1170,13 @@ class ZarrIOManager:
         fill_value: int | float,
         dimension_separator: str,
     ) -> None:
+        """Create level zero and OME/OMERO metadata using the supplied layout options.
+
+        shape and chunks use CZYX order; voxel_size uses ZYX order. dtype,
+        compressor, fill_value, and dimension_separator control array storage.
+        array_path locates level zero; image_name, unit, and channel_names/colors/
+        windows supply display metadata. Updates manager state and marks metadata dirty.
+        """
         self.shape = self._validate_shape(shape, "shape")
         self.dtype = np.dtype(dtype)
         raw_chunks = chunks if chunks is not None else self.DEFAULT_CHUNKS
@@ -1108,6 +1230,13 @@ class ZarrIOManager:
         requested_array_path: str | None,
         open_mode: Literal["r", "r+", "a"],
     ) -> None:
+        """Load an existing OME-Zarr group and validate its requested layout.
+
+        requested_array_path selects an array listed in multiscales, or defaults
+        to the first dataset. Optional requested_shape, requested_dtype, and
+        requested_chunks must match; open_mode chooses read-only or update access.
+        Populates array handles and metadata without replacing stored data.
+        """
         zarr_open_mode = "r" if open_mode == "r" else "r+"
         self.root = zarr.open_group(
             store=str(self.path),
@@ -1165,6 +1294,10 @@ class ZarrIOManager:
 
     @staticmethod
     def _find_multiscale_index(multiscales: list[Any], array_path: str) -> int:
+        """Return the index in multiscales whose datasets include array_path.
+
+        Raises ValueError if the requested array is not listed in the metadata.
+        """
         for index, item in enumerate(multiscales):
             for dataset in item.get("datasets", []):
                 if str(dataset.get("path", "")).strip("/") == array_path:
@@ -1180,6 +1313,12 @@ class ZarrIOManager:
         requested_dtype: Any | None,
         requested_chunks: Sequence[int] | None,
     ) -> None:
+        """Check requested layout options against the opened array.
+
+        Non-None requested_shape, requested_dtype, and requested_chunks must
+        match. Shapes/chunks use CZYX order; chunk sizes are clipped to shape
+        before comparison. Mismatches raise ValueError.
+        """
         if requested_shape is not None:
             expected = self._validate_shape(requested_shape, "shape")
             if expected != self.shape:
@@ -1202,6 +1341,7 @@ class ZarrIOManager:
                 )
 
     def _validate_existing_axes(self, multiscale: dict[str, Any]) -> None:
+        """Require multiscale metadata to declare axes in CZYX order."""
         axes = multiscale.get("axes")
         if not isinstance(axes, list):
             raise ValueError("multiscales.axes is missing or has an invalid format.")
@@ -1215,6 +1355,11 @@ class ZarrIOManager:
             )
 
     def _load_existing_metadata(self, multiscale: dict[str, Any]) -> None:
+        """Populate image, spatial calibration, and channel display settings from multiscale.
+
+        Reads OMERO channel attributes from the open group and fills missing
+        labels, colors, and display windows with defaults.
+        """
         self.image_name = str(multiscale.get("name", "image"))
         axes = multiscale.get("axes", [])
         spatial_units = [
@@ -1275,6 +1420,10 @@ class ZarrIOManager:
     # ------------------------------------------------------------------
     @staticmethod
     def _normalize_array_path(path: str) -> str:
+        """Return a normalized relative group path with forward slashes.
+
+        Strips outer separators and rejects empty paths or empty, '.' and '..' segments.
+        """
         normalized = str(path).replace("\\", "/").strip("/")
         if not normalized:
             raise ValueError("array_path must not be empty.")
@@ -1284,6 +1433,10 @@ class ZarrIOManager:
 
     @staticmethod
     def _validate_shape(values: Sequence[int], name: str) -> Coordinate4D:
+        """Convert values to four positive integers in CZYX order.
+
+        Returns the tuple or raises ValueError, using name to identify the field.
+        """
         result = tuple(int(v) for v in values)
         if len(result) != 4:
             raise ValueError(f"{name} must contain four integers in CZYX order.")
@@ -1293,6 +1446,10 @@ class ZarrIOManager:
 
     @staticmethod
     def _validate_coordinate(values: Sequence[int], name: str) -> Coordinate4D:
+        """Convert values to four nonnegative integers in CZYX order.
+
+        Returns the tuple or raises ValueError, using name to identify the field.
+        """
         result = tuple(int(v) for v in values)
         if len(result) != 4:
             raise ValueError(f"{name} must contain four integers in CZYX order.")
@@ -1304,11 +1461,13 @@ class ZarrIOManager:
     def _normalize_chunks(
         cls, chunks: Sequence[int], shape: Sequence[int]
     ) -> Coordinate4D:
+        """Validate four positive chunk sizes and clip each size to the CZYX shape."""
         raw = cls._validate_shape(chunks, "chunks")
         return tuple(min(int(s), int(c)) for s, c in zip(shape, raw))  # type: ignore[return-value]
 
     @staticmethod
     def _validate_voxel_size(values: Sequence[float]) -> tuple[float, float, float]:
+        """Convert values to a three-element tuple of positive voxel sizes in ZYX order."""
         result = tuple(float(v) for v in values)
         if len(result) != 3 or any(v <= 0 for v in result):
             raise ValueError("voxel_size must contain three positive numbers in ZYX order.")
@@ -1318,6 +1477,10 @@ class ZarrIOManager:
     def _normalize_channel_names(
         cls, names: Sequence[str] | None, c_size: int
     ) -> tuple[str, ...]:
+        """Return c_size channel labels, generating defaults when names is None.
+
+        Provided names are converted to strings and must match the channel count.
+        """
         if names is None:
             return tuple(f"Channel {i}" for i in range(c_size))
         result = tuple(str(value) for value in names)
@@ -1327,12 +1490,18 @@ class ZarrIOManager:
 
     @classmethod
     def _is_valid_color(cls, color: str) -> bool:
+        """Return whether color is exactly six uppercase hexadecimal RGB digits."""
         return len(color) == 6 and all(ch in "0123456789ABCDEF" for ch in color)
 
     @classmethod
     def _normalize_channel_colors(
         cls, colors: Sequence[str] | None, c_size: int
     ) -> tuple[str, ...]:
+        """Return c_size normalized RGB hex colors or a repeating default palette.
+
+        Strips leading '#' characters and uppercases supplied colors. Invalid
+        colors or a mismatched channel count raise ValueError.
+        """
         if colors is None:
             return tuple(
                 cls.DEFAULT_COLORS[i % len(cls.DEFAULT_COLORS)]
@@ -1353,6 +1522,11 @@ class ZarrIOManager:
     def _default_windows(
         c_size: int, dtype: np.dtype[Any]
     ) -> tuple[tuple[float, float, float, float], ...]:
+        """Return one (min, max, start, end) display window per channel.
+
+        c_size determines the count. Integer dtype uses its full numeric range;
+        boolean and floating dtypes default to [0, 1].
+        """
         if np.issubdtype(dtype, np.bool_):
             low, high = 0.0, 1.0
         elif np.issubdtype(dtype, np.integer):
@@ -1369,6 +1543,11 @@ class ZarrIOManager:
         c_size: int,
         dtype: np.dtype[Any],
     ) -> tuple[tuple[float, float, float, float], ...]:
+        """Normalize display windows into four-float tuples for c_size channels.
+
+        Each entry is (start, end) or (min, max, start, end), ordered so
+        min <= start <= end <= max. None uses dtype-dependent defaults.
+        """
         if windows is None:
             return cls._default_windows(c_size, dtype)
         if len(windows) != c_size:
@@ -1399,6 +1578,11 @@ class ZarrIOManager:
         shape: Sequence[int],
         chunks: Sequence[int],
     ) -> zarr.Array:
+        """Create and return a new array at path inside the current group.
+
+        shape and chunks use CZYX order. Uses this manager's dtype, codec, fill
+        value, and chunk encoding, then records CZYX dimension names.
+        """
         array = self.root.create_array(
             path,
             shape=tuple(int(v) for v in shape),
@@ -1413,6 +1597,7 @@ class ZarrIOManager:
         return array
 
     def _level0_dataset_metadata(self) -> dict[str, Any]:
+        """Return the level-zero path and CZYX physical scale transform as NGFF metadata."""
         vz, vy, vx = self.voxel_size
         return {
             "path": self.array_path,
@@ -1425,6 +1610,7 @@ class ZarrIOManager:
         }
 
     def _write_new_ome_metadata(self) -> None:
+        """Write NGFF 0.4 level-zero axes/scales and OMERO display metadata to the group."""
         axes = [dict(axis) for axis in self.AXES_TEMPLATE]
         for axis in axes:
             if axis["name"] in {"z", "y", "x"}:
@@ -1441,6 +1627,7 @@ class ZarrIOManager:
         self._write_omero_metadata()
 
     def _write_omero_metadata(self) -> None:
+        """Write the current image name, channel labels/colors/windows, and display defaults."""
         channels = []
         for name, color, window in zip(
             self.channel_names, self.channel_colors, self.channel_windows
@@ -1482,10 +1669,12 @@ class ZarrIOManager:
         return self._level0
 
     def _ensure_open(self) -> None:
+        """Raise RuntimeError if the manager has been closed."""
         if self._closed:
             raise RuntimeError("ZarrWriter is closed.")
 
     def _ensure_writable(self) -> None:
+        """Require an open manager with write access; reject read-only stores."""
         self._ensure_open()
         if self._read_only:
             raise PermissionError(
@@ -1493,6 +1682,11 @@ class ZarrIOManager:
             )
 
     def _prepare_level0_write(self) -> None:
+        """Apply the configured pyramid policy before the first level-zero write.
+
+        Depending on policy, removes listed lower-resolution arrays and updates
+        metadata, retains them, or raises an error. Runs at most once per manager.
+        """
         self._ensure_writable()
         if self._write_prepared:
             return
@@ -1540,6 +1734,11 @@ class ZarrIOManager:
     def _target_region(
         self, start: Sequence[int], source_shape: Sequence[int]
     ) -> Slice4D:
+        """Return four bounded destination slices from start and source_shape.
+
+        Both arguments use CZYX order. Raises IndexError when the write region
+        would exceed the current array shape.
+        """
         start4 = self._validate_coordinate(start, "start")
         source4 = self._validate_shape(source_shape, "source.shape")
         stop = tuple(s + length for s, length in zip(start4, source4))
@@ -1552,6 +1751,10 @@ class ZarrIOManager:
 
     @staticmethod
     def _source_chunk_shape(source: Any, fallback: Sequence[int]) -> Coordinate4D:
+        """Return CZYX chunk sizes for reading source, bounded by its shape.
+
+        Uses source.chunks when available with four entries; otherwise uses fallback.
+        """
         source_shape = tuple(int(v) for v in source.shape)
         source_chunks = getattr(source, "chunks", None)
         if source_chunks is None or len(source_chunks) != 4:
@@ -1862,6 +2065,11 @@ class ZarrIOManager:
     def _validate_pyramid_factors(
         factors: Iterable[Sequence[int]],
     ) -> list[tuple[int, int, int]]:
+        """Normalize cumulative ZYX pyramid factors into an ordered list of triples.
+
+        Skips (1, 1, 1). Factors must be positive, nondecreasing, and evenly
+        divisible by their preceding factors; invalid sequences raise ValueError.
+        """
         result: list[tuple[int, int, int]] = []
         previous = (1, 1, 1)
         for item in factors:
@@ -1882,6 +2090,11 @@ class ZarrIOManager:
     def _normalize_downsample_modes(
         mode: str | Sequence[str], c_size: int
     ) -> tuple[str, ...]:
+        """Return a lowercased downsampling mode for each of c_size channels.
+
+        mode may be one shared string or a per-channel sequence. Supported values
+        are 'mean', 'nearest', and 'max'; other values raise ValueError.
+        """
         allowed = {"mean", "nearest", "max"}
         if isinstance(mode, str):
             modes = (mode.lower(),) * c_size
@@ -1895,12 +2108,18 @@ class ZarrIOManager:
         return modes
 
     def _generated_level_path(self, level: int) -> str:
+        """Return the string path for level alongside the level-zero array."""
         level0 = PurePosixPath(self.array_path)
         parent = level0.parent
         name = str(level)
         return name if str(parent) == "." else str(parent / name)
 
     def _remove_listed_lower_levels(self) -> None:
+        """Delete lower-resolution arrays listed for the active multiscale image.
+
+        Retains level zero, updates the dataset list, removes stale pyramid
+        metadata, and marks group metadata dirty.
+        """
         multiscales = list(self.root.attrs.get("multiscales", []))
         multiscale = dict(multiscales[self._multiscale_index])
         datasets = list(multiscale.get("datasets", []))
@@ -2090,10 +2309,16 @@ class ZarrIOManager:
         self._closed = True
 
     def __enter__(self) -> "ZarrIOManager":
+        """Return this open manager for context-managed reading or writing."""
         self._ensure_open()
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        """Close the manager and return False so context exceptions propagate.
+
+        exc_type, exc, and traceback are context-manager exception details.
+        Metadata consolidation occurs only on clean exit when enabled.
+        """
         self.close(consolidate=exc_type is None and self.consolidate_on_close)
         return False
 

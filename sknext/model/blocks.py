@@ -2105,6 +2105,12 @@ def init_weights(model: nn.Module):
 
     # 2. Define the exact initialization logic
     def _apply_init(m):
+        """Initialize supported parameters of submodule m in place.
+
+        Convolutional and linear weights use Xavier uniform initialization;
+        biases are zero except the detected heatmap head bias (-4.59). LayerNorm
+        weights are set to one and its biases to zero.
+        """
         if isinstance(m, (nn.Conv2d, nn.Conv3d)):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:

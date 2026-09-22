@@ -136,6 +136,11 @@ def brightness(
     img: NDArray,
     brightness_factor: Tuple[float, float] = (0, 0),
 ) -> NDArray:
+    """Add one uniformly sampled brightness offset to a copy of img.
+
+    img must be a floating-point YXC or ZYXC array. brightness_factor gives
+    the lower and upper additive offsets; output values are not clipped.
+    """
     assert img.ndim in (3, 4), f"Image must be 3D or 4D, got {img.shape}"
     assert np.issubdtype(img.dtype, np.floating), "img must be floating type"
     lo, hi = float(brightness_factor[0]), float(brightness_factor[1])
@@ -146,6 +151,11 @@ def brightness(
     return out
 
 def contrast(img: NDArray, contrast_factor: Tuple[float, float] = (0, 0)) -> NDArray:
+    """Scale a copy of img by 1 plus a uniformly sampled contrast factor.
+
+    img is a YXC or ZYXC array; contrast_factor gives the lower and upper
+    bounds of the sampled increment. Scaling does not subtract the mean.
+    """
     assert img.ndim in (3, 4), f"Image must be 3D or 4D, got {img.shape}"
     lo, hi = float(contrast_factor[0]), float(contrast_factor[1])
     assert lo <= hi, "contrast factor is wrong"
@@ -216,6 +226,10 @@ def random_rot(
     # axes for (y, x) rotation
     axes_img = (1, 0) if img.ndim == 3 else (2, 1)
     def _rotate(arr: NDArray, axes: Tuple[int, int], order: int) -> NDArray:
+        """Rotate arr over axes by the sampled angle, using interpolation order.
+
+        Preserves the array shape and casts the result back to its original dtype.
+        """
         orig_dtype = arr.dtype
         out = rotate(arr.astype(np.float32, copy=False), angle=angle, axes=axes, reshape=False, order=order, mode=_mode)
         return out.astype(orig_dtype, copy=False)
@@ -436,12 +450,21 @@ def shear(
     shear_y = random.randint(shear[0], shear[1])
 
     def _restore_channels(original, warped):
+        """Restore a singleton trailing channel axis dropped from warped.
+
+        original supplies the expected channel layout; otherwise return warped unchanged.
+        """
         # If a single-channel input comes back as (H,W), expand to (H,W,1)
         if original is not None and original.ndim >= 3 and original.shape[-1] == 1 and warped.ndim == 2:
             return warped[..., np.newaxis]
         return warped
 
     def _warp_hwc(arr_hwc: NDArray, tform, order: int, cval: float, mode: str) -> NDArray:
+        """Warp a YXC slice with inverse map tform and interpolation order.
+
+        cval and mode control boundary filling. Preserves spatial size and channel
+        layout, and casts nonfloating results back to the input dtype.
+        """
         H, W = arr_hwc.shape[:2]
         orig_dtype = arr_hwc.dtype
         out = warp(
@@ -637,6 +660,10 @@ def shift(
 
     # Build per-array shift tuples (keep z and c fixed)
     def get_shift_tuple(arr, x, y):
+        """Return axis offsets for x/y pixel shifts in a YXC or ZYXC arr.
+
+        Channel and Z offsets are zero. Unsupported dimensionality raises ValueError.
+        """
         if arr.ndim == 3:           # (y, x, c)
             return (y, x, 0)
         elif arr.ndim == 4:         # (z, y, x, c)
@@ -658,6 +685,11 @@ def shift(
 
 
 def flip_horizontal(image: NDArray, mask: Optional[NDArray] = None, heat: Optional[NDArray] = None):
+    """Reverse the Y axis of image and optional aligned mask and heat arrays.
+
+    Inputs use YXC or ZYXC layout. Returns (image, mask, heat), preserving None
+    for omitted arrays; flipped arrays are views and may have negative strides.
+    """
     assert image.ndim in (3, 4), f"Image must be 3D or 4D, got {image.shape}"
     if mask is not None:
         assert mask.ndim in (3, 4), f"Mask must be 3D or 4D, got {mask.shape}"
@@ -675,6 +707,11 @@ def flip_horizontal(image: NDArray, mask: Optional[NDArray] = None, heat: Option
 
 
 def flip_vertical(image: NDArray, mask: Optional[NDArray] = None, heat: Optional[NDArray] = None):
+    """Reverse the X axis of image and optional aligned mask and heat arrays.
+
+    Inputs use YXC or ZYXC layout. Returns (image, mask, heat), preserving None
+    for omitted arrays; flipped arrays are views and may have negative strides.
+    """
     assert image.ndim in (3, 4), f"Image must be 3D or 4D, got {image.shape}"
     if mask is not None:
         assert mask.ndim in (3, 4), f"Mask must be 3D or 4D, got {mask.shape}"
@@ -744,6 +781,16 @@ def gaussian_blur(
     return blurred.astype(original_dtype, copy=False)
 
 def median_blur(image: NDArray, k_range: Optional[tuple] = None):
+    """Apply an XY median filter without mixing Z slices or channels.
+
+    Args:
+        image: YXC or ZYXC array.
+        k_range: Inclusive integer bounds for sampling the kernel width.
+
+    Returns:
+        Filtered image, or the original array when the sampled width is at most
+        one. Even sampled widths are increased to the next odd integer.
+    """
     assert image.ndim in (3, 4), f"Image must be 3D or 4D, got {image.shape}"
     if k_range is None or len(k_range) != 2:
         raise ValueError("k_range must be provided and have length 2")
@@ -790,6 +837,7 @@ def elastic(
     )
 
     def _spatial_shape(arr: NDArray) -> tuple[int, int]:
+        """Return the (Y, X) shape of a YXC or ZYXC array."""
         return arr.shape[:2] if arr.ndim == 3 else arr.shape[1:3]
 
     image_spatial_shape = _spatial_shape(image)
@@ -825,6 +873,10 @@ def elastic(
     rng = np.random.RandomState(random_seed) if random_seed is not None else np.random
 
     def _sample_parameter(value: float | tuple, name: str) -> float:
+        """Return value as a float or sample uniformly from its two-value tuple.
+
+        name identifies the parameter when validating ordered interval bounds.
+        """
         if isinstance(value, tuple):
             assert len(value) == 2, f"{name} range must contain two values."
             low, high = float(value[0]), float(value[1])
@@ -992,6 +1044,11 @@ def _draw_samples(alpha: float | tuple, sigma: float | tuple, nb_images: int) ->
 
     # Use np.random for all randomness
     def draw_param(param: float | tuple, size: tuple) -> NDArray:
+        """Create a parameter array of size from a constant or uniform interval.
+
+        A two-element tuple specifies sampling bounds; other tuples use their
+        first element as a constant. String parameters produce object arrays.
+        """
         if isinstance(param, (int, float)):
             out = np.full(size, param)
         elif isinstance(param, str):

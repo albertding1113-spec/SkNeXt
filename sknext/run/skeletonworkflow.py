@@ -10,6 +10,11 @@ from sknext.utils.utils import time_str
 from sknext.data.imageIO import get_coord_after_padding, central_block_coordinates_iter
 
 class Skeleton_Workflow():
+    """Extract segmented components associated with neuronal skeletons.
+
+    Processes volume blocks, filters objects by size/location and skeleton
+    compartment, and exports component masks with source/path metadata.
+    """
     def __init__(self,
                  skeleton_path,
                  file_path,
@@ -40,9 +45,14 @@ class Skeleton_Workflow():
         self.create_result_dir()
 
     def create_skeleton(self):
+        """Load and prepare the configured SWC directory as self.skeleton."""
         self.skeleton = SkeletonManager(self.skeleton_path)
 
     def create_reader(self):
+        """Open the configured volume as an OME-Zarr or Imaris reader.
+
+        Stores self.reader; unsupported input formats raise FileNotFoundError.
+        """
         file_type = detect_path_type(self.file_path)
         if file_type == "zarr":
             self.reader = ZarrIOManager(self.file_path, mode="r")
@@ -52,6 +62,7 @@ class Skeleton_Workflow():
             raise FileNotFoundError(f"file type {file_type} is not supported.")
 
     def create_result_dir(self):
+        """Create the result root and one output directory per selected channel."""
         self.result_dirs = []
         self.result_path.mkdir(parents=True, exist_ok=True)
         for ch in self.channel:
@@ -59,8 +70,25 @@ class Skeleton_Workflow():
             self.result_path.joinpath(str(ch)).mkdir(parents=True, exist_ok=True)
 
     def calc_save_one_block(self, block, skeleton_mask, ch, coord, central_coord_in_block):
+        """Filter connected components in one channel block and export accepted objects.
+
+        Args:
+            block: ZYX segmentation block; values at least one are foreground.
+            skeleton_mask: Aligned mask whose positive IDs are skeleton indices plus one.
+            ch: Position in the selected channel list and its per-channel settings.
+            coord: Global (3, 2) ZYX bounds of the block.
+            central_coord_in_block: Block-local (3, 2) bounds used to assign components
+                uniquely by their centroid.
+
+        Rejects small, boundary-touching, unseeded, or disallowed-compartment
+        objects. Writes JSON bounds, a binary TIFF, and an SWC path to soma/root.
+        """
 
         def get_largest_id(mask: np.ndarray, ignore_ids: tuple[int, ...] = (0,),) -> int:
+            """Return the most frequent ID in mask excluding ignore_ids.
+
+            Returns zero when no eligible values remain; ties follow sorted ID order.
+            """
             if np.count_nonzero(mask) == 0:
                 return 0
             valid_mask = ~np.isin(mask, ignore_ids)
@@ -112,6 +140,11 @@ class Skeleton_Workflow():
             navis.write_swc(path_to_soma, saved_path/"data.swc", labels="label")
 
     def run(self):
+        """Process spatial blocks and selected channels, exporting skeleton-linked objects.
+
+        Skips blocks without skeletons, prints progress/errors, and closes the
+        reader in a finally block. Processing exceptions are printed rather than re-raised.
+        """
         try:
             # calculate central_block coordinates
             central_coord = list(central_block_coordinates_iter(self.reader.shape[1:4], self.central_block))

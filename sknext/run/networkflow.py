@@ -30,7 +30,17 @@ from sknext.skeleton.skeleton import SkeletonManager
 
 
 class Segmentation_Workflow(Base_Workflow):
+    """Train a U-NeXt model or run blockwise, skeleton-seeded volume segmentation.
+
+    Extends shared configuration handling with patch preparation, checkpoint
+    I/O, loss/metric tracking, overlap blending, and OME-Zarr output.
+    """
     def __init__(self, cfg, device:torch.device, job_id:int):
+        """Initialize shared settings and epoch chart tracking for a segmentation run.
+
+        cfg supplies workflow options, device selects model execution, and job_id
+        identifies outputs. Creates the configured chart directory.
+        """
         super(Segmentation_Workflow, self).__init__(cfg, device, job_id)
         self.best_val_loss = float("inf")
         # Store the same scalar values that are written to SummaryWriter.
@@ -87,6 +97,11 @@ class Segmentation_Workflow(Base_Workflow):
             saved_files.append(chart_path)
 
     def save_patch_as_zarr(self):
+        """Create paired training and validation stores from configured TIFF directories.
+
+        Resolves instance/semantic label files, crops patches, and writes raw and
+        label arrays. Patch filtering applies to training data only.
+        """
         self.train_tif_list = get_tif_path_in_folder(self.train_path)
         self.train_gt_tif_dict = get_tif_path_dict_in_folder(self.train_gt_path, self.channels)
         self.val_tif_list = get_tif_path_in_folder(self.val_path)
@@ -103,6 +118,11 @@ class Segmentation_Workflow(Base_Workflow):
                          self.channels_extra_opts, filter_dict=None)
 
     def define_activations_and_channels(self):
+        """Expand task channels into model output names and initialize linear heads.
+
+        Affinity targets expand into separate Z, Y, and X offset channels.
+        Stores the output channel count, names, and activation identifiers.
+        """
         self.out_channel_num = 0
         self.output_channel_names = []
         for channel in self.channels:
@@ -120,6 +140,11 @@ class Segmentation_Workflow(Base_Workflow):
         self.head_activations = list(["linear"] * self.out_channel_num)
 
     def set_loss_metrics(self):
+        """Create the weighted BCE/Dice loss and channel-wise IoU evaluator.
+
+        Requires output_channel_names from define_activations_and_channels and
+        moves the loss module to the configured device.
+        """
         self.loss_func = instance_segmentation_loss(channel_weights=self.channel_weights,
                                                     channel_names=self.output_channel_names,
                                                     bce_weight=1.0,
@@ -129,6 +154,11 @@ class Segmentation_Workflow(Base_Workflow):
         self.metric = instance_segmentation_metrics(self.output_channel_names)
 
     def set_optimizer_scheduler(self):
+        """Build the configured SGD/Adam/AdamW optimizer and step-based LR scheduler.
+
+        Requires an initialized model and train_steps_per_epoch. Unsupported
+        optimizer or scheduler names fail assertions.
+        """
         assert self.optimizer_name in ["SGD", "ADAM", "ADAMW"], "Unknown optimizer."
         if self.optimizer_name == "SGD":
             self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.9, weight_decay=self.w_decay)
@@ -151,6 +181,11 @@ class Segmentation_Workflow(Base_Workflow):
                                                            min_lr=self.min_lr)
 
     def set_model(self):
+        """Construct U-NeXt V2 with configured geometry and task output channels.
+
+        Moves the model to the selected device and chooses train/eval mode from
+        the workflow flags. Only the supported U-NeXt V2 architecture aliases are accepted.
+        """
         self.define_activations_and_channels()
         assert self.model_name in ["unext_v2", "u_next_v2", "unext-v2"], f"Unsupported model: {self.model_name}"
         self.model = U_NeXt_V2(image_shape=self.patch_size,
@@ -176,9 +211,16 @@ class Segmentation_Workflow(Base_Workflow):
             self.model.eval()
 
     def create_skeleton(self):
+        """Load configured SWC files into the skeleton manager used during inference."""
         self.skeleton_manager = SkeletonManager(self.skeleton_path)
 
     def load_checkpoint(self):
+        """Restore the configured checkpoint into an already constructed model.
+
+        Validates the saved architecture, removes a uniform 'module.' key prefix
+        when present, and loads weights strictly. Optimizer/scheduler state is
+        not restored.
+        """
         assert hasattr(self, "model") and self.model is not None, (
             "self.model is None. Please call set_model() before loading checkpoint.")
         checkpoint_file = Path(self.checkpoint_file)
@@ -197,6 +239,11 @@ class Segmentation_Workflow(Base_Workflow):
         print(f"{time_str()} Model checkpoint loaded from: {self.checkpoint_file}", flush=True)
 
     def save_checkpoint(self):
+        """Save model weights on CPU and the architecture name to checkpoint_file.
+
+        Creates the checkpoint directory and overwrites the existing checkpoint.
+        Parallel wrappers are unwrapped; optimizer and scheduler state are omitted.
+        """
         assert hasattr(self, "model") and self.model is not None, (
             "self.model is None. Please call set_model() before saving checkpoint.")
         checkpoint_dir = Path(self.checkpoint_dir)
@@ -209,6 +256,11 @@ class Segmentation_Workflow(Base_Workflow):
         print(f"{time_str()} Model checkpoint saved to: {self.checkpoint_file}", flush=True)
 
     def create_reader(self):
+        """Open the configured inference source as an OME-Zarr or Imaris reader.
+
+        Computes output chunk dimensions from patch size and stores infer_reader.
+        Unsupported source formats raise FileNotFoundError.
+        """
         self.chunk = (1, self.patch_size[0]*2, self.patch_size[1]*4, self.patch_size[2]*4)
         self.infer_path = Path(self.infer_path)
         assert self.infer_path.exists(), "Infer path does not exist."
@@ -220,6 +272,11 @@ class Segmentation_Workflow(Base_Workflow):
         else: raise FileNotFoundError(f"file type {file_type} is not supported.")
 
     def create_writer(self):
+        """Open or create the CZYX uint16 OME-Zarr inference destination.
+
+        A directory destination is expanded to result<job_id>.ome.zarr. Requires
+        reader shape, output channel definitions, and chunk sizes to be initialized.
+        """
         self.infer_gt_path = Path(self.infer_gt_path)
         if self.infer_gt_path.exists():
             file_type = detect_path_type(self.infer_gt_path)
@@ -240,6 +297,11 @@ class Segmentation_Workflow(Base_Workflow):
 
 
     def define_postprocess_channels(self):
+        """Count prediction channels and define instance/semantic output metadata.
+
+        All instance-related prediction channels map to one instance-label output;
+        each semantic target receives a separate output channel.
+        """
         self.postpro_channel_num = 0
         self.postpro_channel_info = []
         self.instance_num = 0
@@ -263,10 +325,17 @@ class Segmentation_Workflow(Base_Workflow):
             self.postpro_channel_info = tuple(["Infer_instance",] + self.postpro_channel_info)
 
     def close_reader_writer(self):
+        """Close both inference storage handles after they have been initialized."""
         self.infer_reader.close()
         self.infer_writer.close()
 
     def train(self):
+        """Prepare patch stores, optimize the model, and validate after each epoch.
+
+        Optionally loads existing model weights, records losses/metrics and LR,
+        exports charts every five epochs, saves improved validation checkpoints,
+        and stops after the configured patience without improvement.
+        """
         print(f"{time_str()} preparing training data", flush=True)
         self.save_patch_as_zarr()
         print(f"{time_str()} preparing data loader", flush=True)
@@ -402,6 +471,12 @@ class Segmentation_Workflow(Base_Workflow):
 
     @torch.no_grad()
     def infer(self):
+        """Segment configured volume blocks using saved model weights and SWC seeds.
+
+        Loads progress to resume completed blocks, writes central block regions,
+        and saves progress after each block. Builds output pyramid levels on
+        successful completion and closes initialized I/O handles during cleanup.
+        """
         # create and load model
         print(f"{time_str()} preparing model", flush=True)
         self.set_model()
@@ -461,6 +536,17 @@ class Segmentation_Workflow(Base_Workflow):
                 self.close_reader_writer()
 
     def _infer_one_block(self, coord, skeleton):
+        """Predict and post-process one spatial block using overlapping patches.
+
+        Args:
+            coord: Global (3, 2) half-open ZYX bounds of the block to read.
+            skeleton: Skeletons cropped to this block for watershed seeding.
+
+        Returns:
+            A uint16 CZYX block of instance/semantic labels. Overlapping probability
+            patches are blended with separable weights before thresholding and
+            watershed; uncovered voxels raise RuntimeError.
+        """
         block_size = np.array((self.patch_size[3], *(coord[:, 1] - coord[:, 0])), dtype=np.int64)
         block_raw = np.zeros(tuple(block_size), dtype=self.infer_reader.dtype)  # CZYX
         for i in range(self.patch_size[3]):
@@ -547,6 +633,19 @@ class Segmentation_Workflow(Base_Workflow):
         p_coord_list,
         p_overlap_widths,
     ):
+        """Accumulate weighted patch probabilities into a block's blending buffers.
+
+        Args:
+            block_pred_sum: Mutable float32 CZYX weighted probability accumulator.
+            block_weight_sum: Mutable ZYX spatial weight accumulator.
+            block_raw: Preprocessed CZYX source block.
+            p_coord_list: Block-local (3, 2) ZYX bounds for each patch in the batch.
+            p_overlap_widths: Per-patch (3, 2) low/high overlap widths in voxels.
+
+        Returns:
+            The two updated accumulation buffers. Short patches are padded to
+            model input size and cropped back before accumulation.
+        """
         current_batch_size = len(p_coord_list)
         if current_batch_size == 0:
             return block_pred_sum, block_weight_sum
@@ -610,6 +709,12 @@ class Segmentation_Workflow(Base_Workflow):
         return block_pred_sum, block_weight_sum
 
     def save_infer_log(self) -> Path:
+        """Atomically write the current block progress and output-store path to JSON.
+
+        Returns:
+            Path of the per-job progress file under infer_log_path. A temporary
+            file is flushed and synced before replacement, then cleaned up.
+        """
         self.infer_log_path = Path(self.cfg.DATA.INFER.INFER_LOG)
         self.infer_log_path.mkdir(parents=True, exist_ok=True)
         log_path = self.infer_log_path / f"infer_log_{int(self.job_id):02d}.json"
@@ -682,6 +787,7 @@ class Segmentation_Workflow(Base_Workflow):
 
 
     def run(self):
+        """Run training when enabled, otherwise inference when enabled, then close logs."""
         if self.cfg.TRAIN.ENABLE:
             print(f"{time_str()} start instance segmentation training", flush=True)
             self.train()

@@ -11,6 +11,11 @@ def _resolve_total_steps(
     epochs: int | None = None,
     steps_per_epoch: int | None = None,
 ) -> int:
+    """Return a positive training-step count from explicit or epoch-based settings.
+
+    Uses total_steps when supplied; otherwise multiplies epochs by
+    steps_per_epoch. Missing or nonpositive settings fail assertions.
+    """
     if total_steps is not None:
         assert total_steps > 0, "total_steps must be > 0."
         return int(total_steps)
@@ -65,7 +70,16 @@ def build_warmup_cosine_scheduler(
     min_lr_factors = [min_lr / base_lr for base_lr in base_lrs]
 
     def make_lr_lambda(min_lr_factor: float):
+        """Return a step-to-LR-factor callback for one parameter group's min_lr_factor.
+
+        The callback captures the enclosing warmup and total-step settings.
+        """
         def lr_lambda(current_step: int) -> float:
+            """Return the learning-rate multiplier at current_step.
+
+            Uses linear warmup followed by cosine decay toward the captured minimum
+            factor, clamping steps beyond the configured training duration.
+            """
             current_step = min(current_step, total_steps)
 
             # 1. Linear warmup

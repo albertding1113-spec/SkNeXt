@@ -9,10 +9,26 @@ from sknext.utils.utils import get_cfg_value
 
 
 class ZarrPatchLoader:
+    """Read paired NCZYX patch datasets and assemble batches for segmentation.
+
+    Applies configured random augmentation to training samples only, while
+    validation reads retain the stored raw/label pairing.
+    """
     def __init__(self, cfg,
                  zarr_path: str | Path,
                  dataset_name: list[str] | tuple[str] = ("raw", "label"),
                  if_val: bool = False):
+        """Open a patch store and cache augmentation options from cfg.
+
+        Args:
+            cfg: Configuration supplying AUGMENTOR options.
+            zarr_path: Existing Zarr group containing paired patch arrays.
+            dataset_name: Raw and label array names, in that order.
+            if_val: Disable training augmentation for validation reads.
+
+        Raises:
+            KeyError: A requested dataset is absent from the store.
+        """
         self.cfg = cfg
         self.zarr_path = Path(zarr_path)
         assert self.zarr_path.exists(), "zarr_path does not exist."
@@ -60,9 +76,18 @@ class ZarrPatchLoader:
         self.zflip = get_cfg_value(self.cfg, "AUGMENTOR.ZFLIP", False)
 
     def __len__(self) -> int:
+        """Return the number of stored patches, rather than the number of batches."""
         return self.num_patches
 
     def load_one_pair_patch(self, id:int) -> tuple[np.ndarray, np.ndarray]:
+        """Read a raw/label pair at the zero-based patch id.
+
+        Returns:
+            Two CZYX NumPy arrays, augmented together for training when enabled.
+
+        Raises:
+            IndexError: id is outside the stored patch range.
+        """
         if id < 0 or id >= self.num_patches:
             raise IndexError(f"Patch id out of range: {id}, valid range is [0, {self.num_patches - 1}]")
         raw_arr = self.arrays[self.dataset_name[0]]
@@ -78,6 +103,11 @@ class ZarrPatchLoader:
         return raw_patch, label_patch
 
     def patch_augment(self, patch: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray]:
+        """Apply enabled stochastic transforms to a ZYXC patch and its mask.
+
+        Intensity transforms affect only patch; spatial transforms keep both
+        arrays aligned. Returns the transformed pair as contiguous NumPy arrays.
+        """
         if self.cut_out and random.uniform(0, 1) < self.da_prob / 5:
             patch, mask = cutout(patch, mask)
         if self.g_blur and random.uniform(0, 1) < self.da_prob:

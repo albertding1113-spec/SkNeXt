@@ -6,7 +6,17 @@ from pathlib import Path
 
 
 class SkNeXt_Config:
+    """Own the default YACS configuration for data, models, and workflows.
+
+    Provides independent configuration clones and initializes output paths
+    from a job identifier. YAML overrides are applied by update_config.
+    """
     def __init__(self, job_id:Optional[int|str]):
+        """Construct all default configuration sections for job_id.
+
+        Args:
+            job_id: Identifier embedded in initial result paths, or None.
+        """
         # 1. SYSTEM
         _C = CN()
         _C.SYSTEM = CN()
@@ -341,18 +351,26 @@ class SkNeXt_Config:
         self._C = _C
 
     def get_cfg_defaults(self) -> CN:
+        """Return a cloned CfgNode so callers can edit defaults independently."""
         return self._C.clone()
 
     def to_dict(self):
+        """Return a shallow dictionary of the root configuration sections.
+
+        Nested sections remain CfgNode objects shared with this configuration.
+        """
         return dict(self._C)
 
     def copy(self):
+        """Return a deep copy of this configuration wrapper and its nested values."""
         return copy.deepcopy(self)
 
     def __str__(self):
+        """Return the string representation of this wrapper's attribute dictionary."""
         return str(self.__dict__)
 
     def __repr__(self):
+        """Return this wrapper's attribute dictionary as its diagnostic representation."""
         return str(self.__dict__)
 
 
@@ -373,11 +391,29 @@ def load_config(config:str) ->Dict:
 
 
 def update_config(cfg:CN, new_cfg:CN, job_id:Optional[str|int]) -> CN:
+    """Merge known override keys into cfg and recompute job-specific output paths.
+
+    Args:
+        cfg: Base CfgNode, modified in place and defrosted if necessary.
+        new_cfg: Override CfgNode; unknown keys are rejected.
+        job_id: Identifier used in result, log, and checkpoint directories.
+
+    Returns:
+        The updated base configuration. Override values are deep-copied.
+
+    Raises:
+        KeyError: An override names a key absent from the defaults.
+    """
     assert isinstance(cfg, CN) and isinstance(new_cfg, CN), "Config type is not CN."
     if cfg.is_frozen():
         cfg.defrost()
 
     def _update_recursive(base_cfg: CN, override_cfg: CN, prefix: str = ""):
+        """Recursively copy override_cfg values into base_cfg.
+
+        Both arguments are configuration nodes. prefix tracks the dotted location
+        for unknown-key errors; updates modify the base node in place.
+        """
         for key, value in override_cfg.items():
             full_key = f"{prefix}.{key}" if prefix else key
 

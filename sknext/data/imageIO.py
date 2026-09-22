@@ -10,6 +10,11 @@ from numcodecs import Blosc
 
 
 def get_tif_path_in_folder(file_path: Path|str) -> list[Path|str]:
+    """Return sorted absolute paths to immediate .tif/.tiff files in file_path.
+
+    The path must be an existing directory; the search is not recursive and
+    extension matching is case-insensitive.
+    """
     file_path = Path(file_path)
     assert file_path.exists(), f"Folder does not exist: {file_path}"
     assert file_path.is_dir(), f"Input path is not a folder: {file_path}"
@@ -18,6 +23,20 @@ def get_tif_path_in_folder(file_path: Path|str) -> list[Path|str]:
     return tif_paths
 
 def get_tif_path_dict_in_folder(file_path: Path|str, channel_names: list[str]) -> dict[str, Path|str]:
+    """Group TIFF label paths by instance and requested semantic channels.
+
+    Args:
+        file_path: Directory containing label TIFF files.
+        channel_names: F/P/C/A instance targets and/or S.<name> semantic targets.
+
+    Returns:
+        Mapping from 'instance' or semantic channel names to sorted path lists.
+        Semantic files are identified by the suffix before .tif/.tiff.
+
+    Raises:
+        ValueError: A channel name is unsupported.
+        AssertionError: The directory is invalid or group counts differ.
+    """
     file_path = Path(file_path)
     assert file_path.exists(), f"Folder does not exist: {file_path}"
     assert file_path.is_dir(), f"Input path is not a folder: {file_path}"
@@ -45,6 +64,15 @@ def get_tif_path_dict_in_folder(file_path: Path|str, channel_names: list[str]) -
     return path_dict
 
 def read_one_3D_tif(tif_path: str|Path, output_axes:Literal["ZYX", "CZYX", "ZYXC"] = "CZYX") -> np.ndarray:
+    """Read a TIFF volume and arrange its axes as requested.
+
+    Args:
+        tif_path: Path to a three-dimensional ZYX or four-dimensional CZYX TIFF.
+        output_axes: ZYX, CZYX, or ZYXC; ZYX requires a three-dimensional input.
+
+    Returns:
+        Image array with a singleton channel axis added when needed.
+    """
     tif_path = Path(tif_path)
     img = tifffile.imread(str(tif_path))
     assert img.ndim == 3 or img.ndim == 4, "tiff image must be 3D or 4D."
@@ -72,6 +100,17 @@ def calculate_patch_coordinates(
         overlap: tuple[int, int, int] | list[int] = (0, 0, 0),
         padding: tuple[int, int, int] | list[int] = (0, 0, 0),
 ):
+    """Collect spatial patch bounds for an image into an integer array.
+
+    Args:
+        img_shape: ZYX shape, or CZYX shape whose channel dimension is ignored.
+        patch_size: Spatial patch dimensions in ZYX order.
+        overlap: Overlap in voxels along Z, Y, and X.
+        padding: Spatial halo widths passed to patch_coordinates_iter.
+
+    Returns:
+        An (N, 3, 2) array of half-open bounds, including an empty array for N=0.
+    """
     if len(img_shape) == 4:
         img_shape = img_shape[1:]
 
@@ -217,6 +256,12 @@ def central_block_coordinates_iter(
     img_shape: tuple[int, int, int],
     central_block_size: tuple[int, int, int],
 ):
+    """Yield nonoverlapping block bounds covering a ZYX image.
+
+    img_shape and central_block_size contain three spatial sizes. Each yielded
+    int64 array has shape (3, 2) with inclusive starts and exclusive stops;
+    blocks touching the high image edges are clipped to the image shape.
+    """
     z_size, y_size, x_size = map(int, img_shape)
     bz, by, bx = map(int, central_block_size)
 
@@ -240,6 +285,11 @@ def central_block_coordinates_iter(
 
 def patch_coordinates_generator(img:np.ndarray, # CZYX / ZYX
                                 patch_coordinates:np.ndarray)->Iterator[np.ndarray, np.ndarray]:
+    """Yield (patch_view, bounds) pairs from ZYX or CZYX img.
+
+    patch_coordinates is an (N, 3, 2) array of half-open ZYX bounds. Channel
+    axes are preserved and slices may share memory with the input image.
+    """
     if img.ndim == 4:
         for i in range(patch_coordinates.shape[0]):
             one_patch = img[:, patch_coordinates[i, 0, 0]:patch_coordinates[i, 0, 1],

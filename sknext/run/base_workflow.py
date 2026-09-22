@@ -9,7 +9,22 @@ from tensorboardX import SummaryWriter
 
 
 class Base_Workflow(ABC):
+    """Abstract base for configured segmentation training and inference.
+
+    Caches data/model/training settings, derives patch/block geometry, and
+    owns the TensorBoard writer. Subclasses implement preparation and execution.
+    """
     def __init__(self, cfg, device:torch.device, job_id:int):
+        """Initialize shared workflow state from cfg for device and job_id.
+
+        Args:
+            cfg: Configuration with resolved result/checkpoint paths.
+            device: PyTorch device to use for model execution.
+            job_id: Numeric identifier used to construct the checkpoint filename.
+
+        Creates a TensorBoard writer, converts overlap fractions to voxel counts,
+        and validates filter/post-processing options.
+        """
         self.cfg = cfg
         self.device = device
         self.job_id = job_id
@@ -139,6 +154,7 @@ class Base_Workflow(ABC):
         }
 
     def get_preprocess_dict(self):
+        """Build self.preprocess_dict from clipping and normalization settings."""
         preprocess_dict = {}
         preprocess_dict["perc_clip"] = self.perc_clip_flag
         preprocess_dict["perc_clip_range"] = self.perc_clip_range
@@ -147,6 +163,12 @@ class Base_Workflow(ABC):
         self.preprocess_dict = preprocess_dict
 
     def get_postprocess_dict(self):
+        """Translate enabled configured operations into self.postprocess_dict.
+
+        Supports fill_holes, remove_small, and remove_large. Disabled processing
+        produces an empty dictionary; unknown operations or mismatched value
+        counts raise ValueError.
+        """
         if not self.cfg.INFER.POST_PROCESSING.ENABLE:
             self.postprocess_dict = {}
             return
@@ -168,24 +190,30 @@ class Base_Workflow(ABC):
 
     @abstractmethod
     def save_patch_as_zarr(self):
+        """Prepare training/validation patch stores; subclasses supply the implementation."""
         pass
 
     @abstractmethod
     def set_model(self):
+        """Construct and place the segmentation model; subclasses supply the implementation."""
         pass
 
     @abstractmethod
     def load_checkpoint(self):
+        """Restore saved model weights; subclasses supply the implementation."""
         pass
 
     @abstractmethod
     def train(self):
+        """Execute model training; subclasses supply the implementation."""
         pass
 
     @abstractmethod
     def infer(self):
+        """Execute model inference; subclasses supply the implementation."""
         pass
 
     @abstractmethod
     def run(self):
+        """Dispatch the configured workflow; subclasses supply the implementation."""
         pass

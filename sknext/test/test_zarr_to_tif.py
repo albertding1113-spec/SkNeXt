@@ -12,6 +12,21 @@ def zarr_nczyx_to_tif(
     output_axes: str = "CZYX",
     overwrite: bool = True,
 ) -> list[Path]:
+    """Export each patch in an NCZYX Zarr array as a separate BigTIFF file.
+
+    Args:
+        zarr_path: Existing Zarr group containing the patch array.
+        output_dir: Destination directory, created when needed.
+        array_name: Name of the five-dimensional source array.
+        prefix: Output filename prefix; defaults to array_name.
+        output_axes: CZYX, ZCYX, or ZYXC for multichannel data. Single-channel
+            patches are always written as ZYX.
+        overwrite: Permit replacing existing TIFF files.
+
+    Returns:
+        List of written paths. Raises FileExistsError on a collision when
+        overwrite is false; files written before the collision remain.
+    """
 
     zarr_path = Path(zarr_path)
     output_dir = Path(output_dir)
@@ -69,6 +84,11 @@ def zarr_nczyx_to_tif(
 
 
 def test_zarr_nczyx_to_tif():
+    """Export raw and label patches from the example dataset's hard-coded paths.
+
+    This manual utility writes TIFF files and requires the referenced local
+    dataset; it is not a self-contained unit test.
+    """
     zarr_path = r"G:\Albert\data\260618_SkNeXt_dataset\train.ome.zarr"
 
     zarr_nczyx_to_tif(

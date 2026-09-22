@@ -12,6 +12,11 @@ from typing import Optional, List, Tuple, Dict, Union, Sequence
 
 
 def jaccard_index_numpy(y_true, y_pred):
+    """Return binary intersection-over-union for NumPy masks y_true and y_pred.
+
+    Inputs are expected to contain zeros and ones with matching shapes. A
+    zero union returns 0; differing dimensionality raises ValueError.
+    """
     if y_true.ndim != y_pred.ndim:
         raise ValueError("Dimension mismatch: {} and {} provided".format(y_true.shape, y_pred.shape))
     TP = np.count_nonzero(y_pred * y_true)
@@ -85,6 +90,18 @@ class instance_segmentation_loss(nn.Module):
         eps: float = 1e-6,
         return_dict: bool = False,
     ):
+        """Configure weighted channel-wise BCE and Dice loss terms.
+
+        Args:
+            channel_weights: Optional per-channel weights registered as a buffer.
+            channel_names: Optional names for channel-specific reporting.
+            bce_weight: Nonnegative multiplier for binary cross-entropy.
+            dice_weight: Nonnegative multiplier for Dice loss; at least one term
+                must have a positive weight.
+            auto_balance: Reweight foreground/background voxels in the BCE term.
+            eps: Smoothing constant used by Dice loss.
+            return_dict: Request named loss components along with the total.
+        """
         super().__init__()
 
         assert bce_weight >= 0, "bce_weight must be >= 0."
@@ -132,6 +149,11 @@ class instance_segmentation_loss(nn.Module):
         pred_logits: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
+        """Return mean binary cross-entropy for one channel's logits and binary target.
+
+        pred_logits and target have matching shapes. When auto_balance is enabled,
+        weights compensate for the target foreground/background ratio.
+        """
         if self.auto_balance:
             weight_map = weight_binary_ratio(target)
             return F.binary_cross_entropy_with_logits(
@@ -222,6 +244,12 @@ class instance_segmentation_loss(nn.Module):
 
 
 class instance_segmentation_metrics:
+    """Compute named channel-wise binary IoU values without accumulating state.
+
+    Accepts logits or probabilities and matching targets with batch/channel
+    axes first. Applies the configured threshold and empty-union convention;
+    each call returns a dictionary of Python floats keyed by channel name.
+    """
     def __init__(
         self,
         channel_names: list[str],

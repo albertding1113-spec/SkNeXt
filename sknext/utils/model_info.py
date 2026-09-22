@@ -5,6 +5,7 @@ import torch.nn as nn
 
 
 def bytes_to_mb(num_bytes: int) -> float:
+    """Convert num_bytes to mebibytes using 1024 squared bytes per unit."""
     return num_bytes / 1024 / 1024
 
 
@@ -16,6 +17,15 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 
 def print_model_parameters(model: nn.Module, print_detail: bool = True):
+    """Print parameter counts and storage sizes for a PyTorch model.
+
+    Args:
+        model: Module, optionally wrapped in a parallel-training container.
+        print_detail: Include each parameter's shape, dtype, device, and size.
+
+    Also reports trainable/frozen totals and buffer storage. Sizes use MiB
+    although the console labels them MB; nothing is returned.
+    """
     model = unwrap_model(model)
 
     total_params = 0

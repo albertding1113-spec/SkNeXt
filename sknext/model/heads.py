@@ -264,6 +264,15 @@ class PSP(nn.Module):
             norm: str = "none",
             pool_sizes=[1, 2, 3, 6],
     ):
+        """Build pyramid-pooling branches and their feature-fusion bottleneck.
+
+        Args:
+            conv: Convolution class selecting 2D or 3D operations.
+            in_dims: Number of input feature channels.
+            out_dims: Number of output channels per pooled branch and fused output.
+            norm: Normalization type, or 'none'.
+            pool_sizes: Adaptive spatial pooling sizes, one per context branch.
+        """
         super().__init__()
 
         self.conv = conv
@@ -383,6 +392,7 @@ class SpatialGatherModule(nn.Module):
     """
 
     def __init__(self, num_classes: int, scale: float = 1.0):
+        """Configure aggregation over num_classes using the score multiplier scale."""
         super().__init__()
         self.num_classes = num_classes
         self.scale = scale
@@ -439,6 +449,13 @@ class ObjectAttentionBlock2D(nn.Module):
     """
 
     def __init__(self, in_channels: int, key_channels: int, norm: str = "bn"):
+        """Build pixel/object projections and output projection for 2D attention.
+
+        Args:
+            in_channels: Input and reconstructed context channel count.
+            key_channels: Intermediate key/query/value feature width.
+            norm: Normalization used in the projection layers.
+        """
         super().__init__()
         self.in_channels = in_channels
         self.key_channels = key_channels
@@ -556,6 +573,17 @@ class OCRHead(nn.Module):
             key_dims: int = 256,
             scale: float = 1.0,
     ):
+        """Build a 2D object-context head with an auxiliary segmentation classifier.
+
+        Args:
+            conv: Must be torch.nn.Conv2d.
+            in_dims: Backbone input channel count.
+            out_dims: Refined feature channel count.
+            num_classes: Number of auxiliary classification channels.
+            norm: Normalization option for feature and attention layers.
+            key_dims: Attention projection width; None uses out_dims.
+            scale: Multiplier for class scores during spatial context aggregation.
+        """
         super().__init__()
 
         assert conv is nn.Conv2d, "Current OCRHead implementation is 2D-only."

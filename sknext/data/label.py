@@ -56,6 +56,19 @@ def _parse_p_channel_options(extra_opts: dict | None = None) -> tuple[str, str, 
 def generate_channels_from_labels(labels_dict: dict[np.ndarray], # ZYX
                                   channels: list[str]|tuple[str],
                                   channel_extra_opts: dict = {}) -> list[np.ndarray]:
+    """Construct ordered binary training targets from instance/semantic labels.
+
+    Args:
+        labels_dict: ZYX arrays keyed by 'instance' and semantic S.<name> keys.
+        channels: Target names F (foreground), P (center), C (contour),
+            A (affinity), or S.<name> (semantic).
+        channel_extra_opts: Per-channel morphology, center, contour, and
+            affinity options.
+
+    Returns:
+        List of ZYX target arrays. An A entry expands into Z-, Y-, and X-offset
+        channels, with all offsets for each axis grouped together.
+    """
     for label in labels_dict.values(): assert label.ndim == 3, "label should be a 3d array"
     ch_img_list = []
     for channel in channels:
@@ -115,12 +128,27 @@ def generate_channels_from_labels(labels_dict: dict[np.ndarray], # ZYX
 def mask_dilation_erosion(img: np.ndarray,
                           dilation: int = 0,
                           erosion: int = 0) -> np.array:
+    """Apply binary dilation followed by erosion to positive voxels of img.
+
+    Args:
+        img: A 2D/3D mask or a CZYX array processed channel by channel.
+        dilation: Nonnegative iteration count; zero skips dilation.
+        erosion: Nonnegative iteration count; zero skips erosion.
+
+    Returns:
+        Binary-valued array with the input shape and dtype; instance IDs are
+        not preserved.
+    """
     assert dilation >= 0, "dilation must be >= 0."
     assert erosion >= 0, "erosion must be >= 0."
     original_dtype = img.dtype
     mask = img > 0
 
     def _process_one_mask(one_mask: np.ndarray) -> np.ndarray:
+        """Morphologically process one binary spatial mask with connectivity one.
+
+        Uses the enclosing dilation/erosion iteration counts and returns a boolean mask.
+        """
         structure = generate_binary_structure(
             rank=one_mask.ndim,
             connectivity=1,
@@ -217,6 +245,11 @@ def reconstruct_skeleton_from_mask(
 
 
 def reconstruct_centroid_from_mask(labels:np.ndarray) -> np.ndarray:
+    """Return one foreground voxel per nonzero instance in a ZYX label array.
+
+    Selects the instance voxel nearest its centroid, ensuring the marker stays
+    inside the instance. The result is a binary uint8 volume.
+    """
     assert labels.ndim == 3, "labels should be a 3d array"
     centroid_labels = np.zeros_like(labels)
     props = regionprops(labels)
@@ -236,6 +269,11 @@ def reconstruct_centroid_from_mask(labels:np.ndarray) -> np.ndarray:
 
 def reconstruct_contour_from_mask(labels: np.ndarray,
                                   mode: Literal["thick", "inner", "outer"]) -> np.ndarray:
+    """Return uint8 instance boundaries for a three-dimensional label volume.
+
+    mode selects 'thick', 'inner', or 'outer' boundaries with connectivity one
+    and background label zero.
+    """
     assert labels.ndim == 3, "labels should be a 3d array"
     assert mode in ["thick", "inner", "outer"], "unkonwn contour reconstruction mode"
     contour = find_boundaries(
@@ -248,6 +286,17 @@ def reconstruct_contour_from_mask(labels: np.ndarray,
 
 
 def calc_affinities_from_mask(labels: np.ndarray, affinities: dict) -> np.ndarray:
+    """Compute same-instance affinity targets for the requested axis offsets.
+
+    Args:
+        labels: ZYX instance labels, with zero reserved for background.
+        affinities: z_affinities, y_affinities, and x_affinities lists of equal
+            length, each defaulting to [1].
+
+    Returns:
+        uint8 array of shape (3 * number_of_offsets, Z, Y, X), ordered by Z,
+        then Y, then X offsets. Background and out-of-bounds pairs are zero.
+    """
     assert labels.ndim == 3, "labels should be a 3d array"
     z_affinities = affinities.get("z_affinities", [1])
     y_affinities = affinities.get("y_affinities", [1])
@@ -265,6 +314,11 @@ def calc_affinities_from_mask(labels: np.ndarray, affinities: dict) -> np.ndarra
             dy: int = 0,
             dx: int = 0,
     ) -> np.ndarray:
+        """Compare labels against neighbors displaced by (dz, dy, dx).
+
+        Returns a float32 ZYX map marking matching nonzero instance IDs at the
+        source voxel. Out-of-bounds pairs are zero; an all-zero offset is invalid.
+        """
         if dz == 0 and dy == 0 and dx == 0:
             raise ValueError("Affinity offset cannot be (0, 0, 0).")
         z_size, y_size, x_size = labels.shape
@@ -396,6 +450,7 @@ def watershed_with_sk(
     channel_index = {name: index for index, name in enumerate(ch_names)}
 
     def require_channels(names: list[str], argument_name: str) -> None:
+        """Check names exist in the prediction channels, labeling errors with argument_name."""
         missing = [name for name in names if name not in channel_index]
         if missing:
             raise ValueError(f"{argument_name} contains unavailable channels {missing}; available channels are {ch_names}.")
@@ -409,6 +464,10 @@ def watershed_with_sk(
         channels: list[str],
         argument_name: str,
     ) -> list[float | str]:
+        """Return one threshold per channel, defaulting empty thresholds to 'auto'.
+
+        channels determines the required count; argument_name labels length errors.
+        """
         if not thresholds:
             return ["auto"] * len(channels)
         result = list(thresholds)
@@ -420,6 +479,11 @@ def watershed_with_sk(
     growth_mask_chs_thresh = normalize_thresholds(growth_mask_chs_thresh, growth_mask_chs,"growth_mask_chs_thresh",)
 
     def resolve_threshold(channel: np.ndarray, value: float | str) -> float:
+        """Return a numeric probability threshold for channel and value.
+
+        'auto' uses Otsu on finite values, falling back to 0.5 for empty or constant
+        samples. Explicit thresholds must be finite numbers in [0, 1].
+        """
         if isinstance(value, str):
             text = value.strip().lower()
             if text == "auto":
@@ -445,6 +509,11 @@ def watershed_with_sk(
         channel_name: str,
         threshold_value: float | str,
     ) -> np.ndarray:
+        """Return the foreground mask for channel_name and threshold_value.
+
+        Contour channel C uses values at or below its threshold; other channels
+        use values strictly above it. 'auto' thresholds are resolved per channel.
+        """
         channel = probability[channel_index[channel_name]]
         threshold = resolve_threshold(channel, threshold_value)
         # C is boundary probability: low C means object interior.

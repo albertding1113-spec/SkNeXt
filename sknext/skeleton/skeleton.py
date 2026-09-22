@@ -8,16 +8,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from typing import Iterable
-from collections.abc import Sequence
-import tifffile
-
-import skeleton
 
 
 class SkeletonManager():
+    """Manage SWC neurons, coordinate transforms, cropping, and seed-mask generation.
+
+    Tracks both NAVis neuron IDs and filename-derived IDs, supports spatial
+    queries and visualization, and prepares skeletons for volume workflows.
+    """
     def __init__(self,
                  sk_path: str | Path,
                  node_distance: float | Iterable[float] = [3,10,10],):
+        """Load SWC neurons and prepare their geometry and lookup indices.
+
+        Args:
+            sk_path: Existing directory containing at least one .swc file.
+            node_distance: Maximum node spacing, as a scalar or ZYX limits passed
+                to increase_nodes_density.
+
+        Sorts source paths deterministically, repairs self-parent roots, densifies
+        edges, increases minimum radii, and attaches source-file metadata.
+        """
         self.path = Path(sk_path)
         assert self.path.exists() and self.path.is_dir(), "skeleton path does not exist"
 
@@ -56,12 +67,15 @@ class SkeletonManager():
         self._build_file_id_index_dict()
 
     def __len__(self):
+        """Return the number of managed neurons."""
         return len(self.skeletons)
 
     def __getitem__(self, idx):
+        """Return the neuron or selection obtained by indexing the NeuronList with idx."""
         return self.skeletons[idx]
 
     def __iter__(self):
+        """Return an iterator over the managed neurons in source-file order."""
         return iter(self.skeletons)
 
     @staticmethod
@@ -88,6 +102,11 @@ class SkeletonManager():
         return (1, str(file_id).lower(), Path(path).name.lower())
 
     def _assign_source_file_metadata(self) -> None:
+        """Attach each source path and filename-derived ID to its corresponding neuron.
+
+        Updates self.file_ids and raises RuntimeError if the neuron and source-file
+        counts no longer match.
+        """
         if len(self.skeletons) != len(self.swc_paths):
             raise RuntimeError(
                 "Skeleton/source-file count changed unexpectedly: "
@@ -105,11 +124,13 @@ class SkeletonManager():
             self.file_ids.append(file_id)
 
     def _build_id_index_dict(self):
+        """Map each NAVis neuron ID to its first position in the managed list."""
         self.id_index_dict = {}
         for index, skeleton in enumerate(self.skeletons):
             self.id_index_dict.setdefault(skeleton.id, index)
 
     def _build_file_id_index_dict(self):
+        """Map filename-derived skeleton IDs to positions, rejecting duplicate IDs."""
         self.file_id_index_dict = {}
         for index, file_id in enumerate(self.file_ids):
             if file_id in self.file_id_index_dict:
@@ -122,22 +143,38 @@ class SkeletonManager():
 
     @property
     def shape(self):
+        """Return the underlying NeuronList shape."""
         return self.skeletons.shape
 
     @property
     def min(self):
+        """Return minimum node coordinates across neurons as a ZYX array.
+
+        Ignores NaN coordinates during the final reduction; an empty collection
+        raises ValueError.
+        """
         skeleton_min = [skeleton.nodes[["z", "y", "x"]].min().to_numpy() for skeleton in self.skeletons]
         if not skeleton_min: raise ValueError("NeuronList contains no valid nodes.")
         return np.nanmin(np.vstack(skeleton_min), axis=0)
 
     @property
     def max(self):
+        """Return maximum node coordinates across neurons as a ZYX array.
+
+        Ignores NaN coordinates during the final reduction; an empty collection
+        raises ValueError.
+        """
         skeleton_max = [skeleton.nodes[["z", "y", "x"]].max().to_numpy() for skeleton in self.skeletons]
         if not skeleton_max: raise ValueError("NeuronList contains no valid nodes.")
         return np.nanmax(np.vstack(skeleton_max), axis=0)
 
     @staticmethod
     def fix_skeletons_root(skeletons: navis.NeuronList | list[navis.TreeNeuron]):
+        """Return copied neurons with self-parenting nodes marked as roots.
+
+        skeletons is a NeuronList or list of TreeNeuron objects. Replaces parent IDs
+        that equal the node's own ID with -1 while retaining neuron metadata.
+        """
         fixed_skeletons = []
         for i, skeleton in enumerate(skeletons):
             nodes = skeleton.nodes.copy()
@@ -289,6 +326,10 @@ class SkeletonManager():
                     mask: np.ndarray,
                     target_radius: float,
             ) -> None:
+                """Raise radii selected by mask to at least target_radius in the enclosing array.
+
+                Missing/nonfinite radii are replaced; larger finite radii are retained.
+                """
                 if not np.any(mask):
                     return
 
@@ -750,6 +791,11 @@ class SkeletonManager():
         ordered_files = [self.swc_paths[index] for index in ordered_indices]
 
         def _normalize_requested_id(value):
+            """Normalize a requested ID, filename, or Path for skeleton lookup.
+
+            Returns ('numeric', integer) for integer-like stems, otherwise
+            ('text', lowercase_text); an optional .swc suffix is removed.
+            """
             if isinstance(value, Path):
                 text = value.name
             else:
@@ -785,6 +831,11 @@ class SkeletonManager():
                 )
 
         def _draw_position(position: int, viewer=None):
+            """Draw the selected list position and return its Octarine viewer.
+
+            Clears and reuses viewer when supplied, otherwise creates a new viewer.
+            Applies compartment colors/background and prints the source-file identity.
+            """
             skeleton_index = ordered_indices[position]
             file_id = ordered_ids[position]
             swc_path = ordered_files[position]
@@ -835,6 +886,7 @@ class SkeletonManager():
         viewer = _draw_position(current_position)
 
         def _show_next_skeleton():
+            """Advance the displayed skeleton, wrapping only when the enclosing loop flag is set."""
             nonlocal current_position
             next_position = current_position + 1
 
@@ -877,6 +929,10 @@ class SkeletonManager():
         return viewer
 
     def get_skeletons_index(self, new_skeletons: navis.NeuronList) -> list[int]:
+        """Return original list positions for neurons in new_skeletons by NAVis ID.
+
+        Preserves input order. IDs absent from the manager produce None entries.
+        """
         result_index = []
         for new_skeleton in new_skeletons:
             index = self.id_index_dict.get(new_skeleton.id)
@@ -2277,9 +2333,9 @@ class SkeletonManager():
 
 
 if __name__ == '__main__':
-    path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\Skeleton2"
+    path = r"G:\Albert\data\CAS_hippocampus_dataset\representative"
     sk = SkeletonManager(path)
-    sk.plot_skeletons_by_id(start_id=1, soma_color="green", dendrite_color="red", axon_color="blue", linewidth=4.0)
+    sk.plot_skeletons_by_id(start_id=1, soma_color="green", dendrite_color="red", axon_color="blue", other_color="blue", linewidth=3)
     # sk.plot_one_skeleton(
     #     idx=0,
     #     soma_color="green",

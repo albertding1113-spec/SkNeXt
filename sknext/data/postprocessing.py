@@ -574,6 +574,11 @@ def remove_small_semantics(
         semantic_mask: np.ndarray,
         structure: np.ndarray,
     ) -> np.ndarray:
+        """Remove connected components smaller than the enclosing thresh.
+
+        semantic_mask is a binary class mask and structure defines connectivity.
+        Returns the retained foreground mask without treating background as a component.
+        """
         component_labels, component_num = ndi.label(
             semantic_mask,
             structure=structure,

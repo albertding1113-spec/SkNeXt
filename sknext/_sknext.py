@@ -10,12 +10,24 @@ from sknext.run.networkflow import Segmentation_Workflow
 
 
 class SkNeXt:
+    """Configure and execute a CUDA-backed SkNeXt segmentation workflow.
+
+    Combines YAML overrides with defaults, creates result directories, seeds
+    random generators, and supplies the selected device to the workflow.
+    """
     def __init__(
             self,
             config: str,
             run_id: int,
             gpu: str,
     ):
+        """Load configuration and prepare a run's output directory and CUDA device.
+
+        Args:
+            config: Path to a YAML configuration file.
+            run_id: Numeric identifier used in output and checkpoint paths.
+            gpu: CUDA-visible device selector, such as an index or GPU UUID.
+        """
         # read yaml file, write over default Config
         default_cfg = SkNeXt_Config(job_id=run_id).get_cfg_defaults()
         input_cfg = load_config(config)
@@ -31,6 +43,11 @@ class SkNeXt:
 
 
     def setup_device(self):
+        """Configure the requested GPU and select the first visible CUDA device.
+
+        Stores self.device and prints the selected GPU name. CPU mode raises
+        EnvironmentError; unsupported device types or unavailable CUDA fail assertions.
+        """
         self.device_type = self.cfg.SYSTEM.DEVICE.lower()
         assert self.device_type in ["cpu", "gpu", "cuda"], "unknown device type."
         if self.device_type == "cpu":
@@ -44,6 +61,7 @@ class SkNeXt:
 
 
     def run(self):
+        """Construct the segmentation workflow and execute its configured training or inference."""
         # determine task type 1. SEMANTIC 2. INSTANCE
         self.task = Segmentation_Workflow(self.cfg, self.device, self.run_id)
         self.task.run()
