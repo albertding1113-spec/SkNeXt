@@ -1,0 +1,83 @@
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260618_SkNeXt_dataset/result'
+
+TASK:
+    CHANNELS: ["F", "P", "S.soma", "S.spine", "S.bouton"]
+    CHANNELS_EXTRA_OPTS: [{"P":{"type": "skeleton", "dilation": 2, "skeleton_mode": "main"}}]
+    CHANNEL_WEIGHTS: [1, 2, 2, 2, 2]
+    WATERSHED:
+        SEED_CHANNELS: ["P"]
+        SEED_CHANNELS_THRESH: [0.3]
+        TOPOGRAPHIC_SURFACE_CHANNEL: "F"
+        GROWTH_MASK_CHANNELS: ["F"]
+        GROWTH_MASK_CHANNELS_THRESH: [0.5]
+
+DATA:
+    PATCH_SIZE: [32, 256, 256, 1]
+    NORMALIZATION:
+        PERC_CLIP:
+            ENABLE: True
+            LOWER_PERC: 1.0
+            UPPER_PERC: 99.5
+        TYPE: "zero_mean_unit_variance"
+    TRAIN:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260618_SkNeXt_dataset/train/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260618_SkNeXt_dataset/train/label'
+        FILTER:
+            ENABLE: TRUE
+            PROPS: ['label_mean']
+            VALUES: [1e-6]
+            SIGNS: ['gt']
+
+    VAL:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260618_SkNeXt_dataset/val/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260618_SkNeXt_dataset/val/label'
+    INFER:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/250708_fTEEX_mBJ_mito-mYH/260501_250708_fTEEX_region1/260501_250708_fTEEX_region1_imaris/260501_250708_fTEEX_region1.ims'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/250708_fTEEX_mBJ_mito-mYH/260501_250708_fTEEX_region1/260501_250708_fTEEX_region1_imaris/260501_250708_fTEEX_region1_test2.ome.zarr'
+        CHANNEL: [0]
+        SKELETON_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/250708_fTEEX_mBJ_mito-mYH/260501_250708_fTEEX_region1/260501_250708_fTEEX_region1_imaris/skeleton1'
+
+AUGMENTOR:
+    ENABLE: True
+    CUT_OUT: True
+    RANDOM_ROT: True
+    ZOOM: True
+    ZOOM_RANGE: [0.7, 1.3]
+    VFLIP: True
+    HFLIP: True
+    ZFLIP: True
+    BRIGHTNESS: True
+    BRIGHTNESS_FACTOR: [-0.1, 0.1]
+    CONTRAST: True
+    CONTRAST_FACTOR: [-0.1, 0.1]
+    AFFINE_MODE: "reflect"
+
+MODEL:
+    LOAD_CHECKPOINT: False
+    FEATURE_MAPS: [32, 64, 128, 256, 320]
+
+TRAIN:
+    ENABLE: True
+    OPTIMIZER: "ADAMW"
+    LR: 1.E-4
+    BATCH_SIZE: 16
+    EPOCHS: 600
+    PATIENCE: 200
+    LR_SCHEDULER:
+        NAME: "warmupcosine"
+        MIN_LR: 1.E-6
+        WARMUP_COSINE_DECAY_EPOCHS: 5
+
+INFER:
+    ENABLE: False
+    POST_PROCESSING:
+        ENABLE: True
+        OPERATIONS: ["fill_holes"]
+        VALUES: [None]
+
+
