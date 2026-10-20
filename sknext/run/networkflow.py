@@ -10,12 +10,14 @@ import zarr
 from numcodecs import Blosc
 import matplotlib
 import json
+import hashlib
+import random
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import Any, Callable, Iterable, Sequence
 from sknext.run.base_workflow import Base_Workflow
-from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder, patch_coordinates_iter, get_coord_after_padding, central_block_coordinates_iter
+from sknext.data.imageIO import get_tif_path_in_folder, get_tif_path_dict_in_folder, pair_raw_and_label_tiffs, patch_coordinates_iter, get_coord_after_padding, central_block_coordinates_iter
 from sknext.data.datasetIO import tif_list_to_zarr, detect_path_type, IMSReader, ZarrIOManager
 from sknext.data.data_loader import ZarrPatchLoader
 from sknext.data.label import watershed_with_sk
@@ -26,11 +28,12 @@ from sknext.model.scheduler import build_onecycle_scheduler, build_warmup_cosine
 from sknext.utils.utils import get_cfg_value, time_str
 from sknext.model.loss import instance_segmentation_loss, instance_segmentation_metrics
 from sknext.utils.model_info import print_model_parameters, profile_forward_memory
-from sknext.skeleton.skeleton import SkeletonManager
+from sknext.utils.checkpoint import (read_checkpoint, load_model_weights,
+                                     restore_training_checkpoint, training_checkpoint_paths)
 
 
 class Segmentation_Workflow(Base_Workflow):
-    """Train a U-NeXt model or run blockwise, skeleton-seeded volume segmentation.
+    """Train a U-NeXt model and infer with or without SWC-based segmentation.
 
     Extends shared configuration handling with patch preparation, checkpoint
     I/O, loss/metric tracking, overlap blending, and OME-Zarr output.
@@ -104,18 +107,20 @@ class Segmentation_Workflow(Base_Workflow):
         """
         self.train_tif_list = get_tif_path_in_folder(self.train_path)
         self.train_gt_tif_dict = get_tif_path_dict_in_folder(self.train_gt_path, self.channels)
+        self.train_tif_list, self.train_gt_tif_dict = pair_raw_and_label_tiffs(self.train_tif_list, self.train_gt_tif_dict)
         self.val_tif_list = get_tif_path_in_folder(self.val_path)
         self.val_gt_tif_dict = get_tif_path_dict_in_folder(self.val_gt_path, self.channels)
+        self.val_tif_list, self.val_gt_tif_dict = pair_raw_and_label_tiffs(self.val_tif_list, self.val_gt_tif_dict)
         self.train_zarr_path = Path(self.train_path).parent / "train.ome.zarr"
         self.val_zarr_path = Path(self.val_path).parent / "val.ome.zarr"
         tif_list_to_zarr(self.train_tif_list, self.train_gt_tif_dict, self.train_zarr_path, self.patch_size,
                          self.train_overlap, self.train_padding, self.preprocess_dict, self.channels,
-                         self.channels_extra_opts, filter_dict=self.filter_dict)
+                         self.channels_extra_opts, filter_dict=self.filter_dict, normalize_per_patch=True)
         # Validation data is intentionally not filtered, otherwise the validation
         # distribution and reported metrics would be biased toward retained patches.
         tif_list_to_zarr(self.val_tif_list, self.val_gt_tif_dict, self.val_zarr_path, self.patch_size,
                          self.val_overlap, self.val_padding, self.preprocess_dict, self.channels,
-                         self.channels_extra_opts, filter_dict=None)
+                         self.channels_extra_opts, filter_dict=None, normalize_per_patch=True)
 
     def define_activations_and_channels(self):
         """Expand task channels into model output names and initialize linear heads.
@@ -138,6 +143,12 @@ class Segmentation_Workflow(Base_Workflow):
                 self.out_channel_num += 1
                 self.output_channel_names += [channel]
         self.head_activations = list(["linear"] * self.out_channel_num)
+        self.instance_indices = [i for i, name in enumerate(self.output_channel_names)
+                                 if not name.startswith("S.")]
+        self.semantic_indices = [i for i, name in enumerate(self.output_channel_names)
+                                 if name.startswith("S.")]
+        if not self.output_channel_names or len(set(self.output_channel_names)) != len(self.output_channel_names):
+            raise ValueError("Model output channel names must be nonempty and unique")
 
     def set_loss_metrics(self):
         """Create the weighted BCE/Dice loss and channel-wise IoU evaluator.
@@ -211,49 +222,142 @@ class Segmentation_Workflow(Base_Workflow):
             self.model.eval()
 
     def create_skeleton(self):
-        """Load configured SWC files into the skeleton manager used during inference."""
+        """Load SWCs only when skeleton-guided inference is explicitly enabled."""
+        from sknext.skeleton.skeleton import SkeletonManager
         self.skeleton_manager = SkeletonManager(self.skeleton_path)
 
-    def load_checkpoint(self):
-        """Restore the configured checkpoint into an already constructed model.
+    @property
+    def checkpoint_input_file(self):
+        """The existing file to read; never redirects saved checkpoints."""
+        override = get_cfg_value(self.cfg, "MODEL.CHECKPOINT_INPUT_PATH", "")
+        return Path(override).expanduser() if override else Path(self.checkpoint_file)
 
-        Validates the saved architecture, removes a uniform 'module.' key prefix
-        when present, and loads weights strictly. Optimizer/scheduler state is
-        not restored.
+    def load_checkpoint(self):
+        """Load old or new model checkpoints for inference or fresh fine-tuning.
+
+        Optional checkpoint metadata never blocks weight loading. Tensor mismatches
+        require MODEL.CHECKPOINT_ALLOW_PARTIAL=True and are reported explicitly.
         """
-        assert hasattr(self, "model") and self.model is not None, (
-            "self.model is None. Please call set_model() before loading checkpoint.")
-        checkpoint_file = Path(self.checkpoint_file)
-        assert checkpoint_file.exists(), "Checkpoint file does not exist."
-        assert checkpoint_file.is_file(), "Checkpoint path is not a file."
-        checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
-        model_name = checkpoint["model_name"]
-        assert self.model_name == model_name, "Checkpoint file does not match."
-        state_dict = checkpoint["model_state_dict"]
-        # compatible with multi-GPU
-        model_to_load = self.model.module if hasattr(self.model, "module") else self.model
-        if len(state_dict) > 0 and all(key.startswith("module.") for key in state_dict.keys()):
-            state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
-        incompatible_keys = model_to_load.load_state_dict(state_dict, strict=True)
+        if not hasattr(self, "model"):
+            raise RuntimeError("Call set_model() before load_checkpoint()")
+        path = self.checkpoint_input_file
+        state = read_checkpoint(path)
+        report = load_model_weights(
+            self.model, state,
+            expected_architecture=self.model_name,
+            expected_channels=list(self.output_channel_names),
+            allow_partial=bool(get_cfg_value(self.cfg, "MODEL.CHECKPOINT_ALLOW_PARTIAL", False)))
         self.model.to(self.device)
-        print(f"{time_str()} Model checkpoint loaded from: {self.checkpoint_file}", flush=True)
+        print(f"{time_str()} Loaded {report['loaded']} tensors from {path} "
+              f"(partial={report['partial']})", flush=True)
+        return report
+
+    @staticmethod
+    def _atomic_torch_save(data, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            torch.save(data, tmp)
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists(): tmp.unlink()
+
+    def _training_identity(self):
+        """Hash the model, data, optimization and schedule contract for exact resume."""
+        # Loading policy is not part of model architecture. Removing this newly
+        # introduced key retains exact-resume identities of older v2 checkpoints.
+        identity_model_cfg = self.cfg.MODEL.clone()
+        for key in ("CHECKPOINT_ALLOW_PARTIAL", "CHECKPOINT_INPUT_PATH"):
+            if key in identity_model_cfg:
+                del identity_model_cfg[key]
+        fields = {"model": identity_model_cfg, "task": self.cfg.TASK,
+                  "normalization": self.cfg.DATA.NORMALIZATION,
+                  "patch_size": list(self.patch_size),
+                  "train": {"optimizer": self.optimizer_name, "lr": self.lr,
+                            "weight_decay": self.w_decay, "betas": list(self.opt_betas),
+                            "epochs": self.epochs, "batch_size": self.batch_size,
+                            "scheduler": self.cfg.TRAIN.LR_SCHEDULER},
+                  "training_inputs": [str(Path(self.train_path).resolve()),
+                                      str(Path(self.train_gt_path).resolve()),
+                                      str(Path(self.val_path).resolve()),
+                                      str(Path(self.val_gt_path).resolve())],
+                  "train_overlap": list(map(int, self.train_overlap)),
+                  "val_overlap": list(map(int, self.val_overlap)),
+                  "train_padding": list(self.train_padding), "val_padding": list(self.val_padding),
+                  "filter": self.filter_dict, "augmentor": self.cfg.AUGMENTOR,
+                  "training_patches": self.train_patches,
+                  "validation_patches": self.val_patches,
+                  "input_file_signatures": [
+                      (str(Path(path).resolve()), Path(path).stat().st_size,
+                       Path(path).stat().st_mtime_ns)
+                      for group in (self.train_tif_list, self.val_tif_list,
+                                    *self.train_gt_tif_dict.values(),
+                                    *self.val_gt_tif_dict.values())
+                      for path in group
+                  ]}
+        # YACS nodes stringify deterministically without relying on pickle.
+        blob = json.dumps(fields, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    @property
+    def latest_checkpoint_file(self):
+        path = Path(self.checkpoint_file)
+        return path.with_name(path.stem + "_latest.pth")
 
     def save_checkpoint(self):
-        """Save model weights on CPU and the architecture name to checkpoint_file.
+        """Atomically write best weights for inference and warm-start compatibility."""
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        weights = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+        self._atomic_torch_save({"model_state_dict": weights,
+                                 "model_name": self.model_name,
+                                 "output_channel_names": self.output_channel_names}, self.checkpoint_file)
+        print(f"{time_str()} Best model saved to {self.checkpoint_file}", flush=True)
 
-        Creates the checkpoint directory and overwrites the existing checkpoint.
-        Parallel wrappers are unwrapped; optimizer and scheduler state are omitted.
+    def save_training_state(self, epoch, best_val_metrics, epochs_without_improvement):
+        """Persist an exact epoch-boundary continuation state, separately from best weights."""
+        numpy_rng = np.random.get_state()
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        state = {
+            "format_version": 2, "epoch": int(epoch), "identity": self._training_identity(),
+            "model_name": self.model_name, "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "best_val_loss": float(self.best_val_loss),
+            "best_val_metrics": dict(best_val_metrics),
+            "epochs_without_improvement": int(epochs_without_improvement),
+            "chart_history": self._chart_history,
+            "rng_torch": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            "rng_python": random.getstate(),
+            "rng_numpy": (numpy_rng[0], numpy_rng[1].tolist(),
+                          numpy_rng[2], numpy_rng[3], numpy_rng[4]),
+        }
+        self._atomic_torch_save(state, self.latest_checkpoint_file)
+
+    def load_training_state(self):
+        """Resume an exact epoch state or fall back to legacy weight-only warm start.
+
+        Full restoration requires compatible optimizer, scheduler, epoch and a
+        matching training identity. If these are missing, restart training at
+        epoch zero with fresh optimizer/scheduler instead of pretending to resume.
         """
-        assert hasattr(self, "model") and self.model is not None, (
-            "self.model is None. Please call set_model() before saving checkpoint.")
-        checkpoint_dir = Path(self.checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
-        checkpoint = {"model_state_dict": {key: value.detach().cpu()
-                                           for key, value in model_to_save.state_dict().items()},
-                      "model_name": self.model_name,}
-        torch.save(checkpoint, self.checkpoint_file)
-        print(f"{time_str()} Model checkpoint saved to: {self.checkpoint_file}", flush=True)
+        latest, best = training_checkpoint_paths(self.checkpoint_input_file)
+        result = restore_training_checkpoint(
+            self.model, self.optimizer, self.scheduler,
+            latest_path=latest,
+            best_path=best,
+            identity=self._training_identity(), epochs=self.epochs,
+            expected_architecture=self.model_name,
+            expected_channels=list(self.output_channel_names),
+            allow_partial=bool(get_cfg_value(self.cfg, "MODEL.CHECKPOINT_ALLOW_PARTIAL", False)))
+        self.best_val_loss = result["best_val_loss"]
+        self._chart_history = result["chart_history"]
+        print(f"{time_str()} Training checkpoint: {result['mode']}; "
+              f"source={result['source']}; starting epoch={result['epoch'] + 1}",
+              flush=True)
+        return (result["epoch"], result["best_val_metrics"],
+                result["epochs_without_improvement"])
 
     def create_reader(self):
         """Open the configured inference source as an OME-Zarr or Imaris reader.
@@ -271,63 +375,135 @@ class Segmentation_Workflow(Base_Workflow):
             self.infer_reader = IMSReader(self.infer_path)
         else: raise FileNotFoundError(f"file type {file_type} is not supported.")
 
-    def create_writer(self):
-        """Open or create the CZYX uint16 OME-Zarr inference destination.
+    def _resolve_infer_output_paths(self):
+        """Resolve separate segmentation and probability OME-Zarr destinations."""
+        segmentation = Path(self.infer_gt_path)
+        if segmentation.suffix.lower() != ".zarr":
+            segmentation = segmentation / f"result{self.job_id}.ome.zarr"
 
-        A directory destination is expanded to result<job_id>.ome.zarr. Requires
-        reader shape, output channel definitions, and chunk sizes to be initialized.
-        """
-        self.infer_gt_path = Path(self.infer_gt_path)
-        if self.infer_gt_path.exists():
-            file_type = detect_path_type(self.infer_gt_path)
-            if file_type == "zarr": pass
-            elif file_type == "dir":
-                self.infer_gt_path = self.infer_gt_path / f"result{self.job_id}.ome.zarr"
+        requested_raw = str(self.cfg.DATA.INFER.RAW_OUTPUT_PATH).strip()
+        if requested_raw:
+            raw = Path(requested_raw)
+            if raw.suffix.lower() != ".zarr":
+                raw = raw / f"result{self.job_id}_raw.ome.zarr"
+        elif segmentation.name.lower().endswith(".ome.zarr"):
+            raw = segmentation.with_name(segmentation.name[:-len(".ome.zarr")] + "_raw.ome.zarr")
         else:
-            self.infer_gt_path.mkdir(parents=True, exist_ok=True)
-            if self.infer_gt_path.suffix == ".zarr": pass
-            elif self.infer_gt_path.is_dir():
-                self.infer_gt_path = self.infer_gt_path / f"result{self.job_id}.ome.zarr"
-        self.infer_writer = ZarrIOManager(self.infer_gt_path,
-                                          shape=(self.postpro_channel_num, *self.infer_reader.shape[1:4]),
-                                          dtype="uint16",
-                                          chunks=self.chunk,
-                                          mode="a",
-                                          channel_names=self.postpro_channel_info)
+            raw = segmentation.with_name(segmentation.stem + "_raw.zarr")
 
+        if segmentation.resolve() == raw.resolve():
+            raise ValueError("uint16 and float32 output paths must be different OME-Zarr stores.")
+        if self.save_segmentation and segmentation.resolve() == self.infer_path.resolve():
+            raise ValueError("The uint16 output path must not overwrite the inference input.")
+        if self.save_raw_predictions and raw.resolve() == self.infer_path.resolve():
+            raise ValueError("The float32 output path must not overwrite the inference input.")
+        self.infer_gt_path = segmentation
+        self.infer_raw_path = raw
+
+    def _configure_infer_output(self):
+        """Determine output destinations without creating or modifying stores."""
+        self.output_mode = str(self.cfg.INFER.OUTPUT_MODE).lower().strip()
+        if self.output_mode not in {"uint16", "float32", "both"}:
+            raise ValueError("INFER.OUTPUT_MODE must be 'uint16', 'float32', or 'both'.")
+        self.save_segmentation = self.output_mode in {"uint16", "both"}
+        self.save_raw_predictions = self.output_mode in {"float32", "both"}
+        self.segmentation_dtype = (
+            "uint32" if (self.save_segmentation and self.instance_num and not self.skeleton_flag)
+            else "uint16"
+        )
+        self._resolve_infer_output_paths()
+
+    def create_writer(self):
+        """Create selected label and/or float32 OME-Zarr output stores.
+
+        Float32 channels correspond one-to-one to ``output_channel_names``
+        (F/P/C/affinities/S.*) and contain overlap-blended sigmoid probabilities.
+        """
+        self.infer_writer = None
+        self.infer_raw_writer = None
+        self._configure_infer_output()
+
+        spatial_shape = tuple(int(x) for x in self.infer_reader.shape[1:4])
+        if self.save_segmentation:
+            self.infer_writer = ZarrIOManager(
+                self.infer_gt_path,
+                shape=(self.postpro_channel_num, *spatial_shape),
+                dtype=self.segmentation_dtype,
+                chunks=self.chunk,
+                mode="a",
+                channel_names=self.postpro_channel_info,
+            )
+            self.infer_writer.root.attrs["sknext_instance_id_mode"] = (
+                "skeleton_index_plus_one" if self.skeleton_flag else "global_automatic_watershed_uint32"
+            )
+        if self.save_raw_predictions:
+            self.infer_raw_writer = ZarrIOManager(
+                self.infer_raw_path,
+                shape=(self.out_channel_num, *spatial_shape),
+                dtype="float32",
+                chunks=self.chunk,
+                mode="a",
+                channel_names=self.output_channel_names,
+                channel_windows=[(0.0, 1.0)] * self.out_channel_num,
+                image_name="SkNeXt sigmoid probability maps",
+            )
+            # Distinguish probabilities from pre-sigmoid logits in stored metadata.
+            self.infer_raw_writer.root.attrs["sknext_prediction"] = {
+                "kind": "sigmoid_probability",
+                "dtype": "float32",
+                "channel_names": list(self.output_channel_names),
+                "overlap_blending": "weighted_mean",
+                "value_range": [0.0, 1.0],
+            }
 
     def define_postprocess_channels(self):
-        """Count prediction channels and define instance/semantic output metadata.
+        """Derive output layout from explicit model-channel indices (never slices)."""
+        if not hasattr(self, "output_channel_names"):
+            self.define_activations_and_channels()
+        self.instance_num = len(self.instance_indices)
+        self.semantic_num = len(self.semantic_indices)
+        self.postpro_channel_info = (["Infer_instance"] if self.instance_num else []) + [
+            self.output_channel_names[i][2:] for i in self.semantic_indices
+        ]
+        self.postpro_channel_num = len(self.postpro_channel_info)
 
-        All instance-related prediction channels map to one instance-label output;
-        each semantic target receives a separate output channel.
-        """
-        self.postpro_channel_num = 0
-        self.postpro_channel_info = []
-        self.instance_num = 0
-        self.semantic_num = 0
-        for channel in self.channels:
-            if channel in ["F", "C", "P"]:
-                self.instance_num += 1
-            if channel in ["A"]:
-                a_opts = self.channels_extra_opts.get("A",{"z_affinities": [1], "y_affinities": [1], "x_affinities": [1]})
-                z_aff = a_opts.get("z_affinities", [1])
-                y_aff = a_opts.get("y_affinities", [1])
-                x_aff = a_opts.get("x_affinities", [1])
-                assert len(z_aff) == len(y_aff) == len(x_aff), "z/y/x affinities should have the same length."
-                self.instance_num += 3 * len(z_aff)
-            if "S." in channel:
-                self.semantic_num += 1
-                self.postpro_channel_num += 1
-                self.postpro_channel_info.append(channel.replace("S.", ""))
-        if self.instance_num:
-            self.postpro_channel_num += 1
-            self.postpro_channel_info = tuple(["Infer_instance",] + self.postpro_channel_info)
+    def validate_watershed_config(self):
+        """Fail before opening output stores if watershed would be unconstrained."""
+        if not self.save_segmentation or not self.instance_num:
+            return
+        available = [self.output_channel_names[i] for i in self.instance_indices]
+        if not isinstance(self.watershed_topographic_channel, str) or self.watershed_topographic_channel not in available:
+            raise ValueError(f"Watershed TOPOGRAPHIC_SURFACE_CHANNEL={self.watershed_topographic_channel!r} "
+                             f"is not among instance channels {available}")
+        for name, choices, thresholds in (
+            ("SEED_CHANNELS", self.watershed_seed_channels, self.watershed_seed_channels_thresh),
+            ("GROWTH_MASK_CHANNELS", self.watershed_growth_mask_channels, self.watershed_growth_mask_channels_thresh),
+        ):
+            if not isinstance(choices, (list, tuple)):
+                raise TypeError(f"Watershed {name} must be a list")
+            if len(set(choices)) != len(choices) or any(ch not in available for ch in choices):
+                raise ValueError(f"Watershed {name}={choices!r} contains duplicated or unavailable channels; "
+                                 f"available={available}")
+            if thresholds and len(thresholds) != len(choices):
+                raise ValueError(f"Watershed {name}_THRESH requires one threshold per channel")
+            for threshold in thresholds:
+                if threshold != "auto":
+                    try: value = float(threshold)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError(f"Invalid watershed threshold {threshold!r}") from error
+                    if not np.isfinite(value) or not 0 <= value <= 1:
+                        raise ValueError(f"Watershed threshold outside [0,1]: {threshold!r}")
+        if not self.watershed_growth_mask_channels:
+            raise ValueError("Watershed GROWTH_MASK_CHANNELS must be nonempty to prevent background growth")
+        if not self.skeleton_flag and not self.watershed_seed_channels:
+            raise ValueError("SWC-free watershed requires SEED_CHANNELS")
 
     def close_reader_writer(self):
-        """Close both inference storage handles after they have been initialized."""
-        self.infer_reader.close()
-        self.infer_writer.close()
+        """Close initialized OME-Zarr writer(s) and the inference reader."""
+        for name in ("infer_writer", "infer_raw_writer", "infer_reader"):
+            handle = getattr(self, name, None)
+            if handle is not None:
+                handle.close()
 
     def train(self):
         """Prepare patch stores, optimize the model, and validate after each epoch.
@@ -354,18 +530,22 @@ class Segmentation_Workflow(Base_Workflow):
         self.set_optimizer_scheduler()
         print(f"{time_str()} preparing loss function and metrics", flush=True)
         self.set_loss_metrics()
-        if self.load_checkpoint_flag:
-            self.load_checkpoint()
-
-        best_val_loss = self.best_val_loss  # float('inf')
-        best_val_metrics = {}
-        epochs_without_improvement = 0
+        resume = bool(self.cfg.TRAIN.RESUME)
+        if resume and self.load_checkpoint_flag:
+            raise ValueError("TRAIN.RESUME and MODEL.LOAD_CHECKPOINT are mutually exclusive")
+        if resume:
+            start_epoch, best_val_metrics, epochs_without_improvement = self.load_training_state()
+        else:
+            start_epoch, best_val_metrics, epochs_without_improvement = 0, {}, 0
+            if self.load_checkpoint_flag:
+                self.load_checkpoint()
+        best_val_loss = self.best_val_loss
 
         shuffle_train = bool(get_cfg_value(self.cfg,"AUGMENTOR.SHUFFLE_TRAIN_DATA_EACH_EPOCH",True,))
         shuffle_val = bool(get_cfg_value(self.cfg,"AUGMENTOR.SHUFFLE_VAL_DATA_EACH_EPOCH",False,))
         print(f"{time_str()} patch order: train_shuffle={shuffle_train}, val_shuffle={shuffle_val}", flush=True)
 
-        for epoch in range(self.epochs):
+        for epoch in range(start_epoch, self.epochs):
             epoch_number = epoch + 1
             print(f"{time_str()} [EPOCH{epoch_number:04d}]", flush=True)
             # Generate a fresh permutation at the beginning of every epoch.
@@ -463,21 +643,21 @@ class Segmentation_Workflow(Base_Workflow):
             else:
                 epochs_without_improvement += 1
                 print(f"{time_str()} no improvement, Patience: {epochs_without_improvement:04d}/{self.patience:04d}", flush=True)
-                if epochs_without_improvement >= self.patience:
-                    metric_str = " ".join(f"{key} channel: {value:.6f}," for key, value in best_val_metrics.items())
-                    print(f"{time_str()} Out of patience, stopping training. Best validation loss: {best_val_loss:.6f}", flush=True)
-                    # Preserve the latest partial interval before stopping.
-                    return
+            # Save last epoch even when validation did not improve (required for exact resume).
+            self.save_training_state(epoch_number, best_val_metrics, epochs_without_improvement)
+            if self.patience > 0 and epochs_without_improvement >= self.patience:
+                print(f"{time_str()} Early stopping after epoch {epoch_number}. "
+                      f"Best validation loss: {best_val_loss:.6f}", flush=True)
+                return
 
     @torch.no_grad()
     def infer(self):
-        """Segment configured volume blocks using saved model weights and SWC seeds.
+        """Run full-volume or SWC-selective inference with label/float32 outputs.
 
-        Loads progress to resume completed blocks, writes central block regions,
-        and saves progress after each block. Builds output pyramid levels on
-        successful completion and closes initialized I/O handles during cleanup.
+        Completed blocks are logged only after every selected output has been
+        written, so that a resumed run regenerates an interrupted block in both
+        stores. Float32-only mode does not perform watershed or postprocessing.
         """
-        # create and load model
         print(f"{time_str()} preparing model", flush=True)
         self.set_model()
         print_model_parameters(self.model)
@@ -487,52 +667,86 @@ class Segmentation_Workflow(Base_Workflow):
         self.load_checkpoint()
         self.model.eval()
         self.define_postprocess_channels()
-        print(f"{time_str()} creating reader, writer and skeleton_manager", flush=True)
-        # create reader
+        # Preflight the watershed before any reader or writer is opened.
+        self.infer_path = Path(self.infer_path)
+        self._configure_infer_output()
+        self.validate_watershed_config()
+        print(f"{time_str()} validating inference source, outputs and resume metadata", flush=True)
         self.create_reader()
-        # create writer
-        self.create_writer()
-        # create coordinate_iter
-        coord_iter = central_block_coordinates_iter(self.infer_reader.shape[1:4], self.c_block_size)
-        self.total_block_num = int(np.prod(np.ceil(
-            np.array(self.infer_reader.shape[1:4], dtype="float32") / np.array(self.c_block_size, dtype="float32"))))
-        # create skeleton-manager
-        self.create_skeleton()
-        # load saved infer log
-        self.load_infer_log()
-
+        infer_completed = False
         try:
-            block_num = -1
-            infer_completed = False
-            # start predict
-            for c_coord in coord_iter:
-                block_num += 1
-                if block_num < self.inferred_block_num: continue
-                coord, coord_in_block = get_coord_after_padding(self.infer_reader.shape[1:4], c_coord, self.block_padding)
-                cropped_skeleton = self.skeleton_manager.crop_skeletons(coord) # navis.NeuronList
-                if len(cropped_skeleton) > 0:
-                    print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] {len(cropped_skeleton):04d} skeleton(s) in this block, start inferring", flush=True)
-                    block_result = self._infer_one_block(coord, cropped_skeleton)
-                    self.infer_writer.write_block(
-                        block_result[:, coord_in_block[0,0]:coord_in_block[0,1], coord_in_block[1,0]:coord_in_block[1,1], coord_in_block[2,0]:coord_in_block[2,1]],
-                        start=(0, c_coord[0,0], c_coord[1,0], c_coord[2, 0]))
-                    print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] results saved", flush=True)
+            coord_iter = central_block_coordinates_iter(self.infer_reader.shape[1:4], self.c_block_size)
+            self.total_block_num = int(np.prod(np.ceil(
+                np.array(self.infer_reader.shape[1:4], dtype="float64") / np.array(self.c_block_size, dtype="float64"))))
+            self.raw_all_blocks = bool(self.cfg.INFER.RAW_ALL_BLOCKS) and self.save_raw_predictions
+            self.infer_manifest = self._build_infer_manifest()
+            # In SWC-free mode, this ID is advanced only after complete blocks.
+            # A successful block commit writes the corresponding state to the log.
+            self.next_instance_id = 1
+            self.load_infer_log()
+            if self.skeleton_flag and (self.save_segmentation or not self.raw_all_blocks):
+                self.create_skeleton()
+            self.create_writer()
+            if self.save_segmentation and hasattr(self, "skeleton_manager"):
+                self.infer_writer.root.attrs["sknext_swc_id_mapping"] = self.skeleton_manager.validate_instance_mapping()
+
+            for block_num, c_coord in enumerate(coord_iter):
+                if block_num < self.inferred_block_num:
+                    continue
+                # The *only* block halo is calculated in Base_Workflow from
+                # DATA.INFER.BLOCK_FACTOR and DATA.INFER.BLOCK_CENTRAL_FACTOR.
+                # Both prediction/watershed and cross-block ID matching use
+                # these same coordinates; no separate segmentation halo exists.
+                coord, coord_in_block = get_coord_after_padding(
+                    self.infer_reader.shape[1:4], c_coord, self.block_padding)
+                if hasattr(self, "skeleton_manager"):
+                    cropped_skeleton = self.skeleton_manager.crop_skeletons(coord)
+                else:
+                    cropped_skeleton = []
+                should_predict = (not self.skeleton_flag) or bool(len(cropped_skeleton)) or self.raw_all_blocks
+                if should_predict:
+                    prediction_mode = f"{len(cropped_skeleton)} skeletons" if self.skeleton_flag else "whole-volume, no SWC"
+                    print(f"{time_str()} [BLOCK{block_num:07d}/{self.total_block_num:07d}] "
+                          f"[INFER] predicting ({prediction_mode})", flush=True)
+                    seg_result, raw_result = self._infer_one_block(coord, cropped_skeleton)
+                    if self.save_segmentation and self.instance_num and not self.skeleton_flag:
+                        # Relabel local watershed IDs to unique uint32 IDs, reusing
+                        # a previous ID only for reliable matches in processed halos.
+                        seg_result = self._stitch_instance_block(
+                            seg_result, coord, coord_in_block, block_num)
+                    central_slices = (
+                        slice(None),
+                        slice(int(coord_in_block[0, 0]), int(coord_in_block[0, 1])),
+                        slice(int(coord_in_block[1, 0]), int(coord_in_block[1, 1])),
+                        slice(int(coord_in_block[2, 0]), int(coord_in_block[2, 1])),
+                    )
+                    start = (0, int(c_coord[0, 0]), int(c_coord[1, 0]), int(c_coord[2, 0]))
+                    if self.save_segmentation:
+                        self.infer_writer.write_block(seg_result[central_slices], start=start)
+                    if self.save_raw_predictions:
+                        self.infer_raw_writer.write_block(raw_result[central_slices], start=start)
+                    print(f"{time_str()} [BLOCK{block_num:07d}/{self.total_block_num:07d}] "
+                          "[INFER] requested results saved", flush=True)
+                # A block is committed only after all its selected output writes.
                 self.inferred_block_num = block_num + 1
                 self.save_infer_log()
             infer_completed = True
         except Exception as e:
-            print(f"Error type：{type(e).__name__}")
-            print(f"Error message：{e}")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
             traceback.print_exc()
             raise
         finally:
             try:
                 if infer_completed:
-                    # build pyramid
-                    print(f"{time_str()}, All inference completed, start building pyramid", flush=True)
-                    self.infer_writer.build_pyramid(factors=[(1, 2, 2), (2, 4, 4), (4, 8, 8), (8, 16, 16), (16, 32, 32)], mode="nearest")
+                    factors = [(1, 2, 2), (2, 4, 4), (4, 8, 8), (8, 16, 16), (16, 32, 32)]
+                    if self.infer_writer is not None:
+                        print(f"{time_str()} building segmentation label pyramid", flush=True)
+                        self.infer_writer.build_pyramid(factors=factors, mode="nearest")
+                    if self.infer_raw_writer is not None:
+                        print(f"{time_str()} building float32 probability pyramid", flush=True)
+                        self.infer_raw_writer.build_pyramid(factors=factors, mode="mean")
             finally:
-                # close reader and writer
                 self.close_reader_writer()
 
     def _infer_one_block(self, coord, skeleton):
@@ -543,20 +757,19 @@ class Segmentation_Workflow(Base_Workflow):
             skeleton: Skeletons cropped to this block for watershed seeding.
 
         Returns:
-            A uint16 CZYX block of instance/semantic labels. Overlapping probability
-            patches are blended with separable weights before thresholding and
-            watershed; uncovered voxels raise RuntimeError.
+            (CZYX label segmentation or None, float32 CZYX probabilities or None).
+            Overlapping probabilities are blended before either output is made.
+            In float32-only mode, skeletonization and watershed are not called.
         """
         block_size = np.array((self.patch_size[3], *(coord[:, 1] - coord[:, 0])), dtype=np.int64)
         block_raw = np.zeros(tuple(block_size), dtype=self.infer_reader.dtype)  # CZYX
         for i in range(self.patch_size[3]):
             block_raw[i, ...] = self.infer_reader[self.infer_channel[i], coord[0, 0]:coord[0, 1], coord[1, 0]:coord[1, 1], coord[2, 0]:coord[2, 1],]
-        block_raw = preprocess_img(block_raw, self.preprocess_dict)
+        # Keep original intensity until each patch is padded and normalized.
         # Accumulate weighted probabilities instead of allowing a later patch to overwrite an earlier prediction in overlapping regions.
         block_pred_sum = np.zeros((self.out_channel_num, *block_size[1:4]), dtype=np.float32,)
         # The same spatial blending weight is used for every output channel.
         block_weight_sum = np.zeros(tuple(block_size[1:4]), dtype=np.float32)
-        block_result = np.zeros((self.postpro_channel_num, *block_size[1:4]),dtype=np.uint16,)
         all_patch_coords = list(
             patch_coordinates_iter(block_size[1:4], self.patch_size[0:3], self.infer_overlap, self.infer_padding,))
         if not all_patch_coords:
@@ -604,26 +817,155 @@ class Segmentation_Workflow(Base_Workflow):
         # Numerical roundoff during weighted accumulation can move probabilities
         # a few ULPs outside the sigmoid range.
         np.clip(block_pred, 0.0, 1.0, out=block_pred)
-        # start post_processing
-        print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] [INFER] start post-processing",flush=True)
-        skeleton_label = self.skeleton_manager.create_cropped_skeleton_mask(skeleton, coord)
-        _start_id = 0
+        # Float32 is the final overlap-blended probability output, not logits.
+        raw_result = block_pred if self.save_raw_predictions else None
+        seg_result = None
+        if self.save_segmentation:
+            seg_result = self._postprocess_block_predictions(block_pred, coord, skeleton)
+        return seg_result, raw_result
+
+    def _postprocess_block_predictions(self, block_pred, coord, skeleton):
+        """Convert float32 probabilities into an instance + semantic label block."""
+        result_dtype = np.dtype(self.segmentation_dtype)
+        block_result = np.zeros((self.postpro_channel_num, *block_pred.shape[1:4]), dtype=result_dtype)
+        print(f"{time_str()} [BLOCK{self.inferred_block_num:07d}/{self.total_block_num:07d}] "
+              "[INFER] start post-processing", flush=True)
+        start_id = 0
         if self.instance_num:
-            block_result[_start_id, ...] = watershed_with_sk(
-                        block_pred[0:self.instance_num, ...],
-                        self.output_channel_names[0:self.instance_num],
-                        self.watershed_seed_channels,
-                        self.watershed_seed_channels_thresh,
-                        self.watershed_topographic_channel,
-                        self.watershed_growth_mask_channels,
-                        self.watershed_growth_mask_channels_thresh,
-                        skeleton_label=skeleton_label)
-            block_result[_start_id, ...] = post_processing_instance(block_result[_start_id, ...], self.postprocess_dict)
-            _start_id += 1
+            # SWC-guided mode retains the original selection/ID semantics.
+            # SWC-free mode always watersheds from learned F/P/C seed maps.
+            if not self.skeleton_flag or len(skeleton) > 0:
+                skeleton_label = (
+                    self.skeleton_manager.create_cropped_skeleton_mask(skeleton, coord)
+                    if self.skeleton_flag else None
+                )
+                block_result[0, ...] = watershed_with_sk(
+                    block_pred[self.instance_indices, ...],
+                    [self.output_channel_names[i] for i in self.instance_indices],
+                    self.watershed_seed_channels,
+                    self.watershed_seed_channels_thresh,
+                    self.watershed_topographic_channel,
+                    self.watershed_growth_mask_channels,
+                    self.watershed_growth_mask_channels_thresh,
+                    skeleton_label=skeleton_label,
+                    output_dtype=result_dtype,
+                )
+                block_result[0, ...] = post_processing_instance(
+                    block_result[0, ...], self.postprocess_dict)
+            start_id = 1
         if self.semantic_num:
-            block_result[_start_id:, ...] = np.uint16(block_pred[self.instance_num:, ...] > 0.5)
-            block_result[_start_id:, ...] = post_processing_semantic(block_result[_start_id:, ...], self.postprocess_dict)
+            block_result[start_id:, ...] = (block_pred[self.semantic_indices, ...] > 0.5).astype(result_dtype)
+            block_result[start_id:, ...] = post_processing_semantic(
+                block_result[start_id:, ...], self.postprocess_dict)
         return block_result
+
+    def _stitch_instance_block(self, result, coord, central_coord, block_num):
+        """Give the central region globally unique IDs and stitch across halos.
+
+        No SWC IDs are used. The current block's halo comes directly from the
+        inference block bounds computed with ``self.block_padding``; it is NOT
+        a second, independently configured instance-segmentation halo.
+        Only overlaps between this halo and **already committed** neighboring
+        central blocks can reuse an existing ID; other local watershed instances
+        receive fresh monotonic uint32 IDs. The matching decision is one-to-one
+        per block to reduce false merges. Since it is local and greedy, this is
+        not a guarantee of correct long-range neuron identities.
+        """
+        result = np.asarray(result)
+        local_labels = result[0]
+        center_slices = tuple(slice(int(a), int(b)) for a, b in central_coord)
+        central_ids = np.unique(local_labels[center_slices])
+        central_ids = central_ids[central_ids > 0]
+        if central_ids.size == 0:
+            return result
+
+        max_uint32 = np.iinfo(np.uint32).max
+        if self.next_instance_id > max_uint32:
+            raise OverflowError("Global instance counter exceeded uint32 capacity")
+        central_ids_set = set(map(int, central_ids))
+        old_to_new: dict[int, int] = {}
+
+        # Full-volume blocks are visited in Z, then Y, then X order. A voxel's
+        # central-block index therefore determines whether it has been committed.
+        # This includes zero-valued background, which must count against the
+        # matching fraction. Crucially it excludes any stale data from an
+        # interrupted write of the current central block.
+        central_size = np.asarray(self.c_block_size, dtype=np.int64)
+        block_grid = (
+            np.asarray(self.infer_reader.shape[1:4], dtype=np.int64)
+            + central_size - 1
+        ) // central_size
+        block_zyx = np.unravel_index(int(block_num), tuple(block_grid))
+        axis_index = [
+            np.arange(int(coord[axis, 0]), int(coord[axis, 1]), dtype=np.int64)
+            // int(self.c_block_size[axis]) for axis in range(3)
+        ]
+        already_processed = (
+            (axis_index[0][:, None, None] < block_zyx[0])
+            | ((axis_index[0][:, None, None] == block_zyx[0])
+               & (axis_index[1][None, :, None] < block_zyx[1]))
+            | ((axis_index[0][:, None, None] == block_zyx[0])
+               & (axis_index[1][None, :, None] == block_zyx[1])
+               & (axis_index[2][None, None, :] < block_zyx[2]))
+        )
+
+        # `already_processed` is the part of the inference halo that lies in
+        # previously committed central blocks. At the first block it is empty.
+        if np.any(already_processed):
+            reference = np.asarray(self.infer_writer[
+                0,
+                int(coord[0, 0]):int(coord[0, 1]),
+                int(coord[1, 0]):int(coord[1, 1]),
+                int(coord[2, 0]):int(coord[2, 1]),
+            ])
+            # The denominator covers both previously labeled and previously
+            # background voxels, minimizing spurious matches to tiny overlaps.
+            old_area_local = local_labels[already_processed]
+            old_area_local = old_area_local[old_area_local > 0]
+            eligible_ids, eligible_counts = np.unique(old_area_local, return_counts=True)
+            local_sizes = dict(zip(map(int, eligible_ids), map(int, eligible_counts)))
+            valid = already_processed & (local_labels > 0) & (reference > 0)
+            if np.any(valid):
+                codes = (local_labels[valid].astype(np.uint64) << np.uint64(32)) | reference[valid].astype(np.uint64)
+                pair_codes, pair_counts = np.unique(codes, return_counts=True)
+                candidates = []
+                min_voxels = int(self.cfg.INFER.STITCH_MIN_OVERLAP_VOXELS)
+                min_fraction = float(self.cfg.INFER.STITCH_MIN_FRACTION)
+                if min_voxels < 1 or not 0.0 < min_fraction <= 1.0:
+                    raise ValueError("Invalid stitching thresholds: MIN_OVERLAP_VOXELS >= 1 and 0 < MIN_FRACTION <= 1 required")
+                for code, count in zip(pair_codes, pair_counts):
+                    local_id = int(code >> np.uint64(32))
+                    global_id = int(code & np.uint64(max_uint32))
+                    if local_id not in central_ids_set:
+                        continue
+                    fraction = int(count) / local_sizes[local_id]
+                    if int(count) >= min_voxels and fraction >= min_fraction:
+                        candidates.append((int(count), fraction, local_id, global_id))
+                # Each local region can match at most one existing global ID,
+                # and each previously assigned global ID at most one region.
+                used_global = set()
+                for count, fraction, local_id, global_id in sorted(candidates, reverse=True):
+                    if local_id not in old_to_new and global_id not in used_global:
+                        old_to_new[local_id] = global_id
+                        used_global.add(global_id)
+
+        for local_id in map(int, central_ids):
+            if local_id not in old_to_new:
+                if self.next_instance_id > max_uint32:
+                    raise OverflowError("Global instance counter exceeded uint32 capacity")
+                old_to_new[local_id] = int(self.next_instance_id)
+                self.next_instance_id += 1
+
+        # Only the central region is committed. Avoid a full-volume LUT sized by
+        # the maximum marker ID by applying a sorted search over present labels.
+        centers = local_labels[center_slices]
+        sorted_ids = np.array(sorted(old_to_new), dtype=np.uint32)
+        new_ids = np.array([old_to_new[int(i)] for i in sorted_ids], dtype=np.uint32)
+        remapped = np.zeros(centers.shape, dtype=np.uint32)
+        foreground = centers > 0
+        remapped[foreground] = new_ids[np.searchsorted(sorted_ids, centers[foreground])]
+        result[0][center_slices] = remapped
+        return result
 
     def _infer_one_batch(
         self,
@@ -651,13 +993,13 @@ class Segmentation_Workflow(Base_Workflow):
             return block_pred_sum, block_weight_sum
         if current_batch_size != len(p_overlap_widths):
             raise ValueError("p_coord_list and p_overlap_widths must have the same length.")
-        patch_raw = np.zeros((current_batch_size, self.patch_size[3], *self.patch_size[0:3],), dtype=block_raw.dtype,)  # BCZYX
+        patch_raw = np.zeros((current_batch_size, self.patch_size[3], *self.patch_size[0:3],), dtype=np.float32,)  # BCZYX: retain normalized fractional values
         for i, p_coord in enumerate(p_coord_list):
             patch = block_raw[
                 :, p_coord[0, 0]:p_coord[0, 1], p_coord[1, 0]:p_coord[1, 1],p_coord[2, 0]:p_coord[2, 1],]  # CZYX
             if patch.shape[1:4] != patch_raw.shape[2:5]:
                 patch = reflect_padding_img(patch, patch_raw.shape[2:5])
-            patch_raw[i, ...] = patch
+            patch_raw[i, ...] = preprocess_img(patch, self.preprocess_dict)
 
         patch_tensor = torch.from_numpy(patch_raw.astype(np.float32, copy=False)).to(self.device, non_blocking=True)
         patch_pred = self.model(patch_tensor)  # B(out_channel_num)ZYX
@@ -708,6 +1050,70 @@ class Segmentation_Workflow(Base_Workflow):
             block_weight_sum[block_slices] += patch_weight
         return block_pred_sum, block_weight_sum
 
+    @staticmethod
+    def _file_identity(path):
+        path = Path(path).resolve()
+        stats = path.stat()
+        return {"path": str(path), "size": stats.st_size,
+                "mtime_ns": stats.st_mtime_ns}
+
+    def _build_infer_manifest(self):
+        """Fingerprint parameters and input identities that determine inference output."""
+        source = Path(self.infer_path).resolve()
+        if source.is_file():
+            input_metadata = self._file_identity(source)
+        else:
+            # Avoid walking a PB volume: identify the root metadata only.
+            input_metadata = {"path": str(source),
+                              "metadata_files": [self._file_identity(p) for p in
+                              (source / ".zattrs", source / ".zgroup", source / "zarr.json",
+                               source / ".zmetadata") if p.is_file()]}
+        checkpoint = self.checkpoint_input_file
+        checksum = hashlib.sha256()
+        with checkpoint.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                checksum.update(chunk)
+        skeletons = []
+        if self.skeleton_flag and (self.save_segmentation or not self.raw_all_blocks):
+            directory = Path(self.skeleton_path)
+            if not directory.is_dir():
+                raise FileNotFoundError(f"Missing SWC directory: {directory}")
+            skeletons = [self._file_identity(path) for path in sorted(directory.glob("*.swc"))]
+            if not skeletons:
+                raise ValueError("Skeleton-guided inference requires SWC files")
+        # Loading-only options must not invalidate already running inference jobs.
+        architecture_cfg = self.cfg.MODEL.clone()
+        for key in ("CHECKPOINT_ALLOW_PARTIAL", "CHECKPOINT_INPUT_PATH"):
+            if key in architecture_cfg:
+                del architecture_cfg[key]
+        fields = {"format_version": 2, "job_id": int(self.job_id),
+                  "input": input_metadata, "input_shape": list(map(int, self.infer_reader.shape)),
+                  "checkpoint_sha256": checksum.hexdigest(),
+                  "skeletons": skeletons,
+                  "output_mode": self.output_mode,
+                  "segmentation_path": str(self.infer_gt_path.resolve()) if self.save_segmentation else None,
+                  "probability_path": str(self.infer_raw_path.resolve()) if self.save_raw_predictions else None,
+                  "selected_raw_channels": list(self.infer_channel),
+                  "model": str(architecture_cfg), "task": str(self.cfg.TASK),
+                  "normalization": str(self.cfg.DATA.NORMALIZATION),
+                  "patch_size": list(self.patch_size),
+                  "infer_overlap": list(map(int, self.infer_overlap)),
+                  "infer_padding": list(self.infer_padding),
+                  "block_size": list(map(int, self.block_size)),
+                  "central_block_size": list(map(int, self.c_block_size)),
+                  "watershed": {"seed": list(self.watershed_seed_channels),
+                                 "seed_thresholds": list(self.watershed_seed_channels_thresh),
+                                 "surface": self.watershed_topographic_channel,
+                                 "growth_mask": list(self.watershed_growth_mask_channels),
+                                 "growth_thresholds": list(self.watershed_growth_mask_channels_thresh)},
+                  "postprocessing": self.postprocess_dict,
+                  "skeleton_enabled": bool(self.skeleton_flag),
+                  "raw_all_blocks": bool(self.raw_all_blocks),
+                  "stitch_min_overlap_voxels": int(self.cfg.INFER.STITCH_MIN_OVERLAP_VOXELS),
+                  "stitch_min_fraction": float(self.cfg.INFER.STITCH_MIN_FRACTION),
+                  "output_channel_names": list(self.output_channel_names)}
+        return fields
+
     def save_infer_log(self) -> Path:
         """Atomically write the current block progress and output-store path to JSON.
 
@@ -720,8 +1126,15 @@ class Segmentation_Workflow(Base_Workflow):
         log_path = self.infer_log_path / f"infer_log_{int(self.job_id):02d}.json"
         payload = {
             "job_id": int(self.job_id),
+            "manifest": self.infer_manifest,
             "inferred_block_num": self.inferred_block_num,
-            "ome_zarr_path": str(self.infer_gt_path),
+            "output_mode": self.output_mode,
+            "raw_all_blocks": bool(self.cfg.INFER.RAW_ALL_BLOCKS) and self.save_raw_predictions,
+            "skeleton_enabled": bool(self.skeleton_flag),
+            "next_instance_id": int(self.next_instance_id),
+            "segmentation_dtype": self.segmentation_dtype,
+            "ome_zarr_path": str(self.infer_gt_path) if self.save_segmentation else None,
+            "raw_ome_zarr_path": str(self.infer_raw_path) if self.save_raw_predictions else None,
             "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),}
         temporary_path = log_path.with_name(f".{log_path.name}.{os.getpid()}.tmp")
         try:
@@ -762,9 +1175,14 @@ class Segmentation_Workflow(Base_Workflow):
         self.inferred_block_num = 0
         log_path = Path(self.infer_log_path) / f"infer_log_{int(self.job_id):02d}.json"
         if not log_path.exists():
+            # Never append into unknown output stores without a valid manifest.
+            for required, store in ((self.save_segmentation, self.infer_gt_path),
+                                    (self.save_raw_predictions, self.infer_raw_path)):
+                if required and Path(store).exists():
+                    raise FileExistsError(f"Output store exists without a valid inference progress log: {store}")
             return
         if not log_path.is_file():
-            return
+            raise ValueError(f"Inference log path exists but is not a file: {log_path}")
         try:
             with log_path.open(mode="r", encoding="utf-8") as file:
                 payload = json.load(file)
@@ -772,18 +1190,57 @@ class Segmentation_Workflow(Base_Workflow):
             raise RuntimeError(f"Inference log is not valid JSON: {log_path}") from error
         except OSError as error:
             raise RuntimeError(f"Unable to read inference log: {log_path}") from error
+        if payload.get("manifest") != self.infer_manifest:
+            raise ValueError("Inference resume manifest differs from current source, "
+                             "checkpoint, normalization, channels or inference parameters. "
+                             "Use a new job_id/output path; legacy logs without a manifest are not safe to resume.")
         saved_job_id = payload.get("job_id")
         if isinstance(saved_job_id, bool) or not isinstance(saved_job_id, int) or saved_job_id != int(self.job_id):
             raise ValueError(f"Inference log belongs to a different job: saved job_id={saved_job_id!r}, current job_id={self.job_id!r}.")
         inferred_block_num = payload.get("inferred_block_num")
         if isinstance(inferred_block_num, bool) or not isinstance(inferred_block_num, int) or inferred_block_num < 0:
             raise ValueError( f"Inference log contains an invalid inferred_block_num: {inferred_block_num!r}.")
+        saved_mode = payload.get("output_mode", "uint16")  # legacy segmentation-only logs
+        if saved_mode != self.output_mode:
+            raise ValueError(
+                f"Inference log output_mode={saved_mode!r} does not match "
+                f"configured OUTPUT_MODE={self.output_mode!r}. Use a new job_id/log."
+            )
+        saved_all_blocks = payload.get("raw_all_blocks", False)
+        configured_all_blocks = bool(self.cfg.INFER.RAW_ALL_BLOCKS) and self.save_raw_predictions
+        if not isinstance(saved_all_blocks, bool) or saved_all_blocks != configured_all_blocks:
+            raise ValueError(
+                "Inference log raw_all_blocks does not match the current configuration. "
+                "Use a new job_id/log when changing INFER.RAW_ALL_BLOCKS."
+            )
+        if inferred_block_num > self.total_block_num:
+            raise ValueError("Inference log progress exceeds the current image block count.")
+        # Legacy progress files predate these keys and can only be resumed in
+        # their original SWC-enabled uint16 mode.
+        old_skeleton_flag = payload.get("skeleton_enabled", True)
+        if not isinstance(old_skeleton_flag, bool) or old_skeleton_flag != bool(self.skeleton_flag):
+            raise ValueError("Inference log skeleton mode differs from configuration. Use a new job ID/log.")
+        old_dtype = payload.get("segmentation_dtype", "uint16")
+        if old_dtype != self.segmentation_dtype:
+            raise ValueError("Inference log segmentation dtype differs from configuration. Use a new job ID/log.")
+        if self.save_segmentation and self.instance_num and not self.skeleton_flag:
+            next_id = payload.get("next_instance_id")
+            if isinstance(next_id, bool) or not isinstance(next_id, int) or not 1 <= next_id <= np.iinfo(np.uint32).max + 1:
+                raise ValueError("SWC-free inference log needs a valid next_instance_id for resuming.")
+            self.next_instance_id = next_id
+        requested_stores = (
+            ("ome_zarr_path", self.infer_gt_path, self.save_segmentation),
+            ("raw_ome_zarr_path", self.infer_raw_path, self.save_raw_predictions),
+        )
+        for key, expected_path, required in requested_stores:
+            if not required:
+                continue
+            saved_path = payload.get(key)
+            if not isinstance(saved_path, str) or not saved_path.strip():
+                raise ValueError(f"Inference log missing required {key}.")
+            if not Path(saved_path).is_dir() or not Path(saved_path).samefile(expected_path):
+                raise ValueError(f"Inference log {key} differs from the configured output store.")
         self.inferred_block_num = inferred_block_num
-        infer_gt_path = payload.get("ome_zarr_path")
-        if not isinstance(infer_gt_path, str) or not infer_gt_path.strip():
-            raise ValueError("Inference log contains an invalid ome_zarr_path.")
-        infer_gt_path = Path(infer_gt_path)
-        assert infer_gt_path.samefile(self.infer_gt_path), "zarr path in config file and log file are different."
 
 
     def run(self):

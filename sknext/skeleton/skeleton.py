@@ -65,6 +65,31 @@ class SkeletonManager():
         self._assign_source_file_metadata()
         self._build_id_index_dict()
         self._build_file_id_index_dict()
+        self.validate_instance_mapping()
+
+    def validate_instance_mapping(self):
+        """Validate the zero-based-index -> raster-ID -> SWC filename mapping.
+
+        Rasterized label i+1 is intentionally NOT assumed to equal the SWC
+        filename number; use the returned rows for persistent provenance.
+        """
+        if len(self.skeletons) != len(self.swc_paths) or len(self.file_ids) != len(self.skeletons):
+            raise ValueError("SWC path / skeleton / filename ID counts do not agree")
+        if len(self.id_index_dict) != len(self.skeletons):
+            raise ValueError("Duplicate internal Navis neuron IDs make rasterization ambiguous")
+        if len(self.file_id_index_dict) != len(self.skeletons):
+            raise ValueError("Duplicate SWC filename-derived IDs")
+        if len(self.skeletons) > np.iinfo(np.uint16).max:
+            raise OverflowError("Skeleton-guided uint16 labels support at most 65535 SWCs")
+        rows = []
+        for index, (swc, file_id, neuron) in enumerate(zip(self.swc_paths, self.file_ids, self.skeletons)):
+            if getattr(neuron, "file_id", None) != file_id:
+                raise ValueError(f"SWC metadata mismatch at index {index}")
+            if Path(getattr(neuron, "file", "")) != swc:
+                raise ValueError(f"SWC source path mismatch at index {index}")
+            rows.append({"instance_id": index + 1, "skeleton_index": index,
+                         "swc_file_id": file_id, "swc_filename": swc.name})
+        return rows
 
     def __len__(self):
         """Return the number of managed neurons."""
@@ -510,7 +535,7 @@ class SkeletonManager():
         )
 
         # White background
-        viewer.set_bgcolor("white")
+        viewer.set_bgcolor("black")
 
         viewer.show(start_loop=True)
 
@@ -2333,9 +2358,9 @@ class SkeletonManager():
 
 
 if __name__ == '__main__':
-    path = r"G:\Albert\data\CAS_hippocampus_dataset\representative"
+    path = r"E:\Albert_BigFile\Data\260618_SkNeXt_dataset\skeleton\skeleton1\raw_swc(unit_image_voxel)"
     sk = SkeletonManager(path)
-    sk.plot_skeletons_by_id(start_id=1, soma_color="green", dendrite_color="red", axon_color="blue", other_color="blue", linewidth=3)
+    sk.plot3d(palette="tab10")
     # sk.plot_one_skeleton(
     #     idx=0,
     #     soma_color="green",

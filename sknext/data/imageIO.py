@@ -22,46 +22,129 @@ def get_tif_path_in_folder(file_path: Path|str) -> list[Path|str]:
     tif_paths = sorted(tif_paths)
     return tif_paths
 
-def get_tif_path_dict_in_folder(file_path: Path|str, channel_names: list[str]) -> dict[str, Path|str]:
-    """Group TIFF label paths by instance and requested semantic channels.
+def get_tif_path_dict_in_folder(file_path: Path | str, channel_names: list[str]) -> dict[str, list[Path]]:
+    """Discover instance/semantic TIFF labels without requiring instance masks.
 
-    Args:
-        file_path: Directory containing label TIFF files.
-        channel_names: F/P/C/A instance targets and/or S.<name> semantic targets.
+    Supported layouts::
 
-    Returns:
-        Mapping from 'instance' or semantic channel names to sorted path lists.
-        Semantic files are identified by the suffix before .tif/.tiff.
+        sample_0001.tif       # instance, only when F/P/C/A is requested
+        sample_0001.ER.tif    # channel S.ER
+        sample_0001.mito.tif  # channel S.mito
 
-    Raises:
-        ValueError: A channel name is unsupported.
-        AssertionError: The directory is invalid or group counts differ.
+    Return ordered groups with corresponding sample basenames. Unrequested TIFF
+    groups are ignored. Raises on incomplete or duplicate semantic samples.
     """
     file_path = Path(file_path)
-    assert file_path.exists(), f"Folder does not exist: {file_path}"
-    assert file_path.is_dir(), f"Input path is not a folder: {file_path}"
-    semantic_names = []
-    path_dict = {}
-    for name in channel_names:
-        if name in ["F", "P", "C", "A"]:
-            path_dict["instance"] = []
-        elif "S." in name:
-            semantic_names.append(name[2:])
-            path_dict[name] = []
-        else: raise ValueError(f"Unsupported channel name: {name}")
-    tif_length = 0
-    for one_p in file_path.iterdir():
-        if one_p.is_file() and one_p.suffix.lower() in [".tif", ".tiff"]:
-            tif_length += 1
-            one_c = str(one_p).split(".")[-2]
-            if one_c in semantic_names:
-                path_dict["S."+one_c].append(one_p.resolve())
-            else:
-                path_dict["instance"].append(one_p.resolve())
-    for key in path_dict.keys(): path_dict[key] = sorted(path_dict[key])
-    tif_length /= len(path_dict.keys())
-    for name in path_dict.keys(): assert len(path_dict[name]) == tif_length, "unmatching number of different channels"
-    return path_dict
+    if not file_path.is_dir():
+        raise NotADirectoryError(f"Label directory does not exist: {file_path}")
+    requested = list(channel_names)
+    if not requested:
+        raise ValueError("At least one channel must be configured")
+    semantic = [name for name in requested if name.startswith("S.") and len(name) > 2]
+    if len(semantic) != len(set(semantic)):
+        raise ValueError("Duplicate semantic channels are not allowed")
+    invalid = [name for name in requested if name not in {"F", "P", "C", "A"} and name not in semantic]
+    if invalid:
+        raise ValueError(f"Unsupported channel names: {invalid}")
+    instance_requested = any(name in {"F", "P", "C", "A"} for name in requested)
+    groups: dict[str, dict[str, Path]] = {ch: {} for ch in semantic}
+    if instance_requested:
+        groups["instance"] = {}
+    files = sorted((p.resolve() for p in file_path.iterdir()
+                    if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}))
+    semantic_sample_names = {
+        path.stem[:-(len(ch) - 1)]
+        for path in files for ch in semantic
+        if path.stem.endswith('.' + ch[2:])
+    }
+    for path in files:
+        stem = path.stem
+        target = None
+        sample = stem
+        for ch in semantic:
+            suffix = "." + ch[2:]
+            if stem.endswith(suffix):
+                target = ch
+                sample = stem[:-len(suffix)]
+                break
+        if target is None:
+            if not instance_requested:
+                continue  # existing instance masks should not be required or used
+            # For mixed targets, a valid instance file must match a semantic
+            # sample name; ignore unrelated TIFFs. For instance-only tasks,
+            # preserve compatibility with arbitrary (even dotted) basenames.
+            if semantic and stem not in semantic_sample_names:
+                continue
+            target = "instance"
+        if not sample:
+            raise ValueError(f"Empty sample name in {path}")
+        if sample in groups[target]:
+            raise ValueError(f"Duplicate label for {target!r}, sample {sample!r}")
+        groups[target][sample] = path
+    for ch, entries in groups.items():
+        if not entries:
+            raise ValueError(f"No label TIFF files found for {ch!r} in {file_path}")
+    names_by_group = {ch: set(entries) for ch, entries in groups.items()}
+    reference_name = next(iter(names_by_group))
+    reference = names_by_group[reference_name]
+    for ch, names in names_by_group.items():
+        if names != reference:
+            missing = sorted(reference - names)
+            extra = sorted(names - reference)
+            raise ValueError(f"Mismatched label samples for {ch}: missing={missing}, extra={extra}")
+    return {ch: [entries[name] for name in sorted(reference)] for ch, entries in groups.items()}
+
+
+
+def pair_raw_and_label_tiffs(raw_paths, gt_groups):
+    """Return raw and GT paths matched by sample identity, not list position.
+
+    Accepted GT names: ``sample.tif``, ``sample_gt.tif``, or
+    ``prefix_gt_0001.tif`` for raw ``prefix_0001.tif``. The semantic
+    suffix ``.ER`` in ``prefix_gt_0001.ER.tif`` is handled independently.
+    Ambiguous matches, duplicate samples, and missing labels are fatal.
+    """
+    raw_paths = [Path(p) for p in raw_paths]
+    raw_map = {}
+    for path in raw_paths:
+        if path.stem in raw_map:
+            raise ValueError(f"Duplicate raw sample {path.stem!r}")
+        raw_map[path.stem] = path
+    if not raw_map:
+        raise ValueError("No raw TIFF files were supplied")
+    if not gt_groups:
+        raise ValueError("No label groups were supplied")
+    result = {}
+    for channel, paths in gt_groups.items():
+        indexed = {}
+        suffix = '.' + channel[2:] if channel.startswith('S.') else ''
+        for item in paths:
+            path = Path(item)
+            stem = path.stem
+            if suffix:
+                if not stem.endswith(suffix):
+                    raise ValueError(f"Label {path.name!r} is not a {channel} TIFF")
+                stem = stem[:-len(suffix)]
+            candidates = [stem]
+            # Legacy label convention: xxx_gt_0000 / xxx_0000_gt.
+            candidates.extend([re.sub(r'_gt(?=_|$)', '', stem, count=1),
+                               re.sub(r'(?<=_)gt_', '', stem, count=1)])
+            matches = set(candidates) & set(raw_map)
+            if len(matches) != 1:
+                raise ValueError(f"Could not uniquely pair label {path.name!r} "
+                                 f"with a raw TIFF: possible matches={sorted(matches)}")
+            sample = matches.pop()
+            if sample in indexed:
+                raise ValueError(f"Duplicate {channel} label for {sample!r}")
+            indexed[sample] = path
+        missing = set(raw_map) - set(indexed)
+        extra = set(indexed) - set(raw_map)
+        if missing or extra:
+            raise ValueError(f"Unmatched {channel} labels: missing={sorted(missing)} "
+                             f"extra={sorted(extra)}")
+        result[channel] = [indexed[stem] for stem in sorted(raw_map)]
+    return [raw_map[stem] for stem in sorted(raw_map)], result
+
 
 def read_one_3D_tif(tif_path: str|Path, output_axes:Literal["ZYX", "CZYX", "ZYXC"] = "CZYX") -> np.ndarray:
     """Read a TIFF volume and arrange its axes as requested.

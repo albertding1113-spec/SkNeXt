@@ -224,22 +224,28 @@ def reconstruct_skeleton_from_mask(
         z0, y0, x0, z1, y1, x1 = prop.bbox
         instance_crop = labels[z0:z1, y0:y1, x0:x1] == instance_id
 
-        # Pad each instance independently to reduce skeletonization artifacts
-        # when the instance touches its local bounding-box boundary.
-        padded_mask = np.pad(
-            instance_crop,
-            pad_width=1,
-            mode="constant",
-            constant_values=False,
-        )
-        skeleton_crop = skeletonize(padded_mask)
-        skeleton_crop = skeleton_crop[1:-1, 1:-1, 1:-1]
-
-        if mode == "main":
-            skeleton_crop = skeleton_main_branch(skeleton_crop)
+        # A single ID can contain disconnected fragments inside one patch.
+        # Process each connected-component bounding box to avoid allocating
+        # a full-volume mask once per component.
+        cc_labels, _ = ndi.label(instance_crop, structure=generate_binary_structure(3, 1))
+        skeleton_crop = np.zeros_like(instance_crop, dtype=bool)
+        for component_id, component_slice in enumerate(ndi.find_objects(cc_labels), start=1):
+            if component_slice is None:
+                continue
+            component = cc_labels[component_slice] == component_id
+            # Padding avoids skeletonization artifacts at the crop boundary.
+            component_sk = skeletonize(np.pad(component, 1, mode="constant"))[1:-1, 1:-1, 1:-1]
+            if mode == "main" and np.any(component_sk):
+                component_sk = skeleton_main_branch(component_sk)
+            if not np.any(component_sk):
+                # Even-width compact objects can return an empty skeleton.
+                distances = ndi.distance_transform_edt(component)
+                component_sk = np.zeros_like(component, dtype=bool)
+                component_sk[np.unravel_index(np.argmax(distances), distances.shape)] = True
+            skeleton_crop[component_slice] |= component_sk
 
         target = skeleton_mask[z0:z1, y0:y1, x0:x1]
-        target |= skeleton_crop.astype(bool, copy=False)
+        target |= skeleton_crop
 
     return skeleton_mask.astype(np.uint8)
 
@@ -370,6 +376,7 @@ def watershed_with_sk(
     growth_mask_chs: list[str],
     growth_mask_chs_thresh: list[float | str],
     skeleton_label: np.ndarray | None = None,
+    output_dtype: np.dtype | str = np.uint16,
 ) -> np.ndarray:
     """Convert F/C/P predictions into an instance-label image by watershed.
 
@@ -419,10 +426,15 @@ def watershed_with_sk(
     Returns
     -------
     np.ndarray
-        Watershed instance labels in ``ZYX`` or ``YX`` order, dtype ``uint16``.
+        Watershed instance labels in ``ZYX`` or ``YX`` order. The default dtype
+        is uint16 for compatibility; uint32 is available for dense predictions.
         Background is 0. Without ``skeleton_label``, instances are numbered from
-        1. With ``skeleton_label``, positive output IDs match skeleton IDs.
+        1 within this block. With ``skeleton_label``, positive IDs match SWC IDs.
     """
+    output_dtype = np.dtype(output_dtype)
+    if output_dtype not in (np.dtype("uint16"), np.dtype("uint32")):
+        raise ValueError("output_dtype must be uint16 or uint32")
+    max_label = np.iinfo(output_dtype).max
     raw_logits = np.asarray(raw_logits)
     ch_names = list(ch_names)
 
@@ -537,10 +549,12 @@ def watershed_with_sk(
         # Standard mode: markers must stay inside the allowed growth region.
         seed_mask &= growth_mask
         if not np.any(seed_mask) or not np.any(growth_mask):
-            return np.zeros(spatial_shape, dtype=np.uint16)
+            return np.zeros(spatial_shape, dtype=output_dtype)
         markers, marker_count = ndi.label(seed_mask, structure=connectivity)
         if marker_count == 0:
-            return np.zeros(spatial_shape, dtype=np.uint16)
+            return np.zeros(spatial_shape, dtype=output_dtype)
+        if marker_count > max_label:
+            raise OverflowError(f"{marker_count} watershed seeds exceed {output_dtype} ID capacity")
         markers = markers.astype(np.int64, copy=False)
     else:
         skeleton_label = np.asarray(skeleton_label)
@@ -558,14 +572,14 @@ def watershed_with_sk(
         if np.any(skeleton_label < 0): raise ValueError("skeleton_label cannot contain negative IDs.")
 
         max_skeleton_id = int(np.max(skeleton_label, initial=0))
-        if max_skeleton_id > np.iinfo(np.uint16).max:
-            raise OverflowError(f"skeleton_label contains an ID larger than uint16 can represent: {max_skeleton_id}.")
-        skeleton_label = skeleton_label.astype(np.uint16, copy=False)
+        if max_skeleton_id > max_label:
+            raise OverflowError(f"skeleton_label contains an ID larger than {output_dtype} can represent: {max_skeleton_id}.")
+        skeleton_label = skeleton_label.astype(output_dtype, copy=False)
         skeleton_region = skeleton_label > 0
         if not np.any(skeleton_region):
             # Skeleton-constrained mode has no valid marker IDs. Predicted seeds
             # are intentionally not allowed to create independent instances.
-            return np.zeros(spatial_shape, dtype=np.uint16)
+            return np.zeros(spatial_shape, dtype=output_dtype)
         # Skeleton voxels are markers themselves. Include them in the watershed
         # mask even when the predicted growth mask misses part of a skeleton.
         growth_mask |= skeleton_region
@@ -615,9 +629,9 @@ def watershed_with_sk(
         mask=growth_mask,
         connectivity=connectivity,
         watershed_line=False,)
-    if np.max(instances, initial=0) > np.iinfo(np.uint16).max:
-        raise OverflowError("Watershed output IDs exceed uint16 range.")
-    return instances.astype(np.uint16, copy=False)
+    if np.max(instances, initial=0) > max_label:
+        raise OverflowError(f"Watershed output IDs exceed {output_dtype} range.")
+    return instances.astype(output_dtype, copy=False)
 
 def skeleton_main_branch(sk: np.ndarray) -> np.ndarray:
     """Keep the longest path of every disconnected skeleton component.

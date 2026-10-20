@@ -84,7 +84,7 @@ class SkNeXt_Config:
         # 4. DATA
         _C.DATA = CN()
         # Patch size, "ZYXC"
-        _C.DATA.PATCH_SIZE = (20, 256, 256, 1)
+        _C.DATA.PATCH_SIZE = (32, 256, 256, 1)
         # Whether to reshape the dimensions that does not satisfy the patch shape selected by padding it with reflect.
         _C.DATA.REFLECT_TO_COMPLETE_SHAPE = True
         # 4.1. NORMALIZATION
@@ -97,6 +97,8 @@ class SkNeXt_Config:
         _C.DATA.NORMALIZATION.PERC_CLIP.UPPER_PERC = -1.0
         # Normalization methods. Options: "scale_range", 'zero_mean_unit_variance'.
         _C.DATA.NORMALIZATION.TYPE = "zero_mean_unit_variance"
+        # All training/validation/inference images are normalized per padded patch.
+        _C.DATA.NORMALIZATION.SCOPE = "patch"
         # 4.2. TRAIN
         _C.DATA.TRAIN = CN()
         # PATH organization
@@ -152,21 +154,29 @@ class SkNeXt_Config:
         _C.DATA.INFER = CN()
         _C.DATA.INFER.PATH = "./raw/"
         _C.DATA.INFER.GT_PATH = "./label/"
+        # Optional output path for float32 model probability maps.
+        # Empty string: create a sibling of the uint16 result, with '_raw' suffix.
+        # A directory: write result<job_id>_raw.ome.zarr inside that directory.
+        # A *.zarr path: write to that exact OME-Zarr store.
+        _C.DATA.INFER.RAW_OUTPUT_PATH = ""
         # Infer log
         _C.DATA.INFER.INFER_LOG = os.path.join(Path(_C.DATA.INFER.PATH).parent, "infer_log")
         # Whether to write results into original "hdf5"/"imaris"/"ome-zarr" files.
-        _C.DATA.INFER.RESULT_INTO_FILE = True
+        _C.DATA.INFER.RESULT_INTO_FILE = False
         # Index of channel in "hdf5"/"imaris"/"ome-zarr" file used when inferring.
         _C.DATA.INFER.CHANNEL = [0]
         # Name of channel created in "hdf5"/"imaris"/"ome-zarr" file to save results.
         _C.DATA.INFER.CHANNEL_NAME = "result0"
         # Percentage of overlap in (z,y,x) when cropping. Tuple of floats between range [0, 1).
-        _C.DATA.INFER.OVERLAP = (0.125, 0.125, 0.125)
+        _C.DATA.INFER.OVERLAP = (0, 0, 0)
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
-        _C.DATA.INFER.PADDING = (0, 0, 0)
-        # Block used in inferring and watershed. Block size = BLOCK_FACTOR * PATCH_SIZE
+        _C.DATA.INFER.PADDING = (4, 16, 16)
+        # Full block size (including halo) in patches, ZYX.
+        # The per-side halo is computed automatically by Base_Workflow:
+        # (BLOCK_FACTOR - BLOCK_CENTRAL_FACTOR) * PATCH_SIZE[:3] / 2.
         _C.DATA.INFER.BLOCK_FACTOR = (8, 6, 6)
-        # Central part of block writen into results after inferring and watershed.
+        # Non-overlapping central region written to the output, in patches, ZYX.
+        # Choose a smaller central factor to enable halo-based instance ID matching.
         _C.DATA.INFER.BLOCK_CENTRAL_FACTOR = (7, 5, 5)
         # Order of the axes of the image when using Zarr/hdf5 images.
         _C.DATA.INFER.INPUT_AXES_ORDER = "TCZYX"
@@ -298,6 +308,13 @@ class SkNeXt_Config:
         _C.MODEL.CONVNEXT_STEM_K_SIZE = 2
         # 5.2. CHECKPOINT
         _C.MODEL.LOAD_CHECKPOINT = False
+        # False: strict model tensor/shape check (safe for inference).
+        # True: load all matching tensors, leave missing or mismatched layers
+        # randomly initialized with explicit warnings. Verify before production.
+        _C.MODEL.CHECKPOINT_ALLOW_PARTIAL = True
+        # Optional checkpoint to READ, independent of the current run's output.
+        # Set when fine-tuning or inferring with a checkpoint from another run.
+        _C.MODEL.CHECKPOINT_INPUT_PATH = ""
 
         # 7. LOSS
         _C.LOSS = CN()
@@ -305,6 +322,9 @@ class SkNeXt_Config:
         # 8. TRAIN
         _C.TRAIN = CN()
         _C.TRAIN.ENABLE = False
+        # True: exact epoch-boundary resume from *_latest.pth, including optimizer,
+        # scheduler, RNG states and early-stopping status. False: start a new run.
+        _C.TRAIN.RESUME = False
         # Optimizer. Options: "SGD", "ADAM" or "ADAMW"
         _C.TRAIN.OPTIMIZER = "ADAMW"
         # Learning rate
@@ -331,16 +351,32 @@ class SkNeXt_Config:
         # 9. INFERENCE
         _C.INFER = CN()
         _C.INFER.ENABLE = False
+        # 'uint16': watershed + semantic labels (legacy name); actual stored dtype
+        #           is uint32 when skeleton-free instance labeling is enabled.
+        # 'float32': sigmoid probability channels only (no watershed).
+        # 'both': independent uint16 and float32 OME-Zarr outputs.
+        _C.INFER.OUTPUT_MODE = "uint16"
+        # When skeleton mode is enabled, optionally save float32 probabilities
+        # in blocks without SWCs. Ignored when SKELETON.ENABLE is False, since all
+        # blocks are processed in that mode.
+        _C.INFER.RAW_ALL_BLOCKS = False
+        # SWC-free segmentation: assign unique global uint32 IDs to watershed
+        # instances using the SAME block halo as inference. The halo is computed
+        # in Base_Workflow as (BLOCK_FACTOR - BLOCK_CENTRAL_FACTOR) * PATCH_SIZE / 2.
+        # No separate instance-segmentation halo parameter is needed.
+        # Overlap thresholds control ID reuse, not the geometric halo size.
+        # Matching is conservative and is NOT a replacement for neuron tracing.
+        _C.INFER.STITCH_MIN_OVERLAP_VOXELS = 16
+        _C.INFER.STITCH_MIN_FRACTION = 0.5
         # 8.1. SKELETON
         _C.INFER.SKELETON = CN()
-        # Whether to use .swc skeleton files as seed channel when predicting.
-        # Default: True.
+        # True: selective SWC-guided reading and SWC-ID watershed markers.
+        # False: process EVERY image block without loading SWCs, derive seeds
+        # from predicted channels, and assign/stitch global uint32 instance IDs.
         _C.INFER.SKELETON.ENABLE = True
         # 8.2.
-        # Whether to save the raw output of the model (before any post-processing). Set to True when testing model.
-        _C.INFER.SAVE_MODEL_RAW_OUTPUT = False
-        # When SKELETON.ENAMBLE is True, set as 0. Use -1 (default) to compute it automatically as patch_size / 8.
-        _C.INFER.INSTANCE_SEG_HALO = -1
+        # Deprecated/unused; use INFER.OUTPUT_MODE instead.
+        # _C.INFER.SAVE_MODEL_RAW_OUTPUT = False
         # 8.3. POST-PROCESSING
         _C.INFER.POST_PROCESSING = CN()
         _C.INFER.POST_PROCESSING.ENABLE = False
@@ -429,10 +465,12 @@ def update_config(cfg:CN, new_cfg:CN, job_id:Optional[str|int]) -> CN:
                 _update_recursive(base_value, value, full_key)
             else:
                 base_cfg[key] = copy.deepcopy(value)
+    custom_infer_log = "DATA" in new_cfg and "INFER" in new_cfg.DATA and "INFER_LOG" in new_cfg.DATA.INFER
     _update_recursive(cfg, new_cfg)
     cfg.PATHS.RESULT_DIR.PATH_ = os.path.join(cfg.PATHS.RESULT_DIR.PATH, "results", str(job_id))
     cfg.PATHS.RESULT_DIR.OUTPUT_LOG = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "log")
-    cfg.DATA.INFER.INFER_LOG = os.path.join(Path(cfg.DATA.INFER.PATH).parent, "infer_log")
+    if not custom_infer_log:
+        cfg.DATA.INFER.INFER_LOG = os.path.join(Path(cfg.DATA.INFER.PATH).parent, "infer_log")
     cfg.PATHS.RESULT_DIR.OUTPUT_CHART = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "chart")
     cfg.PATHS.RESULT_DIR.OUTPUT_RAW = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_raw")
     cfg.PATHS.RESULT_DIR.OUTPUT_INSTANCES = os.path.join(cfg.PATHS.RESULT_DIR.PATH_, "output_instances")

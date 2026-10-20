@@ -12,7 +12,7 @@ from itertools import product
 from tqdm import tqdm
 import shutil
 from typing import Any, Callable, Iterable, Literal, Sequence
-from sknext.data.imageIO import read_one_3D_tif, calculate_patch_coordinates, patch_coordinates_generator
+from sknext.data.imageIO import read_one_3D_tif, calculate_patch_coordinates, patch_coordinates_generator, pair_raw_and_label_tiffs
 from sknext.data.preprocessing import preprocess_img, reflect_padding_img
 from sknext.data.label import generate_channels_from_labels
 
@@ -322,6 +322,7 @@ def tif_list_to_zarr(
         channels: list[str] | tuple[str, ...] = (),
         channel_extra_opts: dict | None = None,
         filter_dict: dict | None = None,
+        normalize_per_patch: bool = False,
 ):
     """Convert paired TIFF volumes into an NCZYX patch Zarr dataset.
 
@@ -338,10 +339,9 @@ def tif_list_to_zarr(
     expected_raw_channels = int(patch_size[3])
 
     for key in gt_tif_dict.keys():
-        if len(tif_list) != len(gt_tif_dict[key]):
-            raise ValueError("raw and label images must have the same number of files.")
         if not (key == "instance" or key in channels):
             raise ValueError(f"Unsupported key name: {key}")
+    tif_list, gt_tif_dict = pair_raw_and_label_tiffs(tif_list, gt_tif_dict)
 
     remove_zarr_if_exists(zarr_path)
 
@@ -403,7 +403,9 @@ def tif_list_to_zarr(
         if kept_num == 0:
             continue
 
-        processed_img = preprocess_img(raw_img, preprocess_dict)
+        # Semantic-only workflow normalizes independently at patch scale.
+        # This must match the inference normalization granularity.
+        processed_img = raw_img if normalize_per_patch else preprocess_img(raw_img, preprocess_dict)
 
         # Never build label channels on the complete TIFF. Generate the first
         # patch now only to determine the output-channel count.
@@ -439,7 +441,7 @@ def tif_list_to_zarr(
                 expected_raw_channels,
                 output_label_channel_num,
                 spatial_patch_size,
-                raw_dtype=processed_img.dtype,
+                raw_dtype=np.float32 if normalize_per_patch else processed_img.dtype,
                 label_dtype="uint8",
                 overwrite=False,
             )
@@ -458,6 +460,8 @@ def tif_list_to_zarr(
 
             raw_patch = _crop_patch(processed_img, coord)
             raw_patch = reflect_padding_img(raw_patch, spatial_patch_size)
+            if normalize_per_patch:
+                raw_patch = preprocess_img(raw_patch, preprocess_dict)
             data_raw[patch_id, :, :, :, :] = raw_patch
 
             # Key change: crop original GT first; P/main pruning therefore sees

@@ -36,6 +36,8 @@ class Base_Workflow(ABC):
         self.chart_dir = cfg.PATHS.RESULT_DIR.OUTPUT_CHART
         self.patch_size = tuple(cfg.DATA.PATCH_SIZE)
         self.norm_type = cfg.DATA.NORMALIZATION.TYPE
+        if str(cfg.DATA.NORMALIZATION.SCOPE).lower() != "patch":
+            raise ValueError("DATA.NORMALIZATION.SCOPE must be 'patch' for consistent train/infer normalization")
         self.reflect_to_complete_shape = cfg.DATA.REFLECT_TO_COMPLETE_SHAPE
         self.perc_clip_flag = cfg.DATA.NORMALIZATION.PERC_CLIP.ENABLE
         self.perc_clip_range = [cfg.DATA.NORMALIZATION.PERC_CLIP.LOWER_PERC, cfg.DATA.NORMALIZATION.PERC_CLIP.UPPER_PERC]

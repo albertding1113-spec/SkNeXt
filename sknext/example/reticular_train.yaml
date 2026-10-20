@@ -1,0 +1,64 @@
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: ''
+
+TASK:
+    CHANNELS: ["S.reticular"]
+    CHANNEL_WEIGHTS: [1]
+
+DATA:
+    PATCH_SIZE: [32, 256, 256, 1]
+    NORMALIZATION:
+        TYPE: "zero_mean_unit_variance"
+    TRAIN:
+        PATH: '/raw'
+        GT_PATH: '/label'
+    VAL:
+        PATH: '/raw'
+        GT_PATH: '/label'
+    INFER:
+        PATH: ''
+        GT_PATH: '/.ome.zarr'
+        CHANNEL: [0]
+
+AUGMENTOR:
+    ENABLE: True
+    CUT_OUT: True
+    RANDOM_ROT: True
+    ZOOM: True
+    ZOOM_RANGE: [0.8, 1.2]
+    VFLIP: True
+    HFLIP: True
+    ZFLIP: True
+    BRIGHTNESS: True
+    BRIGHTNESS_FACTOR: [-0.1, 0.1]
+    CONTRAST: True
+    CONTRAST_FACTOR: [-0.1, 0.1]
+    AFFINE_MODE: "reflect"
+
+MODEL:
+    ARCHITECTURE: "unext_v2"
+    LOAD_CHECKPOINT: False
+    FEATURE_MAPS: [32, 64, 128, 256, 320]
+
+TRAIN:
+    ENABLE: True
+    RESUME: False
+    OPTIMIZER: "ADAMW"
+    LR: 1.E-4
+    BATCH_SIZE: 16
+    EPOCHS: 400
+    PATIENCE: 100
+    LR_SCHEDULER:
+        NAME: "warmupcosine"
+        MIN_LR: 1.E-6
+        WARMUP_COSINE_DECAY_EPOCHS: 5
+
+INFER:
+    ENABLE: False
+    THRESHOLD: 0.5
+    SAVE_PROBABILITIES: True
+

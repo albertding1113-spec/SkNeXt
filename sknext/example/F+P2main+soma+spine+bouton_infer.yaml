@@ -19,10 +19,6 @@ TASK:
 DATA:
     PATCH_SIZE: [32, 256, 256, 1]
     NORMALIZATION:
-        PERC_CLIP:
-            ENABLE: True
-            LOWER_PERC: 1.0
-            UPPER_PERC: 99.5
         TYPE: "zero_mean_unit_variance"
     TRAIN:
         PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260618_SkNeXt_dataset/train/raw'
@@ -47,7 +43,7 @@ AUGMENTOR:
     CUT_OUT: True
     RANDOM_ROT: True
     ZOOM: True
-    ZOOM_RANGE: [0.7, 1.3]
+    ZOOM_RANGE: [0.8, 1.2]
     VFLIP: True
     HFLIP: True
     ZFLIP: True
@@ -58,11 +54,13 @@ AUGMENTOR:
     AFFINE_MODE: "reflect"
 
 MODEL:
-    LOAD_CHECKPOINT: False
+    ARCHITECTURE: "unext_v2"
+    LOAD_CHECKPOINT: True
     FEATURE_MAPS: [32, 64, 128, 256, 320]
 
 TRAIN:
-    ENABLE: True
+    ENABLE: False
+    RESUME: False
     OPTIMIZER: "ADAMW"
     LR: 1.E-4
     BATCH_SIZE: 16
@@ -74,7 +72,10 @@ TRAIN:
         WARMUP_COSINE_DECAY_EPOCHS: 5
 
 INFER:
-    ENABLE: False
+    ENABLE: True
+    OUTPUT_MODE: "uint16" # "uint16", "float32", "both"
+    SKELETON:
+        ENABLE: True
     POST_PROCESSING:
         ENABLE: True
         OPERATIONS: ["fill_holes"]
