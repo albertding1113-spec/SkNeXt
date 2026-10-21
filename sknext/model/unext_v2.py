@@ -231,7 +231,8 @@ class U_NeXt_V2(nn.Module):
         )
 
         # depthwise kernel size for ConvNeXt block
-        kernel_size = (7, 7) if self.ndim == 2 else (7, 7, 7)
+        def stage_kernel(isotropic):
+            return (7, 7) if self.ndim == 2 else ((7, 7, 7) if isotropic else (1, 7, 7))
 
         # Encoder
         stage_block_id = 0
@@ -242,8 +243,7 @@ class U_NeXt_V2(nn.Module):
             sd_probs_stage = []
 
             # adjust depthwise kernel size if needed
-            if not isotropy[i] and self.ndim == 3:
-                kernel_size = (1, 7, 7)
+            kernel_size = stage_kernel(isotropy[i])
 
             # ConvNeXtBlocks
             for _ in range(cn_layers[i]):
@@ -274,8 +274,7 @@ class U_NeXt_V2(nn.Module):
 
         # BOTTLENECK
         stage = nn.ModuleList()
-        if not isotropy[-1] and self.ndim == 3:
-            kernel_size = (1, 7, 7)
+        kernel_size = stage_kernel(isotropy[-1])
         for _ in range(cn_layers[-1]):
             sd_prob = stochastic_depth_prob * stage_block_id / (total_stage_blocks - 1.0)
             stage.append(ConvNeXtBlock_V2(self.ndim, conv, feature_maps[-1], sd_prob, layer_norm, k_size=kernel_size))
@@ -288,8 +287,7 @@ class U_NeXt_V2(nn.Module):
         for j in range(self.num_decoders):
             in_channels = feature_maps[-1]
             for i in range(self.depth - 1, -1, -1):
-                if not isotropy[i] and self.ndim == 3:
-                    kernel_size = (1, 7, 7)
+                kernel_size = stage_kernel(isotropy[i])
                 self.up_paths[j].append(
                     UpConvNeXtBlock_V2(
                         ndim=self.ndim,

@@ -36,7 +36,7 @@ class SkNeXt_Config:
 
         # 3. TASK
         _C.TASK = CN()
-        # Options: "F", "P", "C", "A", "S.[channel]".
+        # Options: "F", "P", "C", "A", "S.[channel]", or exclusively "SR".
         # "F" stands for "Foreground".
         # "P" stands for "Center part".
         # "C" stands for "Contour".
@@ -80,6 +80,34 @@ class SkNeXt_Config:
         # Thresholds for growth masks. List of float between 0 and 1.
         # If not provided or "auto" will be automatically calculated.
         _C.TASK.WATERSHED.GROWTH_MASK_CHANNELS_THRESH = []
+
+        # 3. SR image restoration (deconvolution + denoising + super-resolution).
+        # Enabled exclusively by TASK.CHANNELS: ["SR"]. 1/2/4 scale XY only.
+        _C.SR = CN()
+        _C.SR.UPSAMPLE = 1
+        # Auto uses integer dtype's full range; floats must be within [0,1].
+        # Provide [min,max] to use calibrated ranges, especially for microscopy
+        # images occupying only a small fraction of uint16 dynamic range.
+        _C.SR.RAW_RANGE = []
+        _C.SR.GT_RANGE = []
+        _C.SR.RESCALE_GT = True
+        _C.SR.OUTPUT_CLIP = True
+        _C.SR.LOSS_L1_WEIGHT = 1.0
+        _C.SR.LOSS_MSE_WEIGHT = 0.1
+        _C.SR.LOSS_EDGE_WEIGHT = 0.05
+        # Legacy SR-only options, mapped to the shared AUGMENTOR at training time.
+        # Prefer AUGMENTOR.GAUSSIAN_NOISE/NOISE_STD and G_BLUR/G_SIGMA.
+        _C.SR.AUGMENT_NOISE_STD = 0.0
+        _C.SR.AUGMENT_BLUR_SIGMA = 0.0
+        _C.SR.INFER = CN()
+        # SR patch context comes from DATA.INFER.PADDING; block I/O sizes come
+        # from DATA.INFER.BLOCK_FACTOR and BLOCK_CENTRAL_FACTOR.
+        # Halo voxels on each input patch; only central voxels are committed.
+        _C.SR.INFER.OVERWRITE = False
+        # Resume interrupted tiled inference from an atomic per-volume manifest.
+        _C.SR.INFER.RESUME = True
+        # If TIFF/IMS lacks voxel-size metadata, specify physical ZYX sizes here.
+        _C.SR.INFER.VOXEL_SIZE = []
 
         # 4. DATA
         _C.DATA = CN()
@@ -236,6 +264,9 @@ class SkNeXt_Config:
         # Parameter that defines the handling of newly created pixels with the elastic transformation
         _C.AUGMENTOR.E_MODE = "constant"
         # Gaussian blur
+        # Raw-only Gaussian acquisition noise (normalized image units).
+        _C.AUGMENTOR.GAUSSIAN_NOISE = False
+        _C.AUGMENTOR.NOISE_STD = (0.0, 0.03)
         _C.AUGMENTOR.G_BLUR = False
         # Standard deviation of the gaussian kernel. Values in the range 0.0 (no blur) to 3.0 (strong blur) are common.
         _C.AUGMENTOR.G_SIGMA = (1.0, 2.0)

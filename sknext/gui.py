@@ -59,12 +59,13 @@ def set_value(cfg, path, value):
     cfg[parts[-1]] = value
 
 
-def parse_value(text, default):
+def parse_value(text, default, *, allow_bool=False):
     """Convert a form value to the type of its configuration default.
 
     Args:
         text: Entry text, or a boolean supplied by a Tk BooleanVar.
         default: Reference value defining the expected scalar or sequence type.
+        allow_bool: Also accept a boolean for a sequence field such as isotropy.
 
     Returns:
         Parsed value; strings remain literal and sequences preserve the default type.
@@ -77,8 +78,10 @@ def parse_value(text, default):
     if isinstance(default, bool):
         return bool(text)
     try:
-        value = ast.literal_eval(text)
+        value = text if allow_bool and type(text) is bool else ast.literal_eval(text)
         if isinstance(default, (tuple, list)):
+            if allow_bool and type(value) is bool:
+                return value
             if not isinstance(value, (tuple, list)):
                 raise ValueError("expected a list such as [1, 2, 3]")
             return type(default)(value)
@@ -117,8 +120,9 @@ def validate(cfg, run_id, workdir):
     require(bool(cfg.TASK.CHANNELS), "Choose at least one task channel.")
     levels = len(cfg.MODEL.FEATURE_MAPS)
     require(levels >= 2, "Model requires at least two feature levels.")
-    for key in ("ISOTROPY", "CONVNEXT_LAYERS"):
-        require(len(cfg.MODEL[key]) == levels, f"MODEL.{key} must match FEATURE_MAPS length.")
+    if not isinstance(cfg.MODEL.ISOTROPY, bool):
+        vector(cfg.MODEL.ISOTROPY, levels, lambda x: type(x) is bool, "MODEL.ISOTROPY")
+    vector(cfg.MODEL.CONVNEXT_LAYERS, levels, positive_int, "MODEL.CONVNEXT_LAYERS")
     for key in ("Z_DOWN", "YX_DOWN"):
         vector(cfg.MODEL[key], levels - 1, positive_int, f"MODEL.{key}")
     vector(cfg.DATA.INFER.BLOCK_FACTOR, 3, positive_int, "Block factor")
@@ -133,15 +137,20 @@ def validate(cfg, run_id, workdir):
     paths = [cfg.DATA.TRAIN.PATH, cfg.DATA.TRAIN.GT_PATH,
              cfg.DATA.VAL.PATH, cfg.DATA.VAL.GT_PATH] if cfg.TRAIN.ENABLE else [cfg.DATA.INFER.PATH]
     if cfg.INFER.ENABLE:
-        # The current inference loop always uses SkeletonManager and SWC seeds.
-        require(cfg.INFER.SKELETON.ENABLE, "Current inference requires skeleton seeds.")
-        paths.append(cfg.DATA.INFER.SKELETON_PATH)
+        is_sr = list(cfg.TASK.CHANNELS) == ["SR"]
+        save_segmentation = str(cfg.INFER.OUTPUT_MODE).lower().strip() in {"uint16", "both"}
+        needs_skeleton = (not is_sr and cfg.INFER.SKELETON.ENABLE
+                          and (save_segmentation or not cfg.INFER.RAW_ALL_BLOCKS))
+        if needs_skeleton:
+            paths.append(cfg.DATA.INFER.SKELETON_PATH)
         require(len(cfg.DATA.INFER.CHANNEL) == cfg.DATA.PATCH_SIZE[3],
                 "Inference channel count must match patch size C.")
     for path in paths:
         require(bool(path.strip()) and (workdir / path).exists(), f"Input path does not exist: {path}")
     if cfg.INFER.ENABLE or cfg.MODEL.LOAD_CHECKPOINT:
-        checkpoint = workdir / cfg.PATHS.CHECKPOINT_DIR / f"checkpoint_{run_id:02d}.pth"
+        checkpoint = (workdir / Path(cfg.MODEL.CHECKPOINT_INPUT_PATH).expanduser()
+                      if cfg.MODEL.CHECKPOINT_INPUT_PATH else
+                      workdir / cfg.PATHS.CHECKPOINT_DIR / f"checkpoint_{run_id:02d}.pth")
         require(checkpoint.is_file(), f"Checkpoint does not exist: {checkpoint}")
 
 
@@ -312,7 +321,8 @@ class Application(ttk.Frame):
         cfg = self.cfg.clone()
         for path, variable in self.variables.items():
             try:
-                set_value(cfg, path, parse_value(variable.get(), self.defaults[path]))
+                set_value(cfg, path, parse_value(variable.get(), self.defaults[path],
+                                                 allow_bool=path == "MODEL.ISOTROPY"))
             except ValueError as error:
                 raise ValueError(f"{path}: {error}") from error
         cfg.TRAIN.ENABLE = self.workflow.get() == "Training"
@@ -335,7 +345,8 @@ class Application(ttk.Frame):
             for key, value in leaves(cfg):
                 if isinstance(self.defaults[key], bool) and type(value) is not bool:
                     raise ValueError(f"{key}: expected a boolean")
-                parse_value(value if isinstance(value, (str, bool)) else repr(value), self.defaults[key])
+                parse_value(value if isinstance(value, (str, bool)) else repr(value), self.defaults[key],
+                            allow_bool=key == "MODEL.ISOTROPY")
             self.populate(cfg)
             self.status.set(f"Loaded {Path(path).name}")
         except Exception as error:

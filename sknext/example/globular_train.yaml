@@ -61,4 +61,9 @@ INFER:
     ENABLE: False
     THRESHOLD: 0.5
     SAVE_PROBABILITIES: True
+    POST_PROCESSING:
+        ENABLE: True
+        OPERATIONS: ["fill_holes"]
+        VALUES: [None]
+
 

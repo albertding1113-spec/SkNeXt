@@ -512,6 +512,9 @@ class Segmentation_Workflow(Base_Workflow):
         exports charts every five epochs, saves improved validation checkpoints,
         and stops after the configured patience without improvement.
         """
+        if "SR" in self.channels:
+            from sknext.run.restoration_workflow import RestorationWorkflow
+            return RestorationWorkflow(self.cfg, self.device, self.job_id).train()
         print(f"{time_str()} preparing training data", flush=True)
         self.save_patch_as_zarr()
         print(f"{time_str()} preparing data loader", flush=True)
@@ -658,6 +661,9 @@ class Segmentation_Workflow(Base_Workflow):
         written, so that a resumed run regenerates an interrupted block in both
         stores. Float32-only mode does not perform watershed or postprocessing.
         """
+        if "SR" in self.channels:
+            from sknext.run.restoration_workflow import RestorationWorkflow
+            return RestorationWorkflow(self.cfg, self.device, self.job_id).infer()
         print(f"{time_str()} preparing model", flush=True)
         self.set_model()
         print_model_parameters(self.model)
@@ -1244,7 +1250,16 @@ class Segmentation_Workflow(Base_Workflow):
 
 
     def run(self):
-        """Run training when enabled, otherwise inference when enabled, then close logs."""
+        """Dispatch SR to an isolated regression workflow; otherwise segment."""
+        if "SR" in self.channels:
+            if list(self.channels) != ["SR"]:
+                raise ValueError('TASK.CHANNELS: ["SR"] cannot be combined with F/P/C/A/S.*')
+            from sknext.run.restoration_workflow import RestorationWorkflow
+            try:
+                RestorationWorkflow(self.cfg, self.device, self.job_id).run()
+            finally:
+                self.log_writer.close()
+            return
         if self.cfg.TRAIN.ENABLE:
             print(f"{time_str()} start instance segmentation training", flush=True)
             self.train()

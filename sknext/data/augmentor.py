@@ -1225,3 +1225,222 @@ def _map_coordinates(image: NDArray, dx: NDArray, dy: NDArray, order: int = 1, c
 
         return result
 
+
+
+class PairedAugmentor:
+    """One augmentation policy for segmentation and fluorescence restoration.
+
+    Inputs/targets use ZYXC. Spatial transforms share one sampled parameter
+    set and one physical coordinate system. For SR, a target pixel at HR index
+    ``j`` corresponds to LR coordinate ``(j + .5) / scale - .5``; this
+    pixel-center convention is maintained for every geometric transform.
+
+    Segmentation targets are sampled with nearest-neighbor interpolation;
+    SR targets are continuous and use linear interpolation. Photometric
+    changes and simulated acquisition defects affect *only* the raw input.
+    The caller must skip this class for validation and inference.
+    """
+
+    def __init__(self, cfg, task: str = "segmentation", scale: int = 1,
+                 legacy_noise_std: float = 0.0,
+                 legacy_blur_sigma: float = 0.0):
+        from scipy.ndimage import gaussian_filter, map_coordinates
+        self._gaussian_filter = gaussian_filter
+        self._map_coordinates = map_coordinates
+        self.task = str(task).lower()
+        if self.task not in ("segmentation", "sr"):
+            raise ValueError("task must be 'segmentation' or 'sr'")
+        if int(scale) != scale or int(scale) < 1:
+            raise ValueError("scale must be a positive integer")
+        self.scale = int(scale)
+        if self.task == "segmentation" and self.scale != 1:
+            raise ValueError("Segmentation requires scale=1")
+        self.cfg = cfg.get("AUGMENTOR", cfg) if isinstance(cfg, dict) else getattr(cfg, "AUGMENTOR", cfg)
+        self.enable = bool(self._get("ENABLE", True))
+        self.prob = float(self._get("DA_PROB", 0.5))
+        if not 0 <= self.prob <= 1:
+            raise ValueError("AUGMENTOR.DA_PROB must be in [0,1]")
+        if legacy_noise_std < 0 or legacy_blur_sigma < 0:
+            raise ValueError("legacy SR noise/blur sigma must be >= 0")
+        self.legacy_noise_std = float(legacy_noise_std)
+        self.legacy_blur_sigma = float(legacy_blur_sigma)
+
+    def _get(self, key, default=None):
+        if isinstance(self.cfg, dict):
+            return self.cfg.get(key, default)
+        return getattr(self.cfg, key, default)
+
+    def _enabled(self, key, probability=None):
+        return bool(self._get(key, False)) and random.random() < (
+            self.prob if probability is None else probability)
+
+    @staticmethod
+    def _sample(value, name: str, positive: bool = False) -> float:
+        if isinstance(value, (tuple, list, np.ndarray)):
+            if len(value) != 2:
+                raise ValueError(f"{name} must be a scalar or a two-element range")
+            low, high = map(float, value)
+        else:
+            low = high = float(value)
+        if not np.isfinite((low, high)).all() or low > high or (positive and low <= 0):
+            raise ValueError(f"Invalid {name} interval: {(low, high)}")
+        return random.uniform(low, high)
+
+    def _validate(self, raw, target):
+        raw, target = np.asarray(raw), np.asarray(target)
+        if raw.ndim != 4 or target.ndim != 4:
+            raise ValueError("Augmentation expects raw and target in ZYXC order")
+        if raw.shape[0] != target.shape[0] or target.shape[1] != raw.shape[1] * self.scale \
+                or target.shape[2] != raw.shape[2] * self.scale:
+            raise ValueError(f"Paired spatial shapes do not match scale={self.scale}: "
+                             f"raw={raw.shape}, target={target.shape}")
+        if not np.issubdtype(raw.dtype, np.floating):
+            raise TypeError("Raw patches must be floating point after normalization")
+        return raw, target
+
+    def _warp_one(self, image: np.ndarray, lr_shape: tuple[int, int],
+                  scale: int, matrix: np.ndarray, offset: tuple[float, float],
+                  zoom_z: float, field: tuple[np.ndarray, np.ndarray] | None,
+                  mode: str, order: int) -> np.ndarray:
+        """Sample one array in the LR physical coordinate frame, a Z slice at a time."""
+        z_count, height, width, channels = image.shape
+        lr_h, lr_w = lr_shape
+        yy, xx = np.meshgrid(np.arange(height, dtype=np.float32),
+                             np.arange(width, dtype=np.float32), indexing="ij")
+        # Convert destination HR centers into LR pixel-center coordinates.
+        yy = (yy + 0.5) / scale - 0.5
+        xx = (xx + 0.5) / scale - 0.5
+        cy, cx = (lr_h - 1) / 2.0, (lr_w - 1) / 2.0
+        dy, dx = yy - cy, xx - cx
+        source_y = matrix[0, 0] * dy + matrix[0, 1] * dx + cy + offset[0]
+        source_x = matrix[1, 0] * dy + matrix[1, 1] * dx + cx + offset[1]
+        if field is not None:
+            if scale == 1:
+                disp_y, disp_x = field
+            else:
+                # One LR displacement field, resampled at HR physical positions.
+                disp_y = self._map_coordinates(field[0], (yy, xx), order=1,
+                                               mode="reflect", prefilter=False)
+                disp_x = self._map_coordinates(field[1], (yy, xx), order=1,
+                                               mode="reflect", prefilter=False)
+            source_y = source_y + disp_y
+            source_x = source_x + disp_x
+        # Convert LR source coordinate back to this array's pixel centers.
+        source_y = (source_y + 0.5) * scale - 0.5
+        source_x = (source_x + 0.5) * scale - 0.5
+        # Reduce repeated work across channels while keeping memory bounded by YX.
+        coords_y = np.asarray(source_y, dtype=np.float32)
+        coords_x = np.asarray(source_x, dtype=np.float32)
+        coords_z = np.empty((height, width), dtype=np.float32)
+        result = np.empty_like(image)
+        for z in range(z_count):
+            coords_z.fill((z - (z_count - 1) / 2) / zoom_z + (z_count - 1) / 2)
+            for c in range(channels):
+                result[z, :, :, c] = self._map_coordinates(
+                    image[..., c], (coords_z, coords_y, coords_x),
+                    order=order, mode=mode, cval=0.0,
+                    prefilter=False,
+                )
+        return result
+
+    def _paired_warp(self, raw, target, matrix=None, offset=(0., 0.),
+                     zoom_z=1.0, field=None, mode="reflect"):
+        if mode not in {"constant", "reflect", "wrap", "mirror", "nearest", "symmetric"}:
+            raise ValueError(f"Unsupported AUGMENTOR mode: {mode!r}")
+        if mode == "symmetric":
+            mode = "mirror"
+        if matrix is None:
+            matrix = np.eye(2, dtype=np.float32)
+        lr_shape = raw.shape[1:3]
+        raw_out = self._warp_one(raw, lr_shape, 1, matrix, offset, zoom_z,
+                                 field, mode, order=1)
+        target_out = self._warp_one(target, lr_shape, self.scale, matrix, offset,
+                                    zoom_z, field, mode,
+                                    order=0 if self.task == "segmentation" else 1)
+        return raw_out, target_out
+
+    def __call__(self, raw: NDArray, target: NDArray) -> tuple[NDArray, NDArray]:
+        raw, target = self._validate(raw, target)
+        if not self.enable:
+            return np.ascontiguousarray(raw), np.ascontiguousarray(target)
+
+        # Raw-only photometric augmentations. SR targets must retain calibrated GT.
+        if self._enabled("CUT_OUT", self.prob / 5):
+            if self.task == "segmentation":
+                raw, target = cutout(raw, target)
+            else:
+                raw = cutout(raw)  # missing raw signal is NOT missing GT anatomy
+        blur_configured = bool(self._get("G_BLUR", False))
+        blur = self._enabled("G_BLUR")
+        if (not blur_configured and self.task == "sr"
+                and self.legacy_blur_sigma > 0 and random.random() < self.prob):
+            blur = True
+        if blur:
+            sigma = (self._get("G_SIGMA", (1., 2.)) if blur_configured
+                     else self.legacy_blur_sigma)
+            if self.task == "sr":
+                sigma = self._sample(sigma, "G_SIGMA")
+                if sigma < 0:
+                    raise ValueError("G_SIGMA must be nonnegative")
+                raw = self._gaussian_filter(raw, sigma=(0, sigma, sigma, 0))
+            else:
+                raw = gaussian_blur(raw, sigma)
+        if self._enabled("MEDIAN_BLUR"):
+            raw = median_blur(raw, self._get("MB_KERNEL", (3, 7)))
+        if self._enabled("GAMMA_CONTRAST"):
+            raw = gamma_contrast(raw, self._get("GC_GAMMA", (0.8, 1.5)))
+        if self._enabled("BRIGHTNESS"):
+            raw = brightness(raw, self._get("BRIGHTNESS_FACTOR", (-.05, .05)))
+        if self._enabled("CONTRAST"):
+            raw = contrast(raw, self._get("CONTRAST_FACTOR", (-.1, .1)))
+        noise_configured = bool(self._get("GAUSSIAN_NOISE", False))
+        if self._enabled("GAUSSIAN_NOISE"):
+            sigma = self._sample(self._get("NOISE_STD", (0.0, 0.03)), "NOISE_STD")
+            if sigma < 0:
+                raise ValueError("NOISE_STD must be nonnegative")
+            raw = raw + np.random.normal(0, sigma, raw.shape).astype(np.float32)
+        elif (not noise_configured and self.task == "sr"
+              and self.legacy_noise_std > 0 and random.random() < self.prob):
+            raw = raw + np.random.normal(0, self.legacy_noise_std, raw.shape).astype(np.float32)
+
+        # Geometric transforms are shared by both resolutions and target types.
+        mode = str(self._get("AFFINE_MODE", "reflect"))
+        if self._enabled("RANDOM_ROT"):
+            angle = np.deg2rad(self._sample(self._get("RANDOM_ROT_RANGE", (-180., 180.)), "RANDOM_ROT_RANGE"))
+            cs, sn = float(np.cos(angle)), float(np.sin(angle))
+            raw, target = self._paired_warp(raw, target, matrix=np.array([[cs, -sn], [sn, cs]]), mode=mode)
+        if self._enabled("SHEAR"):
+            lohi = self._get("SHEAR_RANGE", (-20, 20))
+            shear_y = np.tan(np.deg2rad(self._sample(lohi, "SHEAR_RANGE")))
+            shear_x = np.tan(np.deg2rad(self._sample(lohi, "SHEAR_RANGE")))
+            raw, target = self._paired_warp(raw, target,
+                                             matrix=np.array([[1., shear_y], [shear_x, 1.]]), mode=mode)
+        if self._enabled("ZOOM"):
+            zoom_value = self._sample(self._get("ZOOM_RANGE", (.9, 1.1)), "ZOOM_RANGE", positive=True)
+            zoom_z = zoom_value if bool(self._get("ZOOM_IN_Z", False)) else 1.0
+            raw, target = self._paired_warp(raw, target,
+                                             matrix=np.eye(2) / zoom_value,
+                                             zoom_z=zoom_z, mode=mode)
+        if self._enabled("SHIFT"):
+            rg = self._get("SHIFT_RANGE", (.1, .2))
+            lr_h, lr_w = raw.shape[1:3]
+            ty = self._sample(rg, "SHIFT_RANGE") * lr_h
+            tx = self._sample(rg, "SHIFT_RANGE") * lr_w
+            raw, target = self._paired_warp(raw, target, offset=(-ty, -tx), mode=mode)
+        if self._enabled("ELASTIC"):
+            alpha = self._sample(self._get("E_ALPHA", (12., 16.)), "E_ALPHA")
+            sigma = self._sample(self._get("E_SIGMA", 4.), "E_SIGMA", positive=True)
+            height, width = raw.shape[1:3]
+            dy = self._gaussian_filter(np.random.uniform(-1, 1, (height, width)).astype(np.float32), sigma)
+            dx = self._gaussian_filter(np.random.uniform(-1, 1, (height, width)).astype(np.float32), sigma)
+            raw, target = self._paired_warp(raw, target,
+                                             field=(alpha * dy, alpha * dx),
+                                             mode=str(self._get("E_MODE", "constant")))
+        for key, axis in (("HFLIP", 2), ("VFLIP", 1), ("ZFLIP", 0)):
+            if self._enabled(key):
+                raw, target = np.flip(raw, axis=axis), np.flip(target, axis=axis)
+
+        if self.task == "sr":
+            # Intensity-normalized input domain: never clip or augment the GT.
+            raw = np.clip(raw, 0., 1.)
+        return np.ascontiguousarray(raw, dtype=np.float32), np.ascontiguousarray(target)

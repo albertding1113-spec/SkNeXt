@@ -1,2 +1,3 @@
 [console_scripts]
 sknext = sknext:main
+sknext-gui = sknext.gui:main

@@ -1,0 +1,55 @@
+# Merge these overrides with the updated SkNeXt_Config defaults.
+# Raw: train_0001.tif ; GT: train_0001.SR.tif ; both ZYX/CZYX TIFF.
+TASK:
+  CHANNELS: ["SR"]
+
+SR:
+  UPSAMPLE: 1                    # 1, 2, or 4; XY only, Z unchanged
+  RESCALE_GT: True              # resize GT XY when shape is not (Z,Y*factor,X*factor)
+  OUTPUT_CLIP: True             # clamp inference values to [0,1]
+
+DATA:
+  PATCH_SIZE: [32, 256, 256, 1]
+  TRAIN:
+    PATH: "/path/to/train/raw"
+    GT_PATH: "/path/to/train/gt"
+  VAL:
+    PATH: "/path/to/val/raw"
+    GT_PATH: "/path/to/val/gt"
+  INFER:
+    PATH: "/path/to/infer/raw"  # directory TIFF, TIFF file, OME-Zarr, or IMS
+    GT_PATH: '/.ome.zarr'
+    CHANNEL: [0]
+
+AUGMENTOR:
+  ENABLE: True
+  HFLIP: True
+  VFLIP: True
+  ZFLIP: True
+  RANDOM_ROT: True
+  G_BLUR: True
+  G_SIGMA: [0.0, 0.6]
+  GAUSSIAN_NOISE: True
+  NOISE_STD: [0.0, 0.02]
+  AFFINE_MODE: "reflect"
+
+MODEL:
+    ARCHITECTURE: "unext_v2"
+    LOAD_CHECKPOINT: False
+    FEATURE_MAPS: [32, 64, 128, 256, 320]
+
+TRAIN:
+    ENABLE: True
+    RESUME: False
+    OPTIMIZER: "ADAMW"
+    LR: 1.E-4
+    BATCH_SIZE: 16
+    EPOCHS: 600
+    PATIENCE: 200
+    LR_SCHEDULER:
+        NAME: "warmupcosine"
+        MIN_LR: 1.E-6
+        WARMUP_COSINE_DECAY_EPOCHS: 5
+
+INFER:
+  ENABLE: false

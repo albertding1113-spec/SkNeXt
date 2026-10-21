@@ -2,10 +2,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sknext.config.config import SkNeXt_Config, load_config, update_config
-from sknext.gui import discover_gpus, parse_value, validate
+from sknext.gui import Application, discover_gpus, leaves, parse_value, validate
 
 
 class LauncherTests(unittest.TestCase):
@@ -29,6 +30,63 @@ class LauncherTests(unittest.TestCase):
         with patch("sknext.gui.subprocess.run") as run:
             run.return_value.stdout = "2, GPU-abc, NVIDIA Example, 100, 200\n"
             self.assertEqual(discover_gpus(), {"GPU 2 · NVIDIA Example · 100/200 MiB free": "GPU-abc"})
+
+    def test_isotropy_boolean_fields(self):
+        for value in (True, False, "True", "False"):
+            self.assertIs(parse_value(value, [True], allow_bool=True), value in (True, "True"))
+        self.assertEqual(parse_value("[False, True]", [True], allow_bool=True), [False, True])
+        with self.assertRaises(ValueError):
+            parse_value("True", [1])
+
+    def test_optional_skeletons_and_custom_checkpoint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            (workdir / "raw").mkdir()
+            checkpoint = workdir / "custom.pth"
+            checkpoint.touch()
+            cfg = SkNeXt_Config(0).get_cfg_defaults()
+            cfg.TRAIN.ENABLE = False
+            cfg.INFER.ENABLE = True
+            cfg.MODEL.CHECKPOINT_INPUT_PATH = "custom.pth"
+            cfg.DATA.INFER.SKELETON_PATH = "missing-skeletons"
+            cfg.INFER.SKELETON.ENABLE = False
+            for isotropy in (True, False, [False, True, True, True, True]):
+                cfg.MODEL.ISOTROPY = isotropy
+                validate(cfg, 0, workdir)
+            cfg.INFER.SKELETON.ENABLE = True
+            with self.assertRaisesRegex(ValueError, "missing-skeletons"):
+                validate(cfg, 0, workdir)
+            cfg.TASK.CHANNELS = ["SR"]
+            validate(cfg, 0, workdir)
+            cfg.TASK.CHANNELS = ["F", "P"]
+            cfg.INFER.OUTPUT_MODE = "float32"
+            cfg.INFER.RAW_ALL_BLOCKS = True
+            validate(cfg, 0, workdir)
+            cfg.MODEL.CHECKPOINT_INPUT_PATH = str(checkpoint)
+            validate(cfg, 0, workdir)
+            checkpoint.unlink()
+            with self.assertRaisesRegex(ValueError, "Checkpoint"):
+                validate(cfg, 0, workdir)
+
+    def test_boolean_isotropy_survives_form_collection(self):
+        class Variable:
+            def __init__(self, value=""):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+
+        cfg = SkNeXt_Config(0).get_cfg_defaults()
+        defaults = dict(leaves(cfg))
+        app = SimpleNamespace(defaults=defaults,
+                              variables={path: Variable() for path in defaults},
+                              workflow=Variable(), run_id=Variable("0"))
+        for value in (True, False, [False, True, True, True, True]):
+            cfg.MODEL.ISOTROPY = value
+            Application.populate(app, cfg)
+            result, _ = Application.collect(app)
+            self.assertEqual(result.MODEL.ISOTROPY, value)
 
     def test_yaml_round_trip_recomputes_derived_paths(self):
         """Verify saved settings survive YAML reload and derived paths follow the new run ID."""

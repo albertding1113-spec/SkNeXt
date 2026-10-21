@@ -447,8 +447,14 @@ def infer(cfg: dict, run_id: int, device: torch.device, overwrite: bool=False) -
             raise ValueError('DATA.INFER.HALO must contain nonnegative ZYX widths')
         num_core = tuple(math.ceil(n / c) for n,c in zip(zyx, core_size))
         run_meta = {'source': str(source.resolve()), 'source_shape':list(zyx), 'channels':names,
+                    'format_version': 2,
                     'patch_size':list(spatial_patch(cfg)), 'core_size':list(core_size),
                     'halo':list(halo), 'input_channels':channels,
+                    'normalization': normalize_options(cfg),
+                    'overlap_voxels': list(overlap_voxels(cfg, 'INFER')),
+                    'skip_zero_patches': bool(cfgget(cfg, 'INFER.SKIP_ZERO_PATCHES', True)),
+                    'amp': amp,
+                    'batch_size': max(1, int(cfgget(cfg, 'TRAIN.BATCH_SIZE', 1))),
                     'checkpoint':str(checkpoint_read_path(cfg, run_id).resolve()),
                     'checkpoint_size':checkpoint_read_path(cfg, run_id).stat().st_size,
                     'checkpoint_mtime_ns':checkpoint_read_path(cfg, run_id).stat().st_mtime_ns,
