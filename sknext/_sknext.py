@@ -6,11 +6,10 @@ from pathlib import Path
 from typing import Optional, Dict
 from sknext.config.config import SkNeXt_Config, update_config, load_config
 from sknext.utils.utils import set_seed
-from sknext.run.networkflow import Segmentation_Workflow
 
 
 class SkNeXt:
-    """Configure and execute a CUDA-backed SkNeXt segmentation workflow.
+    """Configure and dispatch CUDA-backed segmentation or restoration.
 
     Combines YAML overrides with defaults, creates result directories, seeds
     random generators, and supplies the selected device to the workflow.
@@ -32,14 +31,28 @@ class SkNeXt:
         default_cfg = SkNeXt_Config(job_id=run_id).get_cfg_defaults()
         input_cfg = load_config(config)
         self.cfg = update_config(default_cfg, input_cfg, run_id)
+        channels = list(self.cfg.TASK.CHANNELS)
+        if not channels or any(not isinstance(ch, str) or
+                               (ch not in {"F", "P", "C", "A", "SR"} and
+                                not (ch.startswith("S.") and len(ch) > 2)) for ch in channels):
+            raise ValueError("TASK.CHANNELS must contain F/P/C/A, S.<name>, or exclusively SR")
+        if "SR" in channels and channels != ["SR"]:
+            raise ValueError('TASK.CHANNELS: ["SR"] cannot be combined with segmentation channels')
+        self.workflow = ("restoration" if channels == ["SR"] else
+                         "semantic" if all(ch.startswith("S.") for ch in channels) else "segmentation")
+        if bool(self.cfg.TRAIN.ENABLE) == bool(self.cfg.INFER.ENABLE):
+            raise ValueError("Choose exactly one: TRAIN.ENABLE=true or INFER.ENABLE=true")
+        # Semantic loss weights default to one per channel, rather than the
+        # two-channel F/P defaults of the instance workflow.
+        if self.workflow == "semantic" and "CHANNEL_WEIGHTS" not in input_cfg.get("TASK", {}):
+            self.cfg.TASK.CHANNEL_WEIGHTS = [1.0] * len(channels)
         self.run_id = run_id
         # create result dir from config
         Path(self.cfg.PATHS.RESULT_DIR.PATH_).mkdir(parents=True, exist_ok=True)
-        # set seed before model
-        set_seed()
         # setup CPU and GPU
         self.gpu = gpu
         self.setup_device()
+        set_seed()
 
 
     def setup_device(self):
@@ -61,7 +74,17 @@ class SkNeXt:
 
 
     def run(self):
-        """Construct the segmentation workflow and execute its configured training or inference."""
-        # determine task type 1. SEMANTIC 2. INSTANCE
-        self.task = Segmentation_Workflow(self.cfg, self.device, self.run_id)
-        self.task.run()
+        """Select the runner from TASK.CHANNELS, with mode supplied by the YAML."""
+        print(f"Workflow: {self.workflow}", flush=True)
+        if self.workflow == "semantic":
+            from sknext.run.semantic_workflow import run
+            # The semantic runner consumes ordinary nested dictionaries.
+            run(yaml.safe_load(self.cfg.dump()), self.run_id, self.device)
+        elif self.workflow == "restoration":
+            from sknext.run.restoration_workflow import RestorationWorkflow
+            self.task = RestorationWorkflow(self.cfg, self.device, self.run_id)
+            self.task.run()
+        else:
+            from sknext.run.networkflow import Segmentation_Workflow
+            self.task = Segmentation_Workflow(self.cfg, self.device, self.run_id)
+            self.task.run()

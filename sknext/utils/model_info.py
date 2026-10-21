@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+from sknext.utils.progress import log_message
 
 
 def bytes_to_mb(num_bytes: int) -> float:
@@ -32,9 +33,9 @@ def print_model_parameters(model: nn.Module, print_detail: bool = True):
     trainable_params = 0
     param_bytes = 0
 
-    print("=" * 120)
-    print("Model parameter summary")
-    print("=" * 120)
+    log_message("=" * 120)
+    log_message("Model parameter summary")
+    log_message("=" * 120)
 
     if print_detail:
         header = (
@@ -46,8 +47,8 @@ def print_model_parameters(model: nn.Module, print_detail: bool = True):
             f"{'size(MB)':10s} "
             f"{'device':10s}"
         )
-        print(header)
-        print("-" * 120)
+        log_message(header)
+        log_message("-" * 120)
 
     for name, param in model.named_parameters():
         numel = param.numel()
@@ -60,7 +61,7 @@ def print_model_parameters(model: nn.Module, print_detail: bool = True):
             trainable_params += numel
 
         if print_detail:
-            print(
+            log_message(
                 f"{name:70s} "
                 f"{str(tuple(param.shape)):25s} "
                 f"{str(param.dtype):15s} "
@@ -79,27 +80,29 @@ def print_model_parameters(model: nn.Module, print_detail: bool = True):
         buffer_params += numel
         buffer_bytes += size_bytes
 
-    print("-" * 120)
-    print(f"Total parameters:      {total_params:,}")
-    print(f"Trainable parameters:  {trainable_params:,}")
-    print(f"Frozen parameters:     {total_params - trainable_params:,}")
-    print(f"Parameter memory:      {bytes_to_mb(param_bytes):.2f} MB")
-    print(f"Buffer elements:       {buffer_params:,}")
-    print(f"Buffer memory:         {bytes_to_mb(buffer_bytes):.2f} MB")
-    print(f"Param + buffer memory: {bytes_to_mb(param_bytes + buffer_bytes):.2f} MB")
-    print("=" * 120)
+    log_message("-" * 120)
+    log_message(f"Total parameters:      {total_params:,}")
+    log_message(f"Trainable parameters:  {trainable_params:,}")
+    log_message(f"Frozen parameters:     {total_params - trainable_params:,}")
+    log_message(f"Parameter memory:      {bytes_to_mb(param_bytes):.2f} MB")
+    log_message(f"Buffer elements:       {buffer_params:,}")
+    log_message(f"Buffer memory:         {bytes_to_mb(buffer_bytes):.2f} MB")
+    log_message(f"Param + buffer memory: {bytes_to_mb(param_bytes + buffer_bytes):.2f} MB")
+    log_message("=" * 120)
 
 
 def print_cuda_memory(device: torch.device | None = None, prefix: str = ""):
     """
-    Print current cuda memory usage
-    Notice:
-    - memory_allocated: currently used memory
-    - memory_reserved: reserved memory
-    - max_memory_allocated: max allocated memory
+    Print allocator usage and device-wide free/used memory in MiB.
+
+    Allocated/reserved values belong to this PyTorch process. Peak values are
+    measured since the last CUDA peak reset. Device used includes other processes.
+    Explicit CPU devices skip CUDA queries, even on machines with a GPU.
     """
+    if device is not None and device.type != "cuda":
+        return
     if not torch.cuda.is_available():
-        print("CUDA is not available.")
+        log_message("CUDA is not available.", flush=True)
         return
 
     if device is None:
@@ -114,17 +117,18 @@ def print_cuda_memory(device: torch.device | None = None, prefix: str = ""):
 
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
 
-    print("=" * 80)
-    print(f"CUDA memory summary {prefix}")
-    print("=" * 80)
-    print(f"Device:                {device}")
-    print(f"Allocated:             {bytes_to_mb(allocated):.2f} MB")
-    print(f"Reserved:              {bytes_to_mb(reserved):.2f} MB")
-    print(f"Max allocated:         {bytes_to_mb(max_allocated):.2f} MB")
-    print(f"Max reserved:          {bytes_to_mb(max_reserved):.2f} MB")
-    print(f"Free memory:           {bytes_to_mb(free_bytes):.2f} MB")
-    print(f"Total memory:          {bytes_to_mb(total_bytes):.2f} MB")
-    print("=" * 80)
+    log_message("=" * 80, flush=True)
+    log_message(f"CUDA memory summary {prefix}")
+    log_message("=" * 80, flush=True)
+    log_message(f"Device:                {device}")
+    log_message(f"Allocated:             {bytes_to_mb(allocated):.2f} MiB")
+    log_message(f"Reserved:              {bytes_to_mb(reserved):.2f} MiB")
+    log_message(f"Max allocated:         {bytes_to_mb(max_allocated):.2f} MiB")
+    log_message(f"Max reserved:          {bytes_to_mb(max_reserved):.2f} MiB")
+    log_message(f"Device used:           {bytes_to_mb(total_bytes - free_bytes):.2f} MiB")
+    log_message(f"Free memory:           {bytes_to_mb(free_bytes):.2f} MiB")
+    log_message(f"Total memory:          {bytes_to_mb(total_bytes):.2f} MiB")
+    log_message("=" * 80, flush=True)
 
 
 @torch.no_grad()
@@ -161,10 +165,10 @@ def profile_forward_memory(
     print_cuda_memory(device, prefix="after forward")
 
     if isinstance(out, dict):
-        print("Output:")
+        log_message("Output:")
         for key, value in out.items():
-            print(f"  {key}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}")
+            log_message(f"  {key}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}")
     else:
-        print(f"Output shape: {tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
+        log_message(f"Output shape: {tuple(out.shape)}, dtype={out.dtype}, device={out.device}")
 
     return out

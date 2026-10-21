@@ -1,8 +1,27 @@
-# SkNeXt runtime dependencies
-# Requires Python >= 3.10
+# SkNeXt shared runtime dependencies (no OS or CUDA build selection).
+# Requires Python >=3.14, matching pyproject.toml.
 #
-# PyTorch and torchvision are intentionally not pinned to an exact version.
-# Install builds compatible with your Python, NVIDIA driver, and CUDA environment.
+# 1. Create an isolated environment on each computer.
+# 2. FIRST install a matching torch/torchvision pair for that computer's OS,
+#    Python version, NVIDIA driver and supported CUDA runtime, using:
+#      https://pytorch.org/get-started/locally/
+#    PyTorch is intentionally installed separately: this file does not select
+#    a CUDA version or pin torch to a platform-specific build.
+# 3. Install the shared dependencies and the project:
+#   python -m pip install -r requirements.txt
+#   python -m pip install -e .
+#
+# The main SkNeXt launcher requires NVIDIA CUDA; portable dependencies do not
+# add CPU, Apple MPS or AMD ROCm support to that launcher. GUI editing needs
+# Tkinter/Tcl-Tk, supplied by the Python/OS installation rather than pip.
+#
+# Only if an MKL/OpenMP runtime conflict occurs, configure the affected Conda
+# environment (replace ENV_NAME), then reactivate it:
+#   conda env config vars set -n ENV_NAME MKL_THREADING_LAYER=SEQUENTIAL
+#   conda deactivate
+#   conda activate ENV_NAME
+# This makes MKL CPU operations single-threaded; it does not disable CUDA.
+# Environment settings cannot be applied by a requirements file.
 
 # Configuration
 PyYAML
@@ -12,18 +31,20 @@ yacs
 numpy
 scipy
 pandas
+networkx
 
 # Image processing and microscopy I/O
 scikit-image
 opencv-python-headless
 Pillow
 tifffile
+imagecodecs
 h5py
 
 # Zarr v3 storage
-zarr
+zarr>=3,<4
 numcodecs
-dask
+dask[array]
 
 # Training metrics, losses, and logging
 torchmetrics

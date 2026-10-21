@@ -3,7 +3,7 @@ SYSTEM:
 
 PATHS:
     RESULT_DIR:
-        PATH: ''
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
 
 TASK:
     CHANNELS: ["S.reticular"]
@@ -14,14 +14,14 @@ DATA:
     NORMALIZATION:
         TYPE: "zero_mean_unit_variance"
     TRAIN:
-        PATH: '/raw'
-        GT_PATH: '/label'
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_train/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_train/label'
     VAL:
-        PATH: '/raw'
-        GT_PATH: '/label'
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/label'
     INFER:
         PATH: ''
-        GT_PATH: '/.ome.zarr'
+        GT_PATH: ''
         CHANNEL: [0]
 
 AUGMENTOR:

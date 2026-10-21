@@ -1,6 +1,10 @@
 """Semantic-only 3D segmentation runner for SkNeXt.
 
-Usage (from the existing SkNeXt repository root, with patch files installed)::
+Unified CLI (TASK.CHANNELS contains only S.<name>; mode comes from YAML)::
+
+    sknext --config semantic_only.yaml --run_id 0 --gpu 0
+
+Standalone CLI (also supported)::
 
     python -m sknext.run.semantic_workflow --config semantic_only.yaml --mode train --run_id 0
     python -m sknext.run.semantic_workflow --config semantic_only.yaml --mode infer --run_id 0
@@ -34,6 +38,8 @@ from sknext.model.loss import instance_segmentation_loss
 from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle_scheduler
 from sknext.utils.checkpoint import (read_checkpoint, load_model_weights,
                                      restore_training_checkpoint, training_checkpoint_paths)
+from sknext.utils.model_info import print_cuda_memory
+from sknext.utils.progress import loss_log_steps, log_message
 
 
 def cfgget(cfg: dict, path: str, default=None):
@@ -144,7 +150,7 @@ def load_model_checkpoint(model, cfg, run_id, device):
         expected_channels=checked_semantic_names(cfg),
         allow_partial=bool(cfgget(cfg, 'MODEL.CHECKPOINT_ALLOW_PARTIAL', False)))
     model.to(device)
-    print(f"Loaded {report['loaded']} model tensors from {path} "
+    log_message(f"Loaded {report['loaded']} model tensors from {path} "
           f"(partial={report['partial']})", flush=True)
     return state
 
@@ -203,6 +209,7 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                                          num_workers=int(cfgget(cfg, 'TRAIN.NUM_WORKERS', 0)), pin_memory=device.type == 'cuda')
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     model = make_model(cfg, device)
+    print_cuda_memory(device, prefix="[SEMANTIC TRAIN] model loaded")
     resume = bool(cfgget(cfg, 'TRAIN.RESUME', False))
     if resume and cfgget(cfg, 'MODEL.LOAD_CHECKPOINT', False):
         raise ValueError("TRAIN.RESUME and MODEL.LOAD_CHECKPOINT are mutually exclusive")
@@ -220,6 +227,7 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                                   betas=tuple(cfgget(cfg, 'TRAIN.OPT_BETAS', [0.9,0.999])))
     epochs = int(cfgget(cfg, 'TRAIN.EPOCHS', 100))
     steps = len(loader)
+    report_steps = loss_log_steps(steps)
     sch_name = str(cfgget(cfg, 'TRAIN.LR_SCHEDULER.NAME', 'warmupcosine')).lower()
     if sch_name in {'warmupcosine', 'warmup_cosine'}:
         scheduler = build_warmup_cosine_scheduler(
@@ -273,12 +281,12 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
         start_epoch = restoration['epoch']
         best = restoration['best_val_loss']
         stagnant = restoration['epochs_without_improvement']
-        print(f"Semantic training {restoration['mode']} from "
+        log_message(f"Semantic training {restoration['mode']} from "
               f"{restoration['source']}, next epoch {start_epoch + 1}", flush=True)
     for epoch in range(start_epoch, epochs):
         model.train()
         train_sum = 0.
-        for inputs, targets in loader:
+        for step, (inputs, targets) in enumerate(loader, start=1):
             inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('cuda', dtype=torch.float16, enabled=amp):
@@ -290,7 +298,15 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            train_sum += float(loss.detach())
+            step_loss = float(loss.detach())
+            train_sum += step_loss
+            if step in report_steps:
+                log_message(f"[SEMANTIC] [EPOCH{epoch+1:04d}/{epochs:04d}] [TRAIN] "
+                      f"[BATCH{step:06d}/{steps:06d}] loss: {step_loss:.6f}, "
+                      f"mean_loss: {train_sum/step:.6f}, "
+                      f"lr: {optimizer.param_groups[0]['lr']:.6g}", flush=True)
+            if step == 1:
+                print_cuda_memory(device, prefix=f"[SEMANTIC TRAIN] epoch {epoch+1}, first batch")
         model.eval()
         valid_sum, count = 0., 0
         intersections = np.zeros(len(names), dtype=np.float64)
@@ -311,14 +327,15 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                 unions += (binary | truth).sum(dim=dims).cpu().numpy()
         mean_val = valid_sum / max(1, count)
         ious = np.divide(intersections, unions, out=np.ones_like(intersections), where=unions>0)
-        print(f'Epoch {epoch+1:4d}/{epochs}: train={train_sum/max(1, steps):.5f}, '
+        log_message(f'Epoch {epoch+1:4d}/{epochs}: train={train_sum/max(1, steps):.5f}, '
               f'val={mean_val:.5f}, IoU={dict(zip(names, np.round(ious, 4)))}', flush=True)
+        print_cuda_memory(device, prefix=f"[SEMANTIC TRAIN] epoch {epoch+1}, after validation")
         if mean_val < best:
             best, stagnant = mean_val, 0
             torch.save({'model_state_dict': model.state_dict(), 'semantic_channels': names,
                         'epoch': epoch+1, 'val_loss': best, 'input_channels': int(cfgget(cfg, 'DATA.PATCH_SIZE')[-1]),
                         'architecture': 'U_NeXt_V2_semantic_only'}, ckpt)
-            print(f'Checkpoint saved: {ckpt}', flush=True)
+            log_message(f'Checkpoint saved: {ckpt}', flush=True)
         else:
             stagnant += 1
         np_rng = np.random.get_state()
@@ -339,7 +356,7 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
         finally:
             if tmp.exists(): tmp.unlink()
         if patience > 0 and stagnant >= patience:
-            print('Early stopping', flush=True)
+            log_message('Early stopping', flush=True)
             break
 
 
@@ -424,6 +441,7 @@ def infer(cfg: dict, run_id: int, device: torch.device, overwrite: bool=False) -
     model = make_model(cfg, device)
     load_model_checkpoint(model, cfg, run_id, device)
     model.eval()
+    print_cuda_memory(device, prefix="[SEMANTIC INFER] model loaded")
     amp = device.type == 'cuda' and bool(cfgget(cfg, 'INFER.AMP', True))
     source = Path(cfgget(cfg, 'DATA.INFER.PATH', ''))
     channels = list(map(int, cfgget(cfg, 'DATA.INFER.CHANNEL', [0])))
@@ -441,8 +459,8 @@ def infer(cfg: dict, run_id: int, device: torch.device, overwrite: bool=False) -
         if core_factor.shape != (3,) or np.any(core_factor < 1):
             raise ValueError('DATA.INFER.BLOCK_CENTRAL_FACTOR must have three positive integers')
         core_size = tuple((np.asarray(spatial_patch(cfg)) * core_factor).tolist())
-        halo = tuple(map(int, cfgget(cfg, 'DATA.INFER.HALO',
-                                [max(1,x//2) for x in spatial_patch(cfg)])))
+        halo = tuple(map(int, cfgget(cfg, 'DATA.INFER.HALO', []) or
+                                [max(1,x//2) for x in spatial_patch(cfg)]))
         if len(halo) != 3 or min(halo) < 0:
             raise ValueError('DATA.INFER.HALO must contain nonnegative ZYX widths')
         num_core = tuple(math.ceil(n / c) for n,c in zip(zyx, core_size))
@@ -524,14 +542,34 @@ def infer(cfg: dict, run_id: int, device: torch.device, overwrite: bool=False) -
                             temporary = progress.with_name(progress.name + '.tmp')
                             temporary.write_text(json.dumps({'meta':run_meta, 'completed':sorted(completed)},indent=2))
                             os.replace(temporary, progress)
-                            print(f'[INFER] block {block_id+1}/{total} completed, '
+                            log_message(f'[BLOCK{block_id+1:07d}/{total:07d}] [INFER] results saved, '
                                   f'core={start.tolist()}:{stop.tolist()}',flush=True)
+                            if len(completed) == 1 or (block_id+1) % 10 == 0 or block_id+1 == total:
+                                print_cuda_memory(device, prefix=f"[SEMANTIC INFER] block {block_id+1}/{total}")
                             block_id += 1
             finally:
                 if prob_writer is not None: prob_writer.close()
-        print(f'Semantic-only results saved to: {output}',flush=True)
+        log_message(f'Semantic-only results saved to: {output}',flush=True)
     finally:
         reader.close()
+
+
+def run(cfg: dict, run_id: int, device: torch.device, mode: str = 'auto',
+        overwrite: bool = False):
+    """Shared entry point for sknext and the standalone semantic CLI."""
+    checked_semantic_names(cfg)
+    if mode == 'auto':
+        training_enabled = bool(cfgget(cfg, 'TRAIN.ENABLE', False))
+        inference_enabled = bool(cfgget(cfg, 'INFER.ENABLE', False))
+        if training_enabled == inference_enabled:
+            raise ValueError('Choose exactly one: TRAIN.ENABLE=true or INFER.ENABLE=true, or pass --mode')
+        mode = 'train' if training_enabled else 'infer'
+    if mode not in {'train', 'infer'}:
+        raise ValueError(f'Unknown semantic workflow mode: {mode}')
+    log_message(f'Semantic-only workflow: {mode}, device={device}', flush=True)
+    if mode == 'train':
+        return train(cfg, run_id, device)
+    return infer(cfg, run_id, device, overwrite=overwrite)
 
 
 def main():
@@ -545,18 +583,8 @@ def main():
     args=parser.parse_args()
     cfg=yaml.safe_load(Path(args.config).read_text(encoding='utf8'))
     if not isinstance(cfg,dict): raise ValueError('YAML must contain a mapping')
-    checked_semantic_names(cfg)
     device=torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-    mode = args.mode
-    if mode == 'auto':
-        training_enabled = bool(cfgget(cfg, 'TRAIN.ENABLE', False))
-        inference_enabled = bool(cfgget(cfg, 'INFER.ENABLE', False))
-        if training_enabled == inference_enabled:
-            raise ValueError('Choose exactly one: TRAIN.ENABLE=true or INFER.ENABLE=true, or pass --mode')
-        mode = 'train' if training_enabled else 'infer'
-    print(f'Semantic-only workflow: {mode}, device={device}',flush=True)
-    if mode == 'train': train(cfg,args.run_id,device)
-    else: infer(cfg,args.run_id,device,overwrite=args.overwrite)
+    run(cfg, args.run_id, device, mode=args.mode, overwrite=args.overwrite)
 
 
 if __name__=='__main__':

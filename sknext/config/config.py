@@ -85,9 +85,10 @@ class SkNeXt_Config:
         # Enabled exclusively by TASK.CHANNELS: ["SR"]. 1/2/4 scale XY only.
         _C.SR = CN()
         _C.SR.UPSAMPLE = 1
-        # Auto uses integer dtype's full range; floats must be within [0,1].
-        # Provide [min,max] to use calibrated ranges, especially for microscopy
-        # images occupying only a small fraction of uint16 dynamic range.
+        # Empty: normalize each complete raw/GT image independently using its
+        # own min/max, for both integer and float TIFFs. Never share extrema
+        # across files or normalize individual patches. Explicit [min,max]
+        # overrides automatic per-image scaling.
         _C.SR.RAW_RANGE = []
         _C.SR.GT_RANGE = []
         _C.SR.RESCALE_GT = True
@@ -117,6 +118,7 @@ class SkNeXt_Config:
         _C.DATA.REFLECT_TO_COMPLETE_SHAPE = True
         # 4.1. NORMALIZATION
         _C.DATA.NORMALIZATION = CN()
+        _C.DATA.NORMALIZATION.ENABLE = True
         # Whether to apply a percentage clip before normalization.
         _C.DATA.NORMALIZATION.PERC_CLIP = CN()
         _C.DATA.NORMALIZATION.PERC_CLIP.ENABLE = False
@@ -180,6 +182,8 @@ class SkNeXt_Config:
         _C.DATA.VAL.PADDING = (0, 0, 0)
         # 4.3. INFER
         _C.DATA.INFER = CN()
+        # Semantic-only context halo; empty selects half the spatial patch.
+        _C.DATA.INFER.HALO = []
         _C.DATA.INFER.PATH = "./raw/"
         _C.DATA.INFER.GT_PATH = "./label/"
         # Optional output path for float32 model probability maps.
@@ -346,6 +350,8 @@ class SkNeXt_Config:
         # Optional checkpoint to READ, independent of the current run's output.
         # Set when fine-tuning or inferring with a checkpoint from another run.
         _C.MODEL.CHECKPOINT_INPUT_PATH = ""
+        # Optional semantic-only checkpoint destination (input defaults to it).
+        _C.MODEL.CHECKPOINT = ""
 
         # 7. LOSS
         _C.LOSS = CN()
@@ -353,6 +359,12 @@ class SkNeXt_Config:
         # 8. TRAIN
         _C.TRAIN = CN()
         _C.TRAIN.ENABLE = False
+        # Semantic-only runner options.
+        _C.TRAIN.NUM_WORKERS = 0
+        _C.TRAIN.AMP = True
+        _C.TRAIN.BCE_WEIGHT = 1.0
+        _C.TRAIN.DICE_WEIGHT = 1.0
+        _C.TRAIN.AUTO_BALANCE = True
         # True: exact epoch-boundary resume from *_latest.pth, including optimizer,
         # scheduler, RNG states and early-stopping status. False: start a new run.
         _C.TRAIN.RESUME = False
@@ -382,6 +394,11 @@ class SkNeXt_Config:
         # 9. INFERENCE
         _C.INFER = CN()
         _C.INFER.ENABLE = False
+        # Semantic-only inference: scalar or one threshold per S.* channel.
+        _C.INFER.THRESHOLD = 0.5
+        _C.INFER.SAVE_PROBABILITIES = False
+        _C.INFER.SKIP_ZERO_PATCHES = True
+        _C.INFER.AMP = True
         # 'uint16': watershed + semantic labels (legacy name); actual stored dtype
         #           is uint32 when skeleton-free instance labeling is enabled.
         # 'float32': sigmoid probability channels only (no watershed).

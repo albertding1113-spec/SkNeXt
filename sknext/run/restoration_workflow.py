@@ -5,8 +5,8 @@ Infer: 3-D/4-D TIFF, directory of TIFFs, OME-Zarr, or Imaris IMS.
 Prediction: float32 CZYX OME-Zarr, intensities in the normalized GT domain.
 
 SR is intentionally incompatible with all segmentation target channels.
-Training and inference normalize according to fixed datatype or supplied
-ranges, NEVER with independently sampled per-patch statistics.
+Training and inference normalize each source image independently before tiling.
+Explicit intensity bounds override automatic per-image min/max scaling.
 """
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ from sknext.data.datasetIO import IMSReader, ZarrIOManager, detect_path_type
 from sknext.model.unext_v2 import U_NeXt_V2
 from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle_scheduler
 from sknext.utils.checkpoint import read_checkpoint, load_model_weights
+from sknext.utils.model_info import print_cuda_memory
+from sknext.utils.progress import loss_log_steps, log_message
 
 
 def sr_infer_geometry(cfg) -> dict[str, tuple[int, int, int]]:
@@ -123,33 +125,59 @@ def validate_sr(cfg) -> int:
     return scale
 
 
-def normalize_intensity(img: np.ndarray, bounds: Sequence[float], name: str) -> np.ndarray:
-    """Map dtype-calibrated or explicitly bounded raw/GT to float32 [0,1].
-
-    For floating point inputs with unspecified bounds, no undocumented
-    min/max heuristics are used: their values must already be in [0,1].
-    """
+def image_intensity_range(img: np.ndarray, bounds: Sequence[float], name: str) -> tuple[float, float]:
+    """Resolve explicit bounds or the extrema of one complete image."""
     arr = np.asarray(img)
-    if not np.issubdtype(arr.dtype, np.number):
-        raise TypeError(f"{name} must have numeric dtype; got {arr.dtype}")
+    if not (np.issubdtype(arr.dtype, np.integer) or np.issubdtype(arr.dtype, np.floating)):
+        raise TypeError(f"{name} must have real numeric dtype; got {arr.dtype}")
+    if arr.size == 0:
+        raise ValueError(f"{name} is empty")
+    lower, upper = float(arr.min()), float(arr.max())
+    if not np.isfinite([lower, upper]).all():
+        raise ValueError(f"{name} contains NaN or Inf")
     if len(bounds) == 2:
         lo, hi = map(float, bounds)
-    elif np.issubdtype(arr.dtype, np.integer):
-        limits = np.iinfo(arr.dtype)
-        # Many microscopy files are nonnegative despite using signed TIFF types.
-        lo = 0. if np.issubdtype(arr.dtype, np.signedinteger) and arr.min() >= 0 else float(limits.min)
-        hi = float(limits.max)
-    else:
-        lo, hi = 0.0, 1.0
-    data = arr.astype(np.float32)
+        if not np.isfinite([lo, hi]).all() or lo >= hi:
+            raise ValueError(f"{name} bounds must be finite [min,max] with min < max")
+        if lower < lo - 1e-4 * max(1.0, abs(lo)) or upper > hi + 1e-4 * max(1.0, abs(hi)):
+            raise ValueError(f"{name} value range [{lower:g}, {upper:g}] is outside [{lo:g}, {hi:g}]")
+        return lo, hi
+    if bounds:
+        raise ValueError(f"{name} bounds must be [] or [min,max]")
+    return lower, upper
+
+
+def normalize_intensity(img: np.ndarray, bounds: Sequence[float], name: str) -> np.ndarray:
+    """Scale one whole image to [0,1], independently of other images and dtypes."""
+    lo, hi = image_intensity_range(img, bounds, name)
+    data = np.asarray(img, dtype=np.float32)
     if not np.isfinite(data).all():
-        raise ValueError(f"{name} contains NaN or Inf")
-    # No silent truncation of float samples: the user must specify valid ranges.
-    lower, upper = float(data.min()), float(data.max())
-    if lower < lo - 1e-4 * max(1.0, abs(lo)) or upper > hi + 1e-4 * max(1.0, abs(hi)):
-        raise ValueError(f"{name} value range [{lower:g}, {upper:g}] is outside "
-                         f"[{lo:g}, {hi:g}]; configure SR.RAW_RANGE or SR.GT_RANGE")
+        raise ValueError(f"{name} cannot be represented as finite float32 values")
+    if lo == hi:
+        return np.zeros_like(data)
     return np.clip((data - lo) / (hi - lo), 0., 1.).astype(np.float32, copy=False)
+
+
+def reader_intensity_range(reader, channels, block_size, bounds) -> tuple[float, float]:
+    """Scan one inference volume in bounded blocks, then reuse its range for all patches."""
+    if bounds:
+        return tuple(map(float, bounds))
+    lower, upper = float("inf"), -float("inf")
+    shape = reader.shape[-3:]
+    log_message("[SR] scanning this input image for its own intensity range")
+    for z in range(0, shape[0], block_size[0]):
+        for y in range(0, shape[1], block_size[1]):
+            for x in range(0, shape[2], block_size[2]):
+                for channel in channels:
+                    block = np.asarray(reader[channel, z:min(z + block_size[0], shape[0]),
+                                               y:min(y + block_size[1], shape[1]),
+                                               x:min(x + block_size[2], shape[2])])
+                    lo, hi = image_intensity_range(block, [], "inference raw")
+                    lower, upper = min(lower, lo), max(upper, hi)
+    if not np.isfinite([lower, upper]).all():
+        raise ValueError("Inference image has no finite intensity range")
+    log_message(f"[SR] this input image range: [{lower:g}, {upper:g}]")
+    return lower, upper
 
 
 def pair_sr_tiffs(raw_dir: str | Path, gt_dir: str | Path) -> list[tuple[Path, Path]]:
@@ -246,11 +274,17 @@ def make_sr_patch_store(cfg, part: str, output: Path) -> Path:
                                    min(256, hr_patch[1]), min(256, hr_patch[2])),
                            compressors=[codec], dtype="float32")
     count = 0
+    image_ranges = []
     for raw_path, gt_path in pairs:
         raw = read_one_3D_tif(raw_path, "CZYX")
         gt = read_one_3D_tif(gt_path, "CZYX")
         if raw.shape[0] != channels:
             raise ValueError(f"{raw_path.name} contains {raw.shape[0]} channels, expected {channels}")
+        raw_bounds = image_intensity_range(raw, cfg.SR.RAW_RANGE, "raw")
+        gt_bounds = image_intensity_range(gt, cfg.SR.GT_RANGE, "GT")
+        image_ranges.append({"raw": str(raw_path), "gt": str(gt_path),
+                             "raw_range": list(raw_bounds), "gt_range": list(gt_bounds)})
+        log_message(f"[SR] {part} {raw_path.name}: raw range {raw_bounds}; GT range {gt_bounds}")
         raw = normalize_intensity(raw, cfg.SR.RAW_RANGE, "raw")
         gt = normalize_intensity(gt, cfg.SR.GT_RANGE, "GT")
         gt = align_sr_gt(raw, gt, scale, bool(cfg.SR.RESCALE_GT))
@@ -269,12 +303,13 @@ def make_sr_patch_store(cfg, part: str, output: Path) -> Path:
             count += 1
     root.attrs["sknext"] = {"task": "SR", "scale_zyx": [1, scale, scale],
                             "patch_zyx": list(patch), "dtype": "float32",
-                            "normalization": "dtype_or_explicit_ranges",
+                            "normalization": "per_image_minmax_v1",
+                            "image_ranges": image_ranges,
                             "raw_range": list(cfg.SR.RAW_RANGE),
                             "gt_range": list(cfg.SR.GT_RANGE)}
     if count == 0:
         raise ValueError(f"No SR patches written to {output}")
-    print(f"[SR] {part}: wrote {count} paired patches to {output}", flush=True)
+    log_message(f"[SR] {part}: wrote {count} paired patches to {output}", flush=True)
     return output
 
 
@@ -385,6 +420,7 @@ class RestorationWorkflow:
     def _identity(self) -> str:
         cfg = self.cfg
         payload = {
+            "normalization_policy": "per_image_minmax_v1",
             "scale": self.scale, "patch": self.patch, "channels": self.ch,
             "range_raw": list(cfg.SR.RAW_RANGE), "range_gt": list(cfg.SR.GT_RANGE),
             "features": list(cfg.MODEL.FEATURE_MAPS), "z_down": list(cfg.MODEL.Z_DOWN),
@@ -412,6 +448,7 @@ class RestorationWorkflow:
 
     def _checkpoint_data(self, epoch, model, optimizer=None, scheduler=None, best=None):
         return {"model_state_dict": model.state_dict(), "model_name": "U_NeXt_V2",
+                "normalization_policy": "per_image_minmax_v1",
                 "output_channel_names": ["SR"], "scale": self.scale,
                 "input_channels": self.ch, "patch_size": list(self.patch),
                 "raw_range": list(self.cfg.SR.RAW_RANGE),
@@ -435,6 +472,7 @@ class RestorationWorkflow:
 
     def _load(self, model, path: Path):
         state = read_checkpoint(path)
+        self._validate_intensity_policy(state)
         for key, current in (("scale", self.scale), ("input_channels", self.ch),
                              ("patch_size", list(self.patch)),
                              ("raw_range", list(self.cfg.SR.RAW_RANGE)),
@@ -448,10 +486,24 @@ class RestorationWorkflow:
                            expected_channels=["SR"], allow_partial=False)
         return state
 
+    def _validate_intensity_policy(self, state):
+        """Do not silently reuse dataset-wide scaling with per-image normalization."""
+        if state.get("normalization_policy") != "per_image_minmax_v1":
+            raise ValueError("SR checkpoint predates per-image normalization. Start a fresh run "
+                             "with MODEL.LOAD_CHECKPOINT=false and TRAIN.RESUME=false.")
+
     def train(self):
         cfg = self.cfg
         if bool(cfg.TRAIN.RESUME) and bool(cfg.MODEL.LOAD_CHECKPOINT):
             raise ValueError("TRAIN.RESUME and MODEL.LOAD_CHECKPOINT cannot both be true")
+        if cfg.TRAIN.RESUME or cfg.MODEL.LOAD_CHECKPOINT:
+            path = (self.latest if cfg.TRAIN.RESUME else
+                    Path(cfg.MODEL.CHECKPOINT_INPUT_PATH) if cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint)
+            self._validate_intensity_policy(read_checkpoint(path))
+        (self.workdir / "sr_intensity_ranges.json").write_text(json.dumps({
+            "raw_range": list(cfg.SR.RAW_RANGE), "gt_range": list(cfg.SR.GT_RANGE),
+            "normalization_policy": "per_image_minmax_v1",
+        }, indent=2), encoding="utf-8")
         train_path = make_sr_patch_store(cfg, "TRAIN", self.workdir / "train_sr_patches.zarr")
         val_path = make_sr_patch_store(cfg, "VAL", self.workdir / "val_sr_patches.zarr")
         ds_train = SRPatchDataset(train_path, train=True, cfg=cfg,
@@ -464,6 +516,7 @@ class RestorationWorkflow:
         train_dl = DataLoader(ds_train, batch_size=batch, shuffle=True, num_workers=0)
         val_dl = DataLoader(ds_val, batch_size=batch, shuffle=False, num_workers=0)
         model = self.build_model()
+        print_cuda_memory(self.device, prefix="[SR TRAIN] model loaded")
         name = str(cfg.TRAIN.OPTIMIZER).upper()
         if name == "ADAMW":
             opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.TRAIN.LR),
@@ -478,6 +531,7 @@ class RestorationWorkflow:
             raise ValueError(f"Unsupported optimizer {name}")
         schedname = str(cfg.TRAIN.LR_SCHEDULER.NAME).lower()
         steps = len(train_dl)
+        report_steps = loss_log_steps(steps)
         if schedname == "warmupcosine":
             scheduler = build_warmup_cosine_scheduler(
                 opt, epochs=int(cfg.TRAIN.EPOCHS), steps_per_epoch=steps,
@@ -511,7 +565,8 @@ class RestorationWorkflow:
         for epoch in range(start, epochs):
             model.train()
             train_loss = 0.0
-            for x, y in train_dl:
+            train_samples = 0
+            for step, (x, y) in enumerate(train_dl, start=1):
                 x, y = x.to(self.device), y.to(self.device)
                 opt.zero_grad(set_to_none=True)
                 pred = model(x)
@@ -519,7 +574,16 @@ class RestorationWorkflow:
                 loss.backward()
                 opt.step()
                 scheduler.step()
-                train_loss += loss.item() * len(x)
+                step_loss = loss.item()
+                train_loss += step_loss * len(x)
+                train_samples += len(x)
+                if step in report_steps:
+                    log_message(f"[SR] [EPOCH{epoch+1:04d}/{epochs:04d}] [TRAIN] "
+                          f"[BATCH{step:06d}/{steps:06d}] loss: {step_loss:.6f}, "
+                          f"mean_loss: {train_loss/train_samples:.6f}, "
+                          f"lr: {opt.param_groups[0]['lr']:.6g}", flush=True)
+                if step == 1:
+                    print_cuda_memory(self.device, prefix=f"[SR TRAIN] epoch {epoch+1}, first batch")
             model.eval()
             val_loss, val_psnr = 0., 0.
             with torch.no_grad():
@@ -540,8 +604,9 @@ class RestorationWorkflow:
             writer.flush()
             with history_file.open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"epoch": epoch+1, **metrics}) + "\n")
-            print(f"[SR] epoch={epoch+1}/{epochs} train_loss={metrics['train_loss']:.6f} "
+            log_message(f"[SR] epoch={epoch+1}/{epochs} train_loss={metrics['train_loss']:.6f} "
                   f"val_loss={v:.6f} val_PSNR={metrics['val_psnr_db']:.2f}dB", flush=True)
+            print_cuda_memory(self.device, prefix=f"[SR TRAIN] epoch {epoch+1}, after validation")
             if v < best:
                 best, stagnation = v, 0
                 self._save(self._checkpoint_data(epoch+1, model, best=best), self.checkpoint)
@@ -549,7 +614,7 @@ class RestorationWorkflow:
                 stagnation += 1
             self._save(self._checkpoint_data(epoch+1, model, opt, scheduler, best), self.latest)
             if int(cfg.TRAIN.PATIENCE) > 0 and stagnation >= int(cfg.TRAIN.PATIENCE):
-                print(f"[SR] early stopping at epoch {epoch+1}", flush=True)
+                log_message(f"[SR] early stopping at epoch {epoch+1}", flush=True)
                 break
         writer.close()
 
@@ -611,6 +676,8 @@ class RestorationWorkflow:
             patch_central = geometry["patch_central"]
             central_block = geometry["central_block"]
             block_margin = geometry["block_margin"]
+            input_bounds = reader_intensity_range(reader, physical_ch, central_block,
+                                                  self.cfg.SR.RAW_RANGE)
             nc = tuple(math.ceil(a / b) for a, b in zip(shape, central_block))
             total = math.prod(nc)
             out_path = self.workdir / f"{source.stem}_SR_{self.scale}x.ome.zarr"
@@ -620,7 +687,9 @@ class RestorationWorkflow:
                     self.cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint)
             ckptstat = ckpt.stat()
             manifest_args = {
-                "version": 2, "source": str(source.resolve()),
+                "version": 3, "source": str(source.resolve()),
+                "normalization_policy": "per_image_minmax_v1",
+                "input_image_range": list(input_bounds),
                 "source_stat": [stat.st_size, stat.st_mtime_ns],
                 "checkpoint": str(ckpt.resolve()),
                 "checkpoint_stat": [ckptstat.st_size, ckptstat.st_mtime_ns],
@@ -670,9 +739,11 @@ class RestorationWorkflow:
                                             min(256, out_shape[1]), min(256, out_shape[2])),
                                     mode="a", voxel_size=vout, image_name="SkNeXt SR restored",
                                     channel_names=[f"SR_{i}" for i in range(self.ch)])
+                out.root.attrs["sknext_normalization"] = {
+                    "policy": "per_image_minmax_v1", "input_image_range": list(input_bounds)}
                 self._write_infer_progress(log_path, manifest, 0, total)
             if done == total:
-                print(f"[SR] already completed: {out_path}", flush=True)
+                log_message(f"[SR] already completed: {out_path}", flush=True)
                 return
 
             block_index = 0
@@ -694,7 +765,8 @@ class RestorationWorkflow:
                                                    int(read_lo[1]):int(read_hi[1]),
                                                    int(read_lo[2]):int(read_hi[2])])
                             for ch in physical_ch], axis=0)
-                        block = normalize_intensity(block, self.cfg.SR.RAW_RANGE, "inference raw")
+                        block = (np.zeros_like(block, dtype=np.float32) if input_bounds[0] == input_bounds[1]
+                                 else normalize_intensity(block, input_bounds, "inference raw"))
                         hr_size = tuple(int(n * f) for n, f in zip(core_size, factor))
                         # A block buffer permits exactly ONE write to the output
                         # store per central block, rather than one write per patch.
@@ -730,9 +802,10 @@ class RestorationWorkflow:
                         out[(slice(None), *dest)] = restored
                         block_index += 1
                         self._write_infer_progress(log_path, manifest, block_index, total)
-                        if block_index % 10 == 0 or block_index == total:
-                            print(f"[SR] {source.name}: {block_index}/{total} central blocks", flush=True)
-            print(f"[SR] restored volume: {out_path} CZYX={(self.ch, *out_shape)}", flush=True)
+                        if block_index == done + 1 or block_index % 10 == 0 or block_index == total:
+                            log_message(f"[SR] [BLOCK{block_index:07d}/{total:07d}] [INFER] results saved, source: {source.name}", flush=True)
+                            print_cuda_memory(self.device, prefix=f"[SR INFER] block {block_index}/{total}")
+            log_message(f"[SR] restored volume: {out_path} CZYX={(self.ch, *out_shape)}", flush=True)
         finally:
             if out is not None:
                 out.close()
@@ -743,6 +816,7 @@ class RestorationWorkflow:
         path = Path(self.cfg.MODEL.CHECKPOINT_INPUT_PATH) if self.cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint
         self._load(model, path)
         model.eval()
+        print_cuda_memory(self.device, prefix="[SR INFER] model loaded")
         for source in self._input_sources():
             self._infer_one(model, source)
 

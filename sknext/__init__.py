@@ -32,8 +32,8 @@ def main():
     parser = argparse.ArgumentParser(
         prog="sknext",
         description=(
-            "SkNeXt: ConvNeXt-V2 based semantic and instance segmentation "
-            "for multi-type biological microscopy images."
+            "SkNeXt: semantic/instance segmentation and image restoration. "
+            "TASK.CHANNELS in the YAML selects the workflow."
         ),
     )
     parser.add_argument(

@@ -58,6 +58,11 @@ class LauncherTests(unittest.TestCase):
                 validate(cfg, 0, workdir)
             cfg.TASK.CHANNELS = ["SR"]
             validate(cfg, 0, workdir)
+            cfg.TASK.CHANNELS = ["S.globular"]
+            cfg.MODEL.CHECKPOINT_INPUT_PATH = ""
+            cfg.MODEL.CHECKPOINT = "custom.pth"
+            validate(cfg, 0, workdir)
+            cfg.MODEL.CHECKPOINT_INPUT_PATH = "custom.pth"
             cfg.TASK.CHANNELS = ["F", "P"]
             cfg.INFER.OUTPUT_MODE = "float32"
             cfg.INFER.RAW_ALL_BLOCKS = True

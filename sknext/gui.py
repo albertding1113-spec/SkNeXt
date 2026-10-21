@@ -138,8 +138,9 @@ def validate(cfg, run_id, workdir):
              cfg.DATA.VAL.PATH, cfg.DATA.VAL.GT_PATH] if cfg.TRAIN.ENABLE else [cfg.DATA.INFER.PATH]
     if cfg.INFER.ENABLE:
         is_sr = list(cfg.TASK.CHANNELS) == ["SR"]
+        is_semantic = all(ch.startswith("S.") for ch in cfg.TASK.CHANNELS)
         save_segmentation = str(cfg.INFER.OUTPUT_MODE).lower().strip() in {"uint16", "both"}
-        needs_skeleton = (not is_sr and cfg.INFER.SKELETON.ENABLE
+        needs_skeleton = (not is_sr and not is_semantic and cfg.INFER.SKELETON.ENABLE
                           and (save_segmentation or not cfg.INFER.RAW_ALL_BLOCKS))
         if needs_skeleton:
             paths.append(cfg.DATA.INFER.SKELETON_PATH)
@@ -148,9 +149,13 @@ def validate(cfg, run_id, workdir):
     for path in paths:
         require(bool(path.strip()) and (workdir / path).exists(), f"Input path does not exist: {path}")
     if cfg.INFER.ENABLE or cfg.MODEL.LOAD_CHECKPOINT:
+        default_checkpoint = (workdir / Path(cfg.MODEL.CHECKPOINT).expanduser()
+                              if all(ch.startswith("S.") for ch in cfg.TASK.CHANNELS)
+                              and cfg.MODEL.CHECKPOINT else
+                              workdir / cfg.PATHS.CHECKPOINT_DIR / f"checkpoint_{run_id:02d}.pth")
         checkpoint = (workdir / Path(cfg.MODEL.CHECKPOINT_INPUT_PATH).expanduser()
                       if cfg.MODEL.CHECKPOINT_INPUT_PATH else
-                      workdir / cfg.PATHS.CHECKPOINT_DIR / f"checkpoint_{run_id:02d}.pth")
+                      default_checkpoint)
         require(checkpoint.is_file(), f"Checkpoint does not exist: {checkpoint}")
 
 

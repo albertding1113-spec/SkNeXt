@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-from datetime import datetime
+from sknext.utils.progress import time_str
 from yacs.config import CfgNode as CN
 from typing import Any, Sequence
 
@@ -63,9 +63,5 @@ def get_cfg_value(
         return default
 
 
-def time_str():
-    """Return the current local time formatted as [YYYY.MM.DD||HH:MM:SS]."""
-    now = datetime.now()
-    return f"[{now.year:04d}.{now.month:02d}.{now.day:02d}||{now.hour:02d}:{now.minute:02d}:{now.second:02d}]"
 
 

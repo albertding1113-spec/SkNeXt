@@ -1,5 +1,10 @@
-# Merge these overrides with the updated SkNeXt_Config defaults.
-# Raw: train_0001.tif ; GT: train_0001.SR.tif ; both ZYX/CZYX TIFF.
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
+
 TASK:
   CHANNELS: ["SR"]
 
@@ -11,14 +16,14 @@ SR:
 DATA:
   PATCH_SIZE: [32, 256, 256, 1]
   TRAIN:
-    PATH: "/path/to/train/raw"
-    GT_PATH: "/path/to/train/gt"
+    PATH: "/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/super_resolution_train/raw"
+    GT_PATH: "/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/super_resolution_train/gt"
   VAL:
-    PATH: "/path/to/val/raw"
-    GT_PATH: "/path/to/val/gt"
+    PATH: "/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/super_resolution_val/raw"
+    GT_PATH: "/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/super_resolution_val/gt"
   INFER:
-    PATH: "/path/to/infer/raw"  # directory TIFF, TIFF file, OME-Zarr, or IMS
-    GT_PATH: '/.ome.zarr'
+    PATH: ""  # directory TIFF, TIFF file, OME-Zarr, or IMS
+    GT_PATH: ''
     CHANNEL: [0]
 
 AUGMENTOR:
@@ -44,8 +49,8 @@ TRAIN:
     OPTIMIZER: "ADAMW"
     LR: 1.E-4
     BATCH_SIZE: 16
-    EPOCHS: 600
-    PATIENCE: 200
+    EPOCHS: 400
+    PATIENCE: 100
     LR_SCHEDULER:
         NAME: "warmupcosine"
         MIN_LR: 1.E-6
