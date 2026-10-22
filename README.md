@@ -680,8 +680,8 @@ not necessarily just the most recent batch. CPU execution skips CUDA queries.
 | Console losses | Training and validation | Training and validation | Training and validation |
 | Console quality metric | Per-channel training/validation IoU | Per-channel validation IoU | Validation PSNR in dB |
 | TensorBoard | `log/`: loss, IoU, LR | Not currently written | `sr_tensorboard/`: loss, PSNR, LR |
-| Separate JSONL metric history | No | No | `sr_history.jsonl` |
-| PNG training curves | `chart/`, every five epochs | Not currently written | Not currently written |
+| Separate JSONL metric history | No | `semantic_history.jsonl` | `sr_history.jsonl` |
+| PNG training curves | `chart/`, every five epochs | `chart/Loss.png`, every epoch | `chart/SR_Loss.png`, every epoch |
 | Best/latest checkpoints | Yes | Yes | Yes |
 
 Directories in this table are relative to
@@ -814,8 +814,12 @@ result/results/0/
 └── gui-<timestamp>.log      # Console output for GUI launches
 ```
 
-Semantic-only runs also save best/latest checkpoints, but do not create the
-instance/mixed TensorBoard and chart outputs. SR runs additionally contain:
+Semantic-only runs save best/latest checkpoints, `semantic_history.jsonl`, and
+`chart/Loss.png`. Semantic-only and SR loss charts show both training and
+validation loss and update after each completed epoch, including the final epoch
+when early stopping triggers. Resumed runs retain available history through the
+restored checkpoint epoch; fresh runs reset their history. The chart directory
+uses `PATHS.RESULT_DIR.OUTPUT_CHART`. SR runs additionally contain:
 
 ```text
 result/results/2/
@@ -826,6 +830,7 @@ result/results/2/
 ├── val_sr_patches.zarr/
 ├── sr_tensorboard/
 ├── sr_history.jsonl
+├── chart/SR_Loss.png
 ├── sr_intensity_ranges.json
 ├── <source-stem>_SR_2x.ome.zarr/
 └── <source-stem>_SR_2x.progress.json

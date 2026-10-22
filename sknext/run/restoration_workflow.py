@@ -37,6 +37,7 @@ from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle
 from sknext.utils.checkpoint import read_checkpoint, load_model_weights
 from sknext.utils.model_info import print_cuda_memory
 from sknext.utils.progress import loss_log_steps, log_message
+from sknext.utils.training_charts import TrainingLossChart
 
 
 def sr_infer_geometry(cfg) -> dict[str, tuple[int, int, int]]:
@@ -558,9 +559,8 @@ class RestorationWorkflow:
             path = Path(cfg.MODEL.CHECKPOINT_INPUT_PATH) if cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint
             self._load(model, path)
         epochs = int(cfg.TRAIN.EPOCHS)
-        history_file = self.workdir / "sr_history.jsonl"
-        if not cfg.TRAIN.RESUME:
-            history_file.unlink(missing_ok=True)
+        loss_chart = TrainingLossChart(self.workdir / "sr_history.jsonl",
+                                       Path(cfg.PATHS.RESULT_DIR.OUTPUT_CHART) / "SR_Loss.png", start)
         writer = SummaryWriter(log_dir=str(self.workdir / "sr_tensorboard"))
         for epoch in range(start, epochs):
             model.train()
@@ -602,8 +602,7 @@ class RestorationWorkflow:
             writer.add_scalar("SR/PSNR_dB/val", metrics["val_psnr_db"], epoch+1)
             writer.add_scalar("SR/Learning_Rate", metrics["learning_rate"], epoch+1)
             writer.flush()
-            with history_file.open("a", encoding="utf-8") as f:
-                f.write(json.dumps({"epoch": epoch+1, **metrics}) + "\n")
+            loss_chart.log(epoch+1, metrics)
             log_message(f"[SR] epoch={epoch+1}/{epochs} train_loss={metrics['train_loss']:.6f} "
                   f"val_loss={v:.6f} val_PSNR={metrics['val_psnr_db']:.2f}dB", flush=True)
             print_cuda_memory(self.device, prefix=f"[SR TRAIN] epoch {epoch+1}, after validation")

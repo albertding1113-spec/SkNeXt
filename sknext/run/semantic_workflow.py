@@ -40,6 +40,7 @@ from sknext.utils.checkpoint import (read_checkpoint, load_model_weights,
                                      restore_training_checkpoint, training_checkpoint_paths)
 from sknext.utils.model_info import print_cuda_memory
 from sknext.utils.progress import loss_log_steps, log_message
+from sknext.utils.training_charts import TrainingLossChart
 
 
 def cfgget(cfg: dict, path: str, default=None):
@@ -283,6 +284,11 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
         stagnant = restoration['epochs_without_improvement']
         log_message(f"Semantic training {restoration['mode']} from "
               f"{restoration['source']}, next epoch {start_epoch + 1}", flush=True)
+    workdir = Path(cfgget(cfg, 'PATHS.RESULT_DIR.PATH_',
+                          str(Path(cfgget(cfg, 'PATHS.RESULT_DIR.PATH', './result')) / 'results' / str(run_id))))
+    chart_dir = Path(cfgget(cfg, 'PATHS.RESULT_DIR.OUTPUT_CHART', str(workdir / 'chart')))
+    loss_chart = TrainingLossChart(workdir / 'semantic_history.jsonl',
+                                   chart_dir / 'Loss.png', start_epoch)
     for epoch in range(start_epoch, epochs):
         model.train()
         train_sum = 0.
@@ -326,6 +332,8 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                 intersections += (binary & truth).sum(dim=dims).cpu().numpy()
                 unions += (binary | truth).sum(dim=dims).cpu().numpy()
         mean_val = valid_sum / max(1, count)
+        loss_chart.log(epoch + 1, {'train_loss': train_sum / max(1, steps),
+                                   'val_loss': mean_val})
         ious = np.divide(intersections, unions, out=np.ones_like(intersections), where=unions>0)
         log_message(f'Epoch {epoch+1:4d}/{epochs}: train={train_sum/max(1, steps):.5f}, '
               f'val={mean_val:.5f}, IoU={dict(zip(names, np.round(ious, 4)))}', flush=True)
