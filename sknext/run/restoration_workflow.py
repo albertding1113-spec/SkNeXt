@@ -35,7 +35,7 @@ from sknext.data.datasetIO import IMSReader, ZarrIOManager, detect_path_type
 from sknext.model.unext_v2 import U_NeXt_V2
 from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle_scheduler
 from sknext.utils.checkpoint import read_checkpoint, load_model_weights
-from sknext.utils.model_info import print_cuda_memory
+from sknext.utils.model_info import print_cuda_memory, print_model_parameters
 from sknext.utils.progress import loss_log_steps, log_message
 from sknext.utils.training_charts import TrainingLossChart
 
@@ -517,6 +517,8 @@ class RestorationWorkflow:
         train_dl = DataLoader(ds_train, batch_size=batch, shuffle=True, num_workers=0)
         val_dl = DataLoader(ds_val, batch_size=batch, shuffle=False, num_workers=0)
         model = self.build_model()
+        log_message(model)
+        print_model_parameters(model)
         print_cuda_memory(self.device, prefix="[SR TRAIN] model loaded")
         name = str(cfg.TRAIN.OPTIMIZER).upper()
         if name == "ADAMW":
@@ -611,6 +613,7 @@ class RestorationWorkflow:
                 self._save(self._checkpoint_data(epoch+1, model, best=best), self.checkpoint)
             else:
                 stagnation += 1
+                log_message(f"no improvement, Patience: {stagnation:04d}/{int(cfg.TRAIN.PATIENCE):04d}", flush=True)
             self._save(self._checkpoint_data(epoch+1, model, opt, scheduler, best), self.latest)
             if int(cfg.TRAIN.PATIENCE) > 0 and stagnation >= int(cfg.TRAIN.PATIENCE):
                 log_message(f"[SR] early stopping at epoch {epoch+1}", flush=True)
@@ -815,6 +818,8 @@ class RestorationWorkflow:
         path = Path(self.cfg.MODEL.CHECKPOINT_INPUT_PATH) if self.cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint
         self._load(model, path)
         model.eval()
+        log_message(model)
+        print_model_parameters(model)
         print_cuda_memory(self.device, prefix="[SR INFER] model loaded")
         for source in self._input_sources():
             self._infer_one(model, source)

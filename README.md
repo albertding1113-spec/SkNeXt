@@ -156,6 +156,18 @@ single number or one number per channel in `TASK.CHANNELS` order. Set
 are now part of the shared schema in `sknext/config/config.py`. The standalone
 `python -m sknext.run.semantic_workflow` command remains available.
 
+Semantic-only inference accepts an Imaris `.ims`, a CZYX OME-Zarr store, a
+single TIFF, or a folder of TIFF volumes. For a TIFF folder, set
+`DATA.INFER.PATH` to the input folder and `DATA.INFER.GT_PATH` to an output
+directory. Each immediate `.tif`/`.tiff` file is processed independently as
+ZYX (single channel) or CZYX (multiple channels); files are not stacked together
+and subfolders are not searched. Select input channels with `DATA.INFER.CHANNEL`.
+Filenames must have unique stems. For example, `sample.tif` with run ID 0 writes
+`sample_semantic_0.ome.zarr`, with its own resume progress file and optional
+`sample_semantic_0.ome_prob.zarr` probability store. The model is loaded once
+for the whole folder. Compressed TIFFs are decoded into memory; uncompressed
+TIFFs use memory mapping when available.
+
 ## Data preparation
 
 ### Training and validation
@@ -209,7 +221,7 @@ Provide:
 - A trained checkpoint and the matching model/channel configuration.
 - A destination directory or `.zarr` path for segmentation output.
 
-Segmentation readers do not accept a directory of TIFFs or arbitrary HDF5
+Instance/mixed readers do not accept a directory of TIFFs or arbitrary HDF5
 datasets. They use the readers' default resolution level and time point.
 Restoration additionally accepts TIFF inputs, as described below.
 

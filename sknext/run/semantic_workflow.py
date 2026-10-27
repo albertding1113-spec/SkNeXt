@@ -23,6 +23,7 @@ import hashlib
 from pathlib import Path
 
 import numpy as np
+import tifffile
 import torch
 import yaml
 
@@ -38,7 +39,7 @@ from sknext.model.loss import instance_segmentation_loss
 from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle_scheduler
 from sknext.utils.checkpoint import (read_checkpoint, load_model_weights,
                                      restore_training_checkpoint, training_checkpoint_paths)
-from sknext.utils.model_info import print_cuda_memory
+from sknext.utils.model_info import print_cuda_memory, print_model_parameters
 from sknext.utils.progress import loss_log_steps, log_message
 from sknext.utils.training_charts import TrainingLossChart
 
@@ -210,6 +211,8 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                                          num_workers=int(cfgget(cfg, 'TRAIN.NUM_WORKERS', 0)), pin_memory=device.type == 'cuda')
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     model = make_model(cfg, device)
+    log_message(model)
+    print_model_parameters(model)
     print_cuda_memory(device, prefix="[SEMANTIC TRAIN] model loaded")
     resume = bool(cfgget(cfg, 'TRAIN.RESUME', False))
     if resume and cfgget(cfg, 'MODEL.LOAD_CHECKPOINT', False):
@@ -346,6 +349,7 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
             log_message(f'Checkpoint saved: {ckpt}', flush=True)
         else:
             stagnant += 1
+            log_message(f'no improvement, Patience: {stagnant:04d}/{patience:04d}', flush=True)
         np_rng = np.random.get_state()
         state = {'format_version':2, 'epoch':epoch+1, 'identity':identity,
                  'model_state_dict':model.state_dict(),
@@ -368,14 +372,38 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
             break
 
 
+class _TiffReader:
+    """Expose a ZYX or CZYX TIFF through the block reader interface."""
+
+    def __init__(self, path: Path):
+        try:
+            data = tifffile.memmap(path)
+        except (ValueError, TypeError, tifffile.TiffFileError):
+            data = tifffile.imread(path)
+        if data.ndim == 3:
+            data = data[None, ...]
+        if data.ndim != 4:
+            raise ValueError(f'TIFF must be ZYX or CZYX: {path}')
+        self.data = data
+        self.shape = tuple(data.shape)
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def close(self):
+        del self.data
+
+
 def _input_reader(path: Path, channel_indices: list[int]):
+    if path.suffix.lower() in {'.tif', '.tiff'}:
+        return _TiffReader(path), channel_indices
     kind = detect_path_type(path)
     if kind == 'ims':
         # Logical reader channels now follow requested channel order.
         return IMSReader(path, channel=channel_indices), list(range(len(channel_indices)))
     if kind == 'zarr':
         return ZarrIOManager(path, mode='r'), channel_indices
-    raise ValueError(f'Inference expects .ims or CZYX OME-Zarr, got {path}')
+    raise ValueError(f'Inference expects TIFF, .ims or CZYX OME-Zarr, got {path}')
 
 
 def _window(patch: tuple[int, int, int]) -> np.ndarray:
@@ -444,24 +472,57 @@ def _resolved_output(cfg: dict, run_id: int) -> Path:
     return path if path.name.endswith('.zarr') else path / f'semantic_{run_id}.ome.zarr'
 
 
+def _inference_jobs(cfg: dict, run_id: int) -> list[tuple[Path, Path]]:
+    """Resolve one output per TIFF, preserving existing IMS/Zarr output paths."""
+    source = Path(cfgget(cfg, 'DATA.INFER.PATH', ''))
+    kind = detect_path_type(source)
+    if kind != 'dir':
+        return [(source, _resolved_output(cfg, run_id))]
+    sources = get_tif_path_in_folder(source)
+    if not sources:
+        raise ValueError(f'No TIFF files found in {source}')
+    value = cfgget(cfg, 'DATA.INFER.GT_PATH', '')
+    if not value:
+        raise ValueError('DATA.INFER.GT_PATH must specify the semantic segmentation output')
+    output_dir = Path(value)
+    if output_dir.suffix.lower() == '.zarr' or (output_dir.exists() and not output_dir.is_dir()):
+        raise ValueError('TIFF folder inference requires DATA.INFER.GT_PATH to be an output directory')
+    jobs = [(path, output_dir / f'{path.stem}_semantic_{run_id}.ome.zarr') for path in sources]
+    if len({str(output).casefold() for _, output in jobs}) != len(jobs):
+        raise ValueError('TIFF filenames must have unique stems to avoid duplicate output paths')
+    return jobs
+
+
 def infer(cfg: dict, run_id: int, device: torch.device, overwrite: bool=False) -> None:
+    jobs = _inference_jobs(cfg, run_id)
     names = checked_semantic_names(cfg)
     model = make_model(cfg, device)
     load_model_checkpoint(model, cfg, run_id, device)
     model.eval()
+    log_message(model)
+    print_model_parameters(model)
     print_cuda_memory(device, prefix="[SEMANTIC INFER] model loaded")
     amp = device.type == 'cuda' and bool(cfgget(cfg, 'INFER.AMP', True))
-    source = Path(cfgget(cfg, 'DATA.INFER.PATH', ''))
     channels = list(map(int, cfgget(cfg, 'DATA.INFER.CHANNEL', [0])))
     if len(channels) != int(cfgget(cfg, 'DATA.PATCH_SIZE')[-1]):
         raise ValueError('DATA.INFER.CHANNEL length must equal DATA.PATCH_SIZE[-1]')
-    output = _resolved_output(cfg, run_id)
+    for source, output in jobs:
+        log_message(f'[SEMANTIC INFER] source: {source}', flush=True)
+        _infer_source(model, cfg, run_id, device, names, channels, amp, source, output, overwrite)
+
+
+def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
+                  names: list[str], channels: list[int], amp: bool,
+                  source: Path, output: Path, overwrite: bool) -> None:
+    """Segment one source with independent output stores and resume progress."""
     if output.resolve() == source.resolve():
         raise ValueError('DATA.INFER.GT_PATH must not overwrite the input data store')
     output.parent.mkdir(parents=True, exist_ok=True)
     progress = output.parent / (output.name + '.progress.json')
     reader, logical_channels = _input_reader(source, channels)
     try:
+        if not logical_channels or min(logical_channels) < 0 or max(logical_channels) >= reader.shape[0]:
+            raise ValueError(f'DATA.INFER.CHANNEL index out of range for {source}')
         zyx = tuple(map(int, reader.shape[1:]))
         core_factor = np.asarray(cfgget(cfg, 'DATA.INFER.BLOCK_CENTRAL_FACTOR', [1,2,2]), dtype=int)
         if core_factor.shape != (3,) or np.any(core_factor < 1):
@@ -486,6 +547,9 @@ def infer(cfg: dict, run_id: int, device: torch.device, overwrite: bool=False) -
                     'checkpoint_mtime_ns':checkpoint_read_path(cfg, run_id).stat().st_mtime_ns,
                     'thresholds':get_thresholds(cfg,len(names)).tolist(),
                     'save_probabilities':bool(cfgget(cfg, 'INFER.SAVE_PROBABILITIES', False))}
+        if source.suffix.lower() in {'.tif', '.tiff'}:
+            source_stat = source.stat()
+            run_meta.update(source_size=source_stat.st_size, source_mtime_ns=source_stat.st_mtime_ns)
         if overwrite:
             if output.exists():
                 from sknext.data.datasetIO import remove_zarr_if_exists
