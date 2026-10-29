@@ -557,7 +557,13 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
             if progress.exists(): progress.unlink()
         if progress.exists():
             saved = json.loads(progress.read_text())
-            if saved.get('meta') != run_meta:
+            # Batch size only groups patches; completed progress tracks spatial blocks.
+            # Keep it in metadata for reference, but allow it to change on resume.
+            saved_meta = saved.get('meta')
+            saved_compat = ({k: v for k, v in saved_meta.items() if k != 'batch_size'}
+                            if isinstance(saved_meta, dict) else saved_meta)
+            current_compat = {k: v for k, v in run_meta.items() if k != 'batch_size'}
+            if saved_compat != current_compat:
                 raise RuntimeError('Cannot resume: inference configuration / checkpoint differs from progress metadata')
             if not output.exists():
                 raise RuntimeError('Progress exists but output data is missing')

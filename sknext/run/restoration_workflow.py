@@ -688,6 +688,7 @@ class RestorationWorkflow:
             ckpt = (Path(self.cfg.MODEL.CHECKPOINT_INPUT_PATH) if
                     self.cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint)
             ckptstat = ckpt.stat()
+            # Batch size is an execution setting, not a resume compatibility key.
             manifest_args = {
                 "version": 3, "source": str(source.resolve()),
                 "normalization_policy": "per_image_minmax_v1",

@@ -110,6 +110,30 @@ class SemanticTiffInferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Cannot resume'):
             self.infer()
 
+    def test_resume_with_changed_batch_size_preserves_completed_blocks(self):
+        tifffile.imwrite(self.raw / 'a.tif', np.ones((3, 5, 6), dtype='uint16'),
+                         photometric='minisblack')
+        self.cfg['TRAIN'] = {'BATCH_SIZE': 1}
+        self.infer()
+        output = self.output / 'a_semantic_7.ome.zarr'
+        progress_path = output.with_name(output.name + '.progress.json')
+        progress = json.loads(progress_path.read_text())
+        self.assertEqual(progress['meta']['batch_size'], 1)
+        # Simulate an interrupted run with one block left to process.
+        progress['completed'].pop()
+        progress_path.write_text(json.dumps(progress))
+        self.cfg['TRAIN']['BATCH_SIZE'] = 4
+        self.ns['_predict_block'] = Mock(wraps=self.ns['_predict_block'])
+        self.infer()
+        self.ns['_predict_block'].assert_called_once()
+        resumed = json.loads(progress_path.read_text())
+        self.assertEqual(resumed['meta']['batch_size'], 4)
+        self.assertEqual(len(resumed['completed']), len(progress['completed']) + 1)
+        # Other inference settings must still match.
+        self.cfg['DATA']['INFER']['HALO'] = [0, 0, 0]
+        with self.assertRaisesRegex(RuntimeError, 'Cannot resume'):
+            self.infer()
+
     def test_tiff_channel_order_and_single_file_input(self):
         data = np.arange(2 * 3 * 4 * 5, dtype='uint16').reshape(2, 3, 4, 5)
         path = self.raw / 'channels.tif'

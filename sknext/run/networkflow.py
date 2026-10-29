@@ -1064,7 +1064,7 @@ class Segmentation_Workflow(Base_Workflow):
                 "mtime_ns": stats.st_mtime_ns}
 
     def _build_infer_manifest(self):
-        """Fingerprint parameters and input identities that determine inference output."""
+        """Fingerprint inference output settings, excluding execution batch size."""
         source = Path(self.infer_path).resolve()
         if source.is_file():
             input_metadata = self._file_identity(source)
