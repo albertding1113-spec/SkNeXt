@@ -35,6 +35,9 @@ from sknext.data.imageIO import (get_tif_path_dict_in_folder,
                                  patch_coordinates_iter)
 from sknext.data.preprocessing import preprocess_img, reflect_padding_img
 from sknext.model.unext_v2 import U_NeXt_V2
+from sknext.utils.parallel import model_state_dict
+from sknext.utils.execution import (prepare_once, make_loader, set_epoch, primary,
+    reduce_sums, world_size, validation_model, NullWriter, training_rng_states)
 from sknext.model.loss import instance_segmentation_loss
 from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle_scheduler
 from sknext.utils.checkpoint import (read_checkpoint, load_model_weights,
@@ -125,7 +128,9 @@ def make_model(cfg: dict, device: torch.device) -> torch.nn.Module:
         output_channels=[len(channels)], output_channel_info=['semantic'],
         separated_decoders=False, explicit_activations=False, contrast=False,
     )
-    return model.to(device)
+    from sknext.utils.parallel import parallel_model
+    return parallel_model(model, device, cfgget(cfg, 'TRAIN.BATCH_SIZE', 1)
+                          if cfgget(cfg, 'TRAIN.ENABLE', False) else None)
 
 
 def checkpoint_path(cfg: dict, run_id: int) -> Path:
@@ -202,14 +207,13 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
     weights = cfgget(cfg, 'TASK.CHANNEL_WEIGHTS', [1.] * len(names))
     if len(weights) != len(names) or any(float(v) <= 0 for v in weights):
         raise ValueError('TASK.CHANNEL_WEIGHTS must contain one positive weight per semantic channel')
-    train_path = prepare_patch_data(cfg, 'TRAIN', names)
-    val_path = prepare_patch_data(cfg, 'VAL', names)
+    train_path = prepare_once(prepare_patch_data, cfg, 'TRAIN', names)
+    val_path = prepare_once(prepare_patch_data, cfg, 'VAL', names)
     train_ds = ZarrPatchLoader(cfg, train_path, if_val=False)
     val_ds = ZarrPatchLoader(cfg, val_path, if_val=True)
     batch_size = int(cfgget(cfg, 'TRAIN.BATCH_SIZE', 1))
-    loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                         num_workers=int(cfgget(cfg, 'TRAIN.NUM_WORKERS', 0)), pin_memory=device.type == 'cuda')
-    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    loader = make_loader(train_ds, cfg, device)
+    val_loader = make_loader(val_ds, cfg, device, training=False)
     model = make_model(cfg, device)
     log_message(model)
     print_model_parameters(model)
@@ -291,8 +295,9 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                           str(Path(cfgget(cfg, 'PATHS.RESULT_DIR.PATH', './result')) / 'results' / str(run_id))))
     chart_dir = Path(cfgget(cfg, 'PATHS.RESULT_DIR.OUTPUT_CHART', str(workdir / 'chart')))
     loss_chart = TrainingLossChart(workdir / 'semantic_history.jsonl',
-                                   chart_dir / 'Loss.png', start_epoch)
+                                   chart_dir / 'Loss.png', start_epoch) if primary() else NullWriter()
     for epoch in range(start_epoch, epochs):
+        set_epoch(loader, epoch)
         model.train()
         train_sum = 0.
         for step, (inputs, targets) in enumerate(loader, start=1):
@@ -314,17 +319,15 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                       f"[BATCH{step:06d}/{steps:06d}] loss: {step_loss:.6f}, "
                       f"mean_loss: {train_sum/step:.6f}, "
                       f"lr: {optimizer.param_groups[0]['lr']:.6g}", flush=True)
-            if step == 1:
-                print_cuda_memory(device, prefix=f"[SEMANTIC TRAIN] epoch {epoch+1}, first batch")
         model.eval()
         valid_sum, count = 0., 0
         intersections = np.zeros(len(names), dtype=np.float64)
         unions = np.zeros(len(names), dtype=np.float64)
         with torch.inference_mode():
             for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
+                inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
                 with torch.autocast('cuda', dtype=torch.float16, enabled=amp):
-                    logits = model(inputs)
+                    logits = validation_model(model)(inputs)
                     if isinstance(logits, dict): logits = logits['pred']
                     loss = loss_fn(logits.float(), targets)
                 valid_sum += float(loss) * len(inputs)
@@ -334,39 +337,49 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
                 dims = (0, 2, 3, 4)
                 intersections += (binary & truth).sum(dim=dims).cpu().numpy()
                 unions += (binary | truth).sum(dim=dims).cpu().numpy()
+        totals = reduce_sums([train_sum, valid_sum, count, *intersections, *unions], device)
+        train_sum = totals[0] / world_size()
+        valid_sum, count = totals[1:3]
+        intersections = np.asarray(totals[3:3+len(names)])
+        unions = np.asarray(totals[3+len(names):])
         mean_val = valid_sum / max(1, count)
         loss_chart.log(epoch + 1, {'train_loss': train_sum / max(1, steps),
                                    'val_loss': mean_val})
         ious = np.divide(intersections, unions, out=np.ones_like(intersections), where=unions>0)
         log_message(f'Epoch {epoch+1:4d}/{epochs}: train={train_sum/max(1, steps):.5f}, '
               f'val={mean_val:.5f}, IoU={dict(zip(names, np.round(ious, 4)))}', flush=True)
-        print_cuda_memory(device, prefix=f"[SEMANTIC TRAIN] epoch {epoch+1}, after validation")
+        if (epoch+1) % 5 == 0:
+            print_cuda_memory(device, prefix=f"[SEMANTIC TRAIN] epoch {epoch+1}, after validation",
+                              all_devices=True)
         if mean_val < best:
             best, stagnant = mean_val, 0
-            torch.save({'model_state_dict': model.state_dict(), 'semantic_channels': names,
-                        'epoch': epoch+1, 'val_loss': best, 'input_channels': int(cfgget(cfg, 'DATA.PATCH_SIZE')[-1]),
-                        'architecture': 'U_NeXt_V2_semantic_only'}, ckpt)
+            if primary():
+                torch.save({'model_state_dict': model_state_dict(model), 'semantic_channels': names,
+                            'epoch': epoch+1, 'val_loss': best, 'input_channels': int(cfgget(cfg, 'DATA.PATCH_SIZE')[-1]),
+                            'architecture': 'U_NeXt_V2_semantic_only'}, ckpt)
             log_message(f'Checkpoint saved: {ckpt}', flush=True)
         else:
             stagnant += 1
             log_message(f'no improvement, Patience: {stagnant:04d}/{patience:04d}', flush=True)
-        np_rng = np.random.get_state()
-        state = {'format_version':2, 'epoch':epoch+1, 'identity':identity,
-                 'model_state_dict':model.state_dict(),
-                 'optimizer_state_dict':optimizer.state_dict(),
-                 'scheduler_state_dict':scheduler.state_dict(),
-                 'scaler_state_dict':scaler.state_dict(),
-                 'best':best, 'stagnant':stagnant,
-                 'rng_python':random.getstate(),
-                 'rng_numpy':(np_rng[0], np_rng[1].tolist(), np_rng[2], np_rng[3], np_rng[4]),
-                 'rng_torch':torch.get_rng_state(),
-                 'rng_cuda':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
-        tmp = latest.with_name('.' + latest.name + '.tmp')
-        try:
-            torch.save(state, tmp)
-            os.replace(tmp, latest)
-        finally:
-            if tmp.exists(): tmp.unlink()
+        rng_states = training_rng_states()
+        if primary():
+            np_rng = np.random.get_state()
+            state = {'format_version':2, 'epoch':epoch+1, 'identity':identity,
+                     'model_state_dict':model_state_dict(model),
+                     'optimizer_state_dict':optimizer.state_dict(),
+                     'scheduler_state_dict':scheduler.state_dict(),
+                     'scaler_state_dict':scaler.state_dict(),
+                     'best':best, 'stagnant':stagnant,
+                     'rng_python':random.getstate(),
+                     'rng_numpy':(np_rng[0], np_rng[1].tolist(), np_rng[2], np_rng[3], np_rng[4]),
+                     'rng_torch':torch.get_rng_state(),
+                     'rng_cuda':rng_states[0]['rng_cuda'], 'rng_by_rank':rng_states}
+            tmp = latest.with_name('.' + latest.name + '.tmp')
+            try:
+                torch.save(state, tmp)
+                os.replace(tmp, latest)
+            finally:
+                if tmp.exists(): tmp.unlink()
         if patience > 0 and stagnant >= patience:
             log_message('Early stopping', flush=True)
             break
@@ -429,7 +442,8 @@ def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
     win = _window(patch_size)
     overlap = overlap_voxels(cfg, 'INFER')
     coords = list(patch_coordinates_iter(sz, patch_size, overlap, (0,0,0)))
-    batch_size = max(1, int(cfgget(cfg, 'TRAIN.BATCH_SIZE', 1)))
+    from sknext.utils.parallel import inference_batch_size, configured_inference_batch
+    batch_size = inference_batch_size(model, configured_inference_batch(cfg))
     norm = normalize_options(cfg)
     skip_empty = bool(cfgget(cfg, 'INFER.SKIP_ZERO_PATCHES', True))
     for batch_start in range(0, len(coords), batch_size):
@@ -496,24 +510,29 @@ def _inference_jobs(cfg: dict, run_id: int) -> list[tuple[Path, Path]]:
 def infer(cfg: dict, run_id: int, device: torch.device, overwrite: bool=False) -> None:
     jobs = _inference_jobs(cfg, run_id)
     names = checked_semantic_names(cfg)
-    model = make_model(cfg, device)
-    load_model_checkpoint(model, cfg, run_id, device)
-    model.eval()
-    log_message(model)
-    print_model_parameters(model)
-    print_cuda_memory(device, prefix="[SEMANTIC INFER] model loaded")
+    from sknext.utils.inference_workers import BlockPool, parallel_inference_enabled
+    from contextlib import ExitStack
+    use_pool = parallel_inference_enabled(cfg, device)
+    model = None
+    if not use_pool:
+        model = make_model(cfg, device)
+        load_model_checkpoint(model, cfg, run_id, device)
+        model.eval()
+        print_model_parameters(model)
     amp = device.type == 'cuda' and bool(cfgget(cfg, 'INFER.AMP', True))
     channels = list(map(int, cfgget(cfg, 'DATA.INFER.CHANNEL', [0])))
     if len(channels) != int(cfgget(cfg, 'DATA.PATCH_SIZE')[-1]):
         raise ValueError('DATA.INFER.CHANNEL length must equal DATA.PATCH_SIZE[-1]')
-    for source, output in jobs:
-        log_message(f'[SEMANTIC INFER] source: {source}', flush=True)
-        _infer_source(model, cfg, run_id, device, names, channels, amp, source, output, overwrite)
+    with ExitStack() as stack:
+        pool = stack.enter_context(BlockPool(cfg, run_id, 'semantic')) if use_pool else None
+        for source, output in jobs:
+            log_message(f'[SEMANTIC INFER] source: {source}', flush=True)
+            _infer_source(model, cfg, run_id, device, names, channels, amp, source, output, overwrite, pool)
 
 
 def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
                   names: list[str], channels: list[int], amp: bool,
-                  source: Path, output: Path, overwrite: bool) -> None:
+                  source: Path, output: Path, overwrite: bool, pool=None) -> None:
     """Segment one source with independent output stores and resume progress."""
     if output.resolve() == source.resolve():
         raise ValueError('DATA.INFER.GT_PATH must not overwrite the input data store')
@@ -594,37 +613,45 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
                            if save_prob else None)
             try:
                 total = math.prod(num_core)
-                block_id = 0
-                for zz in range(0, zyx[0], core_size[0]):
-                    for yy in range(0, zyx[1], core_size[1]):
-                        for xx in range(0, zyx[2], core_size[2]):
-                            if block_id in completed:
+                def jobs():
+                    block_id = 0
+                    for zz in range(0, zyx[0], core_size[0]):
+                        for yy in range(0, zyx[1], core_size[1]):
+                            for xx in range(0, zyx[2], core_size[2]):
+                                start = np.array([zz, yy, xx], dtype=int)
+                                stop = np.minimum(start + core_size, zyx)
+                                if block_id not in completed:
+                                    yield dict(id=block_id, source=str(source), start=start, stop=stop,
+                                               low=np.maximum(start-halo, 0), high=np.minimum(stop+halo, zyx))
                                 block_id += 1
-                                continue
-                            start = np.array([zz,yy,xx], dtype=int)
-                            stop = np.minimum(start + core_size, zyx)
-                            low = np.maximum(start - halo, 0)
-                            high = np.minimum(stop + halo, zyx)
-                            key = tuple(slice(int(a),int(b)) for a,b in zip(low,high))
-                            block = np.stack([reader[(ch,*key)] for ch in logical_channels], axis=0)
-                            probs = _predict_block(model, block, cfg, device, names, amp)
-                            local = tuple(slice(int(a-b),int(c-b)) for a,c,b in zip(start,stop,low))
-                            write_key = (slice(None), *[slice(int(a),int(b)) for a,b in zip(start,stop)])
-                            center_probs = probs[(slice(None),*local)]
-                            masks = (center_probs >= thresholds[:,None,None,None]).astype('uint8')
-                            dst[write_key] = masks
-                            if prob_writer is not None:
-                                prob_writer[write_key] = np.rint(center_probs * 65535.).astype('uint16')
-                            completed.add(block_id)
-                            # Update progress atomically: a crash cannot truncate its JSON.
-                            temporary = progress.with_name(progress.name + '.tmp')
-                            temporary.write_text(json.dumps({'meta':run_meta, 'completed':sorted(completed)},indent=2))
-                            os.replace(temporary, progress)
-                            log_message(f'[BLOCK{block_id+1:07d}/{total:07d}] [INFER] results saved, '
-                                  f'core={start.tolist()}:{stop.tolist()}',flush=True)
-                            if len(completed) == 1 or (block_id+1) % 10 == 0 or block_id+1 == total:
-                                print_cuda_memory(device, prefix=f"[SEMANTIC INFER] block {block_id+1}/{total}")
-                            block_id += 1
+
+                def predict_local(job):
+                    low, high = job['low'], job['high']
+                    start, stop = job['start'], job['stop']
+                    key = tuple(slice(int(a), int(b)) for a, b in zip(low, high))
+                    block = np.stack([reader[(ch, *key)] for ch in logical_channels], axis=0)
+                    probs = _predict_block(model, block, cfg, device, names, amp)
+                    local = tuple(slice(int(a-b), int(c-b)) for a, c, b in zip(start, stop, low))
+                    return probs[(slice(None), *local)]
+
+                results = pool.map(jobs()) if pool is not None else ((job, predict_local(job)) for job in jobs())
+                for job, center_probs in results:
+                    block_id, start, stop = job['id'], job['start'], job['stop']
+                    write_key = (slice(None), *[slice(int(a), int(b)) for a, b in zip(start, stop)])
+                    masks = (center_probs >= thresholds[:,None,None,None]).astype('uint8')
+                    dst[write_key] = masks
+                    if prob_writer is not None:
+                        prob_writer[write_key] = np.rint(center_probs * 65535.).astype('uint16')
+                    completed.add(block_id)
+                    # Update progress atomically: a crash cannot truncate its JSON.
+                    temporary = progress.with_name(progress.name + '.tmp')
+                    temporary.write_text(json.dumps({'meta':run_meta, 'completed':sorted(completed)},indent=2))
+                    os.replace(temporary, progress)
+                    log_message(f'[BLOCK{block_id+1:07d}/{total:07d}] [INFER] results saved, '
+                          f'core={start.tolist()}:{stop.tolist()}',flush=True)
+                    if pool is None and (block_id+1) % 20 == 0:
+                        print_cuda_memory(device, prefix=f"[SEMANTIC INFER] block {block_id+1}/{total}",
+                                          all_devices=True)
             finally:
                 if prob_writer is not None: prob_writer.close()
         log_message(f'Semantic-only results saved to: {output}',flush=True)
@@ -656,12 +683,14 @@ def main():
     parser.add_argument('--mode',choices=['auto','train','infer'],default='auto',
                         help='auto reads TRAIN.ENABLE / INFER.ENABLE in the YAML')
     parser.add_argument('--run_id',type=int,default=0)
-    parser.add_argument('--gpu',type=int,default=0)
+    parser.add_argument('--gpu',type=str,default='0',help="GPU indices/UUIDs or 'all'")
     parser.add_argument('--overwrite',action='store_true',help='Overwrite preexisting inference output')
     args=parser.parse_args()
     cfg=yaml.safe_load(Path(args.config).read_text(encoding='utf8'))
     if not isinstance(cfg,dict): raise ValueError('YAML must contain a mapping')
-    device=torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+    from sknext.utils.parallel import configure_visible_devices
+    configure_visible_devices(args.gpu)
+    device=torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     run(cfg, args.run_id, device, mode=args.mode, overwrite=args.overwrite)
 
 

@@ -110,6 +110,39 @@ class SemanticTiffInferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Cannot resume'):
             self.infer()
 
+    def test_parallel_block_results_match_serial_at_volume_edges(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from sknext.utils.inference_workers import ordered_bounded_map
+        raw = np.arange(3*5*6, dtype=np.uint16).reshape(3,5,6) + 1
+        tifffile.imwrite(self.raw / 'a.tif', raw, photometric='minisblack')
+        self.infer()
+        source = self.raw / 'a.tif'
+        output = self.base / 'parallel.zarr'
+        ns, cfg = self.ns, self.cfg
+        model = ns['make_model'](cfg, torch.device('cpu'))
+        def predict(job):
+            reader, channels = ns['_input_reader'](source, [0])
+            try:
+                low, high = job['low'], job['high']
+                key = tuple(slice(int(a), int(b)) for a,b in zip(low, high))
+                block = np.stack([reader[(ch,*key)] for ch in channels])
+                probs = ns['_predict_block'](model, block, cfg, torch.device('cpu'), ['S.ER','S.mito'], False)
+                local = tuple(slice(int(a-b),int(c-b)) for a,c,b in zip(job['start'],job['stop'],low))
+                return np.ascontiguousarray(probs[(slice(None),*local)])
+            finally:
+                reader.close()
+        with ThreadPoolExecutor(2) as executor:
+            class Pool:
+                def map(self, jobs):
+                    return ordered_bounded_map([executor, executor], predict, jobs)
+            ns['_infer_source'](None, cfg, 7, torch.device('cpu'), ['S.ER','S.mito'], [0],
+                                False, source, output, False, Pool())
+        serial = self.output / 'a_semantic_7.ome.zarr'
+        for a,b in ((serial, output), (serial.with_name(serial.name[:-5]+'_prob.zarr'),
+                                      output.with_name('parallel_prob.zarr'))):
+            with ns['ZarrIOManager'](a, mode='r') as first, ns['ZarrIOManager'](b, mode='r') as second:
+                np.testing.assert_array_equal(first[:], second[:])
+
     def test_resume_with_changed_batch_size_preserves_completed_blocks(self):
         tifffile.imwrite(self.raw / 'a.tif', np.ones((3, 5, 6), dtype='uint16'),
                          photometric='minisblack')

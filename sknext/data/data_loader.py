@@ -50,6 +50,18 @@ class ZarrPatchLoader:
         """Return the number of stored patches, rather than the number of batches."""
         return self.num_patches
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Never send open Zarr stores or async runtimes to spawned loader workers.
+        state.update(store=None, root=None, arrays=None)
+        return state
+
+    def _ensure_open(self):
+        if self.arrays is None:
+            self.store = LocalStore(str(self.zarr_path))
+            self.root = zarr.open_group(store=self.store, mode='r')
+            self.arrays = {name: self.root[name] for name in self.dataset_name}
+
     def load_one_pair_patch(self, id:int) -> tuple[np.ndarray, np.ndarray]:
         """Read a raw/label pair at the zero-based patch id.
 
@@ -61,6 +73,7 @@ class ZarrPatchLoader:
         """
         if id < 0 or id >= self.num_patches:
             raise IndexError(f"Patch id out of range: {id}, valid range is [0, {self.num_patches - 1}]")
+        self._ensure_open()
         raw_arr = self.arrays[self.dataset_name[0]]
         raw_patch = np.asarray(raw_arr[id, :, :, :, :])
         raw_patch = np.transpose(raw_patch, (1, 2, 3, 0))  # CZYX -> ZYXC

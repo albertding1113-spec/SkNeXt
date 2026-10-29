@@ -134,6 +134,13 @@ def load_model_weights(
 
 def _restore_rng(state: Mapping[str, Any]) -> None:
     """Restore available RNG fields; never require them for continuation."""
+    if state.get('rng_by_rank'):
+        from sknext.utils.execution import rank, world_size
+        states = state['rng_by_rank']
+        if len(states) != world_size():
+            warnings.warn('GPU count changed; stochastic training will not be bitwise reproducible.',
+                          RuntimeWarning, stacklevel=2)
+        state = states[rank() % len(states)]
     if state.get("rng_python") is not None:
         random.setstate(state["rng_python"])
     if state.get("rng_numpy") is not None:
@@ -143,7 +150,10 @@ def _restore_rng(state: Mapping[str, Any]) -> None:
     if state.get("rng_torch") is not None:
         torch.set_rng_state(state["rng_torch"])
     if torch.cuda.is_available() and state.get("rng_cuda"):
-        torch.cuda.set_rng_state_all(state["rng_cuda"])
+        if state.get('rng_cuda_local'):
+            torch.cuda.set_rng_state(state['rng_cuda'][0])
+        else:
+            torch.cuda.set_rng_state_all(state["rng_cuda"])
 
 
 def training_checkpoint_paths(input_path: str | Path) -> tuple[Path, Path]:

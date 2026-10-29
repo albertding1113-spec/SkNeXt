@@ -21,6 +21,8 @@ class SkNeXt_Config:
         _C = CN()
         _C.SYSTEM = CN()
         _C.SYSTEM.DEVICE = 'gpu'
+        _C.SYSTEM.CPU_THREADS = 0  # 0: automatically cap native threads per GPU process
+        _C.SYSTEM.DISTRIBUTED_TIMEOUT_SECONDS = 21600  # allow large shared patch-store preparation
         # 2. PATH
         _C.PATHS = CN()
         _C.PATHS.RESULT_DIR = CN()
@@ -360,7 +362,8 @@ class SkNeXt_Config:
         _C.TRAIN = CN()
         _C.TRAIN.ENABLE = False
         # Semantic-only runner options.
-        _C.TRAIN.NUM_WORKERS = 0
+        _C.TRAIN.NUM_WORKERS = -1  # -1: CPU-budgeted automatic loading workers per GPU
+        _C.TRAIN.PREFETCH_FACTOR = 1
         _C.TRAIN.AMP = True
         _C.TRAIN.BCE_WEIGHT = 1.0
         _C.TRAIN.DICE_WEIGHT = 1.0
@@ -399,6 +402,8 @@ class SkNeXt_Config:
         _C.INFER.SAVE_PROBABILITIES = False
         _C.INFER.SKIP_ZERO_PATCHES = True
         _C.INFER.AMP = True
+        _C.INFER.BATCH_SIZE = 0  # 0: divide TRAIN.BATCH_SIZE over GPU workers (at least one)
+        _C.INFER.PARALLEL_BLOCKS = True
         # 'uint16': watershed + semantic labels (legacy name); actual stored dtype
         #           is uint32 when skeleton-free instance labeling is enabled.
         # 'float32': sigmoid probability channels only (no watershed).

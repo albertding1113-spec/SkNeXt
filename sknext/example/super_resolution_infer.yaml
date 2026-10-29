@@ -18,7 +18,7 @@ DATA:
     GT_PATH: "/path/to/val/gt"
   INFER:
     PATH: "/path/to/infer/raw"  # directory TIFF, TIFF file, OME-Zarr, or IMS
-    GT_PATH: '/.ome.zarr'
+    GT_PATH: "/path/to/infer/output"  # output directory; single input also accepts an exact .zarr path
     CHANNEL: [0]
 
 AUGMENTOR:

@@ -91,18 +91,30 @@ def print_model_parameters(model: nn.Module, print_detail: bool = True):
     log_message("=" * 120)
 
 
-def print_cuda_memory(device: torch.device | None = None, prefix: str = ""):
+def print_cuda_memory(device: torch.device | None = None, prefix: str = "", *,
+                      all_devices: bool = False):
     """
     Print allocator usage and device-wide free/used memory in MiB.
 
     Allocated/reserved values belong to this PyTorch process. Peak values are
     measured since the last CUDA peak reset. Device used includes other processes.
     Explicit CPU devices skip CUDA queries, even on machines with a GPU.
+    With all_devices=True, report every CUDA device visible to this process.
     """
     if device is not None and device.type != "cuda":
         return
     if not torch.cuda.is_available():
         log_message("CUDA is not available.", flush=True)
+        return
+
+    # Process workers own one device. Querying every device here would create
+    # unnecessary CUDA contexts on their peers (and report the wrong allocator).
+    from sknext.utils.execution import world_size
+    if all_devices and world_size() > 1:
+        all_devices = False
+    if all_devices:
+        for index in range(torch.cuda.device_count()):
+            print_cuda_memory(torch.device(f"cuda:{index}"), prefix=prefix)
         return
 
     if device is None:

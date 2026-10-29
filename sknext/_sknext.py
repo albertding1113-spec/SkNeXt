@@ -66,7 +66,8 @@ class SkNeXt:
         if self.device_type == "cpu":
             raise EnvironmentError("CPU device not recommended.")
         elif self.device_type in ["gpu", "cuda"]:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
+            from sknext.utils.parallel import configure_visible_devices
+            configure_visible_devices(self.gpu)
         assert torch.cuda.is_available(), "CUDA device not available."
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
@@ -75,6 +76,12 @@ class SkNeXt:
 
     def run(self):
         """Select the runner from TASK.CHANNELS, with mode supplied by the YAML."""
+        from sknext.utils.execution import world_size, launch_training, configure_threads
+        count = getattr(torch.cuda, 'device_count', lambda: 1)()
+        if self.cfg.TRAIN.ENABLE and count > 1 and world_size() == 1:
+            return launch_training(self.cfg, self.run_id, self.workflow, count)
+        if hasattr(torch, 'set_num_threads'):
+            configure_threads(self.cfg, world_size())
         print(f"Workflow: {self.workflow}", flush=True)
         if self.workflow == "semantic":
             from sknext.run.semantic_workflow import run

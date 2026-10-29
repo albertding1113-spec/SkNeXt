@@ -53,7 +53,9 @@ for module, attribute, kind in (
     stub = types.ModuleType(module)
     setattr(stub, attribute, runner(kind))
     sys.modules[module] = stub
-sys.argv = ['sknext', '--config', sys.argv[1], '--run_id', '9', '--gpu', 'GPU-selected']
+selector = sys.argv[2]
+os.environ['CUDA_VISIBLE_DEVICES'] = '3,2,1'
+sys.argv = ['sknext', '--config', sys.argv[1], '--run_id', '9', '--gpu', selector]
 from sknext import main
 try:
     main()
@@ -64,12 +66,12 @@ print('DISPATCH_RESULT=' + json.dumps(events))
 
 
 class CliDispatchTests(unittest.TestCase):
-    def launch(self, cfg, expected=None, error=None):
+    def launch(self, cfg, expected=None, error=None, gpu='GPU-selected'):
         with tempfile.TemporaryDirectory() as folder:
             cfg.setdefault('PATHS', {}).setdefault('RESULT_DIR', {})['PATH'] = folder
             path = Path(folder) / 'config.yaml'
             path.write_text(yaml.safe_dump(cfg), encoding='utf-8')
-            proc = subprocess.run([sys.executable, '-c', PROBE, str(path)], cwd=ROOT,
+            proc = subprocess.run([sys.executable, '-c', PROBE, str(path), gpu], cwd=ROOT,
                                   capture_output=True, text=True, timeout=30)
             if error:
                 self.assertNotEqual(proc.returncode, 0)
@@ -83,9 +85,20 @@ class CliDispatchTests(unittest.TestCase):
             self.assertEqual(event['kind'], expected)
             self.assertEqual(event['run_id'], 9)
             self.assertEqual(event['device'], 'cuda:0')
-            self.assertEqual(event['visible_gpu'], 'GPU-selected')
+            self.assertEqual(event['visible_gpu'], '3,2,1' if gpu == 'all' else gpu)
             self.assertEqual(Path(event['result']), Path(folder) / 'results' / '9')
             return event
+
+    def test_multi_gpu_selectors_dispatch_every_workflow(self):
+        for gpu in ('0,1', '0,1,2', 'all'):
+            for channels, kind in ((['F', 'P'], 'segmentation'),
+                                   (['S.a'], 'semantic'), (['SR'], 'restoration')):
+                for training in (True, False):
+                    with self.subTest(gpu=gpu, channels=channels, training=training):
+                        expected = kind + ('_train' if training else '_infer') if kind == 'semantic' else kind
+                        self.launch({'TASK': {'CHANNELS': channels},
+                                     'TRAIN': {'ENABLE': training}, 'INFER': {'ENABLE': not training}},
+                                    expected, gpu=gpu)
 
     def test_all_bundled_examples_route_through_cli(self):
         for path in sorted((ROOT / 'sknext/example').glob('*.yaml')):

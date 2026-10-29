@@ -24,10 +24,12 @@ from sknext.data.label import watershed_with_sk
 from sknext.data.preprocessing import reflect_padding_img, preprocess_img
 from sknext.data.postprocessing import post_processing_instance, post_processing_semantic
 from sknext.model.unext_v2 import U_NeXt_V2
+from sknext.utils.execution import (prepare_once, make_loader, set_epoch, primary,
+    reduce_metrics, validation_model, training_rng_states)
 from sknext.model.scheduler import build_onecycle_scheduler, build_warmup_cosine_scheduler
 from sknext.utils.utils import get_cfg_value, time_str
 from sknext.model.loss import instance_segmentation_loss, instance_segmentation_metrics
-from sknext.utils.model_info import print_model_parameters, profile_forward_memory
+from sknext.utils.model_info import print_cuda_memory, print_model_parameters, profile_forward_memory
 from sknext.utils.checkpoint import (read_checkpoint, load_model_weights,
                                      restore_training_checkpoint, training_checkpoint_paths)
 
@@ -122,6 +124,12 @@ class Segmentation_Workflow(Base_Workflow):
                          self.val_overlap, self.val_padding, self.preprocess_dict, self.channels,
                          self.channels_extra_opts, filter_dict=None, normalize_per_patch=True)
 
+    def _prepare_training_stores(self):
+        self.save_patch_as_zarr()
+        return {key: getattr(self, key) for key in (
+            'train_tif_list', 'val_tif_list', 'train_gt_tif_dict', 'val_gt_tif_dict',
+            'train_zarr_path', 'val_zarr_path')}
+
     def define_activations_and_channels(self):
         """Expand task channels into model output names and initialize linear heads.
 
@@ -215,7 +223,9 @@ class Segmentation_Workflow(Base_Workflow):
                                stem_k_size=self.convnext_stem_k_size,
                                contrast=False,
                                return_one_tensor=False)
-        self.model.to(self.device)
+        from sknext.utils.parallel import parallel_model
+        self.model = parallel_model(self.model, self.device,
+                                    self.batch_size if self.cfg.TRAIN.ENABLE else None)
         if self.cfg.TRAIN.ENABLE:
             self.model.train()
         else:
@@ -323,12 +333,14 @@ class Segmentation_Workflow(Base_Workflow):
             "model_name": self.model_name, "model_state_dict": model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
             "best_val_loss": float(self.best_val_loss),
             "best_val_metrics": dict(best_val_metrics),
             "epochs_without_improvement": int(epochs_without_improvement),
             "chart_history": self._chart_history,
             "rng_torch": torch.get_rng_state(),
-            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            "rng_cuda": self._rng_states[0]["rng_cuda"],
+            "rng_by_rank": self._rng_states,
             "rng_python": random.getstate(),
             "rng_numpy": (numpy_rng[0], numpy_rng[1].tolist(),
                           numpy_rng[2], numpy_rng[3], numpy_rng[4]),
@@ -347,7 +359,7 @@ class Segmentation_Workflow(Base_Workflow):
             self.model, self.optimizer, self.scheduler,
             latest_path=latest,
             best_path=best,
-            identity=self._training_identity(), epochs=self.epochs,
+            identity=self._training_identity(), epochs=self.epochs, scaler=self.scaler,
             expected_architecture=self.model_name,
             expected_channels=list(self.output_channel_names),
             allow_partial=bool(get_cfg_value(self.cfg, "MODEL.CHECKPOINT_ALLOW_PARTIAL", False)))
@@ -516,23 +528,29 @@ class Segmentation_Workflow(Base_Workflow):
             from sknext.run.restoration_workflow import RestorationWorkflow
             return RestorationWorkflow(self.cfg, self.device, self.job_id).train()
         print(f"{time_str()} preparing training data", flush=True)
-        self.save_patch_as_zarr()
+        prepared = prepare_once(self._prepare_training_stores)
+        for key, value in prepared.items():
+            setattr(self, key, value)
         print(f"{time_str()} preparing data loader", flush=True)
         self.train_patch_loader = ZarrPatchLoader(self.cfg, self.train_zarr_path, if_val=False)
         self.val_patch_loader = ZarrPatchLoader(self.cfg, self.val_zarr_path, if_val=True)
         self.train_patches = len(self.train_patch_loader)
         self.val_patches = len(self.val_patch_loader)
-        self.train_steps_per_epoch = math.ceil(self.train_patches / self.batch_size)
-        self.val_steps_per_epoch = math.ceil(self.val_patches / self.batch_size)
+        train_loader = make_loader(self.train_patch_loader, self.cfg, self.device,
+                                   shuffle=bool(get_cfg_value(self.cfg, "AUGMENTOR.SHUFFLE_TRAIN_DATA_EACH_EPOCH", True)))
+        val_loader = make_loader(self.val_patch_loader, self.cfg, self.device, training=False)
+        self.train_steps_per_epoch = len(train_loader)
+        self.val_steps_per_epoch = len(val_loader)
         print(f"{time_str()} preparing model", flush=True)
         self.set_model()
         print_model_parameters(self.model)
-        profile_forward_memory(self.model, input_shape=(self.batch_size,self.patch_size[-1],*self.patch_size[:-1],), device=self.device)
         torch.cuda.empty_cache()
         print(f"{time_str()} preparing optimizer and scheduler", flush=True)
         self.set_optimizer_scheduler()
         print(f"{time_str()} preparing loss function and metrics", flush=True)
         self.set_loss_metrics()
+        amp = self.device.type == "cuda" and bool(self.cfg.TRAIN.AMP)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=amp)
         resume = bool(self.cfg.TRAIN.RESUME)
         if resume and self.load_checkpoint_flag:
             raise ValueError("TRAIN.RESUME and MODEL.LOAD_CHECKPOINT are mutually exclusive")
@@ -552,25 +570,21 @@ class Segmentation_Workflow(Base_Workflow):
             epoch_number = epoch + 1
             print(f"{time_str()} [EPOCH{epoch_number:04d}]", flush=True)
             # Generate a fresh permutation at the beginning of every epoch.
-            # Every training patch is still used exactly once per epoch.
-            train_indices = self.train_patch_loader.get_epoch_indices(shuffle=shuffle_train,)
+            # DistributedSampler may pad the last training shard to equalize steps.
+            set_epoch(train_loader, epoch)
             self.model.train()
             epoch_train_loss = 0
             epoch_train_metrics = {}  # {"F" 0.0:, "P": 0.0}
             epoch_train_patches = 0
-            for step in range(self.train_steps_per_epoch):
-                # clear optimizer grad before starting everything
-                self.optimizer.zero_grad()
-                start_ = step * self.batch_size
-                end_ = min((step + 1) * self.batch_size, self.train_patches)
-                batch_indices = train_indices[start_:end_]
-                img, mask = self.train_patch_loader[batch_indices]
+            for step, (img, mask) in enumerate(train_loader):
+                self.optimizer.zero_grad(set_to_none=True)
                 img = img.to(self.device, non_blocking=True)
                 mask = mask.to(self.device, non_blocking=True)
-                pred = self.model(img)
-                step_loss = self.loss_func(pred, mask)
+                with torch.autocast("cuda", enabled=amp):
+                    pred = self.model(img)
+                    step_loss = self.loss_func(pred.float(), mask)
                 step_metrics = self.metric(pred, mask)
-                step_patches = end_ - start_
+                step_patches = len(img)
                 # update epoch loss and metrics
                 epoch_train_loss += float(step_loss.item()) * step_patches
                 for key, value in step_metrics.items():
@@ -581,11 +595,14 @@ class Segmentation_Workflow(Base_Workflow):
                     metric_str = " ".join(f"{key} channel: {value:.6f}," for key, value in step_metrics.items())
                     print(f"{time_str()} [EPOCH{epoch_number:04d}] [TRAIN] [{epoch_train_patches:06d}/{self.train_patches:06d}], loss: {step_loss: 6f}, {metric_str}, lr: {self.optimizer.param_groups[0]['lr']:.6f}", flush=True)
                 # backward
-                step_loss.backward()
-                self.optimizer.step()
+                self.scaler.scale(step_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 self.scheduler.step()
             # calculate epoch loss and metrics
-            epoch_train_loss = epoch_train_loss / epoch_train_patches
+            epoch_train_loss, epoch_train_patches, epoch_train_metrics = reduce_metrics(
+                epoch_train_loss, epoch_train_patches, epoch_train_metrics, self.device)
+            epoch_train_loss = epoch_train_loss / max(1, epoch_train_patches)
             for key, value in epoch_train_metrics.items():
                 epoch_train_metrics[key] = epoch_train_metrics.get(key, 0.0) / epoch_train_patches
             # print epoch loss and metrics
@@ -593,23 +610,19 @@ class Segmentation_Workflow(Base_Workflow):
             print(f"{time_str()} [EPOCH{epoch_number:04d}] [TRAIN] loss: {epoch_train_loss:.6f}, {metric_str}", flush=True)
 
             # validation
-            val_indices = self.val_patch_loader.get_epoch_indices(shuffle=shuffle_val,)
             self.model.eval()
             epoch_val_loss = 0
             epoch_val_metrics = {}
             epoch_val_patches = 0
             with torch.no_grad():
-                for step in range(self.val_steps_per_epoch):
-                    start_ = step * self.batch_size
-                    end_ = min((step + 1) * self.batch_size, self.val_patches)
-                    batch_indices = val_indices[start_:end_]
-                    img, mask = self.val_patch_loader[batch_indices]
+                for step, (img, mask) in enumerate(val_loader):
                     img = img.to(self.device, non_blocking=True)
                     mask = mask.to(self.device, non_blocking=True)
-                    pred = self.model(img)
-                    step_loss = self.loss_func(pred, mask)
+                    with torch.autocast("cuda", enabled=amp):
+                        pred = validation_model(self.model)(img)
+                        step_loss = self.loss_func(pred.float(), mask)
                     step_metrics = self.metric(pred, mask)
-                    step_patches = end_ - start_
+                    step_patches = len(img)
                     # update epoch loss and metrics
                     epoch_val_loss += float(step_loss.item()) * step_patches
                     for key, value in step_metrics.items():
@@ -620,7 +633,9 @@ class Segmentation_Workflow(Base_Workflow):
                         metric_str = " ".join(f"{key} channel: {value:.6f}," for key, value in step_metrics.items())
                         print(f"{time_str()} [EPOCH{epoch_number:04d}] [VAL] [{epoch_val_patches:06d}/{self.val_patches:06d}], loss: {step_loss: 6f}, {metric_str}", flush=True)
             # calculate epoch loss and metrics
-            epoch_val_loss = epoch_val_loss / epoch_val_patches
+            epoch_val_loss, epoch_val_patches, epoch_val_metrics = reduce_metrics(
+                epoch_val_loss, epoch_val_patches, epoch_val_metrics, self.device)
+            epoch_val_loss = epoch_val_loss / max(1, epoch_val_patches)
             for key, value in epoch_val_metrics.items():
                 epoch_val_metrics[key] = epoch_val_metrics.get(key, 0.0) / epoch_val_patches
             # print epoch loss and metric
@@ -632,8 +647,10 @@ class Segmentation_Workflow(Base_Workflow):
                 self._log_scalars(f"{key} channel",{"train_metric": epoch_train_metrics[key], "val_metric": epoch_val_metrics[key]}, epoch_number)
             self._log_scalars( "Learning Rate",{"lr": self.optimizer.param_groups[0]["lr"]},  epoch_number)
             # Export all current log charts every five completed epochs.
-            if epoch_number % 5 == 0:
+            if primary() and epoch_number % 5 == 0:
                 self.save_log_charts(epoch_number)
+                print_cuda_memory(self.device, prefix=f"[SEGMENTATION TRAIN] epoch {epoch_number}, after validation",
+                                  all_devices=True)
             # update best_loss and patience
             if epoch_val_loss < best_val_loss:
                 metric_str = " ".join(f"{key} channel: {value:.6f}," for key, value in epoch_val_metrics.items())
@@ -642,12 +659,15 @@ class Segmentation_Workflow(Base_Workflow):
                 best_val_loss = epoch_val_loss
                 self.best_val_loss = best_val_loss
                 best_val_metrics = epoch_val_metrics
-                self.save_checkpoint()
+                if primary():
+                    self.save_checkpoint()
             else:
                 epochs_without_improvement += 1
                 print(f"{time_str()} no improvement, Patience: {epochs_without_improvement:04d}/{self.patience:04d}", flush=True)
             # Save last epoch even when validation did not improve (required for exact resume).
-            self.save_training_state(epoch_number, best_val_metrics, epochs_without_improvement)
+            self._rng_states = training_rng_states()
+            if primary():
+                self.save_training_state(epoch_number, best_val_metrics, epochs_without_improvement)
             if self.patience > 0 and epochs_without_improvement >= self.patience:
                 print(f"{time_str()} Early stopping after epoch {epoch_number}. "
                       f"Best validation loss: {best_val_loss:.6f}", flush=True)
@@ -664,14 +684,16 @@ class Segmentation_Workflow(Base_Workflow):
         if "SR" in self.channels:
             from sknext.run.restoration_workflow import RestorationWorkflow
             return RestorationWorkflow(self.cfg, self.device, self.job_id).infer()
-        print(f"{time_str()} preparing model", flush=True)
-        self.set_model()
-        print_model_parameters(self.model)
-        profile_forward_memory(self.model, input_shape=(self.batch_size, self.patch_size[-1], *self.patch_size[:-1],),
-                               device=self.device)
-        torch.cuda.empty_cache()
-        self.load_checkpoint()
-        self.model.eval()
+        from sknext.utils.inference_workers import BlockPool, parallel_inference_enabled
+        from contextlib import ExitStack
+        use_pool = parallel_inference_enabled(self.cfg, self.device)
+        if use_pool:
+            self.define_activations_and_channels()
+        else:
+            self.set_model()
+            self.load_checkpoint()
+            self.model.eval()
+            print_model_parameters(self.model)
         self.define_postprocess_channels()
         # Preflight the watershed before any reader or writer is opened.
         self.infer_path = Path(self.infer_path)
@@ -696,46 +718,65 @@ class Segmentation_Workflow(Base_Workflow):
             if self.save_segmentation and hasattr(self, "skeleton_manager"):
                 self.infer_writer.root.attrs["sknext_swc_id_mapping"] = self.skeleton_manager.validate_instance_mapping()
 
-            for block_num, c_coord in enumerate(coord_iter):
-                if block_num < self.inferred_block_num:
-                    continue
-                # The *only* block halo is calculated in Base_Workflow from
-                # DATA.INFER.BLOCK_FACTOR and DATA.INFER.BLOCK_CENTRAL_FACTOR.
-                # Both prediction/watershed and cross-block ID matching use
-                # these same coordinates; no separate segmentation halo exists.
-                coord, coord_in_block = get_coord_after_padding(
-                    self.infer_reader.shape[1:4], c_coord, self.block_padding)
-                if hasattr(self, "skeleton_manager"):
-                    cropped_skeleton = self.skeleton_manager.crop_skeletons(coord)
+            def block_jobs():
+                for block_num, c_coord in enumerate(coord_iter):
+                    if block_num < self.inferred_block_num:
+                        continue
+                    # The *only* block halo is calculated in Base_Workflow from
+                    # DATA.INFER.BLOCK_FACTOR and DATA.INFER.BLOCK_CENTRAL_FACTOR.
+                    # Both prediction/watershed and cross-block ID matching use
+                    # these same coordinates; no separate segmentation halo exists.
+                    coord, coord_in_block = get_coord_after_padding(
+                        self.infer_reader.shape[1:4], c_coord, self.block_padding)
+                    if hasattr(self, "skeleton_manager"):
+                        cropped_skeleton = self.skeleton_manager.crop_skeletons(coord)
+                    else:
+                        cropped_skeleton = []
+                    should_predict = (not self.skeleton_flag) or bool(len(cropped_skeleton)) or self.raw_all_blocks
+                    yield dict(id=block_num, total=self.total_block_num, central=c_coord,
+                               coord=coord, local=coord_in_block, skeleton=cropped_skeleton,
+                               predict=should_predict)
+
+            with ExitStack() as stack:
+                if use_pool:
+                    pool = stack.enter_context(BlockPool(self.cfg, self.job_id, 'segmentation'))
+                    results = pool.map(block_jobs())
                 else:
-                    cropped_skeleton = []
-                should_predict = (not self.skeleton_flag) or bool(len(cropped_skeleton)) or self.raw_all_blocks
-                if should_predict:
-                    prediction_mode = f"{len(cropped_skeleton)} skeletons" if self.skeleton_flag else "whole-volume, no SWC"
-                    print(f"{time_str()} [BLOCK{block_num:07d}/{self.total_block_num:07d}] "
-                          f"[INFER] predicting ({prediction_mode})", flush=True)
-                    seg_result, raw_result = self._infer_one_block(coord, cropped_skeleton)
-                    if self.save_segmentation and self.instance_num and not self.skeleton_flag:
-                        # Relabel local watershed IDs to unique uint32 IDs, reusing
-                        # a previous ID only for reliable matches in processed halos.
-                        seg_result = self._stitch_instance_block(
-                            seg_result, coord, coord_in_block, block_num)
-                    central_slices = (
-                        slice(None),
-                        slice(int(coord_in_block[0, 0]), int(coord_in_block[0, 1])),
-                        slice(int(coord_in_block[1, 0]), int(coord_in_block[1, 1])),
-                        slice(int(coord_in_block[2, 0]), int(coord_in_block[2, 1])),
-                    )
-                    start = (0, int(c_coord[0, 0]), int(c_coord[1, 0]), int(c_coord[2, 0]))
-                    if self.save_segmentation:
-                        self.infer_writer.write_block(seg_result[central_slices], start=start)
-                    if self.save_raw_predictions:
-                        self.infer_raw_writer.write_block(raw_result[central_slices], start=start)
-                    print(f"{time_str()} [BLOCK{block_num:07d}/{self.total_block_num:07d}] "
-                          "[INFER] requested results saved", flush=True)
-                # A block is committed only after all its selected output writes.
-                self.inferred_block_num = block_num + 1
-                self.save_infer_log()
+                    results = ((job, self._infer_one_block(job['coord'], job['skeleton'])
+                                if job['predict'] else (None, None)) for job in block_jobs())
+                for job, (seg_result, raw_result) in results:
+                    block_num, c_coord = job['id'], job['central']
+                    coord, coord_in_block = job['coord'], job['local']
+                    cropped_skeleton, should_predict = job['skeleton'], job['predict']
+                    if should_predict:
+                        prediction_mode = f"{len(cropped_skeleton)} skeletons" if self.skeleton_flag else "whole-volume, no SWC"
+                        print(f"{time_str()} [BLOCK{block_num:07d}/{self.total_block_num:07d}] "
+                              f"[INFER] committing prediction ({prediction_mode})", flush=True)
+                        if self.save_segmentation and self.instance_num and not self.skeleton_flag:
+                            # Relabel local watershed IDs to unique uint32 IDs, reusing
+                            # a previous ID only for reliable matches in processed halos.
+                            seg_result = self._stitch_instance_block(
+                                seg_result, coord, coord_in_block, block_num)
+                        central_slices = (
+                            slice(None),
+                            slice(int(coord_in_block[0, 0]), int(coord_in_block[0, 1])),
+                            slice(int(coord_in_block[1, 0]), int(coord_in_block[1, 1])),
+                            slice(int(coord_in_block[2, 0]), int(coord_in_block[2, 1])),
+                        )
+                        start = (0, int(c_coord[0, 0]), int(c_coord[1, 0]), int(c_coord[2, 0]))
+                        if self.save_segmentation:
+                            self.infer_writer.write_block(seg_result[central_slices], start=start)
+                        if self.save_raw_predictions:
+                            self.infer_raw_writer.write_block(raw_result[central_slices], start=start)
+                        print(f"{time_str()} [BLOCK{block_num:07d}/{self.total_block_num:07d}] "
+                              "[INFER] requested results saved", flush=True)
+                    # A block is committed only after all its selected output writes.
+                    self.inferred_block_num = block_num + 1
+                    self.save_infer_log()
+                    if not use_pool and self.inferred_block_num % 20 == 0:
+                        print_cuda_memory(self.device,
+                                          prefix=f"[SEGMENTATION INFER] block {self.inferred_block_num}/{self.total_block_num}",
+                                          all_devices=True)
             infer_completed = True
         except Exception as e:
             print(f"Error type: {type(e).__name__}")
@@ -807,8 +848,10 @@ class Segmentation_Workflow(Base_Workflow):
                     overlap_widths[axis, 1] = max(0, current_interval[1] - next_interval[0],)
             patch_overlap_widths.append(overlap_widths)
 
-        for batch_start in range(0, len(all_patch_coords), self.batch_size):
-            batch_end = min(batch_start + self.batch_size, len(all_patch_coords),)
+        from sknext.utils.parallel import inference_batch_size, configured_inference_batch
+        batch_size = inference_batch_size(self.model, configured_inference_batch(self.cfg))
+        for batch_start in range(0, len(all_patch_coords), batch_size):
+            batch_end = min(batch_start + batch_size, len(all_patch_coords),)
             block_pred_sum, block_weight_sum = self._infer_one_batch(
                 block_pred_sum,
                 block_weight_sum,

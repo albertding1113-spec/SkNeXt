@@ -33,6 +33,9 @@ from sknext.data.imageIO import get_tif_path_in_folder, read_one_3D_tif, patch_c
 from sknext.data.augmentor import PairedAugmentor
 from sknext.data.datasetIO import IMSReader, ZarrIOManager, detect_path_type
 from sknext.model.unext_v2 import U_NeXt_V2
+from sknext.utils.parallel import model_state_dict
+from sknext.utils.execution import (prepare_once, make_loader, set_epoch, primary,
+    reduce_sums, validation_model, NullWriter, training_rng_states)
 from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle_scheduler
 from sknext.utils.checkpoint import read_checkpoint, load_model_weights
 from sknext.utils.model_info import print_cuda_memory, print_model_parameters
@@ -407,7 +410,7 @@ class RestorationWorkflow:
         cfg = self.cfg
         if str(cfg.MODEL.ARCHITECTURE).lower().replace("-", "_") not in {"unext_v2", "u_next_v2"}:
             raise ValueError("SR workflow currently supports only U_NeXt_V2")
-        return U_NeXt_V2(
+        model = U_NeXt_V2(
             image_shape=tuple(map(int, cfg.DATA.PATCH_SIZE)),
             feature_maps=list(cfg.MODEL.FEATURE_MAPS), z_down=list(cfg.MODEL.Z_DOWN),
             yx_down=list(cfg.MODEL.YX_DOWN), cn_layers=list(cfg.MODEL.CONVNEXT_LAYERS),
@@ -416,7 +419,10 @@ class RestorationWorkflow:
             output_channels=[self.ch], output_channel_info=["SR"],
             explicit_activations=False, separated_decoders=False,
             upsampling_factor=(1, self.scale, self.scale) if self.scale > 1 else (),
-            upsampling_position="post").to(self.device)
+            upsampling_position="post")
+        from sknext.utils.parallel import parallel_model
+        return parallel_model(model, self.device, cfg.TRAIN.BATCH_SIZE
+                              if cfg.TRAIN.ENABLE else None)
 
     def _identity(self) -> str:
         cfg = self.cfg
@@ -448,7 +454,7 @@ class RestorationWorkflow:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def _checkpoint_data(self, epoch, model, optimizer=None, scheduler=None, best=None):
-        return {"model_state_dict": model.state_dict(), "model_name": "U_NeXt_V2",
+        return {"model_state_dict": model_state_dict(model), "model_name": "U_NeXt_V2",
                 "normalization_policy": "per_image_minmax_v1",
                 "output_channel_names": ["SR"], "scale": self.scale,
                 "input_channels": self.ch, "patch_size": list(self.patch),
@@ -458,7 +464,9 @@ class RestorationWorkflow:
                 "z_down": list(self.cfg.MODEL.Z_DOWN),
                 "yx_down": list(self.cfg.MODEL.YX_DOWN),
                 "epoch": epoch, "best_val_loss": best, "identity": self._identity(),
+                "rng_by_rank": getattr(self, "_rng_states", []),
                 "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+                "scaler_state_dict": self.scaler.state_dict() if hasattr(self, "scaler") else None,
                 "scheduler_state_dict": scheduler.state_dict() if scheduler else None}
 
     @staticmethod
@@ -501,12 +509,13 @@ class RestorationWorkflow:
             path = (self.latest if cfg.TRAIN.RESUME else
                     Path(cfg.MODEL.CHECKPOINT_INPUT_PATH) if cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint)
             self._validate_intensity_policy(read_checkpoint(path))
-        (self.workdir / "sr_intensity_ranges.json").write_text(json.dumps({
-            "raw_range": list(cfg.SR.RAW_RANGE), "gt_range": list(cfg.SR.GT_RANGE),
-            "normalization_policy": "per_image_minmax_v1",
-        }, indent=2), encoding="utf-8")
-        train_path = make_sr_patch_store(cfg, "TRAIN", self.workdir / "train_sr_patches.zarr")
-        val_path = make_sr_patch_store(cfg, "VAL", self.workdir / "val_sr_patches.zarr")
+        if primary():
+            (self.workdir / "sr_intensity_ranges.json").write_text(json.dumps({
+                "raw_range": list(cfg.SR.RAW_RANGE), "gt_range": list(cfg.SR.GT_RANGE),
+                "normalization_policy": "per_image_minmax_v1",
+            }, indent=2), encoding="utf-8")
+        train_path = prepare_once(make_sr_patch_store, cfg, "TRAIN", self.workdir / "train_sr_patches.zarr")
+        val_path = prepare_once(make_sr_patch_store, cfg, "VAL", self.workdir / "val_sr_patches.zarr")
         ds_train = SRPatchDataset(train_path, train=True, cfg=cfg,
                                   noise_std=float(cfg.SR.AUGMENT_NOISE_STD),
                                   blur_sigma=float(cfg.SR.AUGMENT_BLUR_SIGMA))
@@ -514,8 +523,8 @@ class RestorationWorkflow:
         batch = int(cfg.TRAIN.BATCH_SIZE)
         if batch < 1:
             raise ValueError("TRAIN.BATCH_SIZE must be positive")
-        train_dl = DataLoader(ds_train, batch_size=batch, shuffle=True, num_workers=0)
-        val_dl = DataLoader(ds_val, batch_size=batch, shuffle=False, num_workers=0)
+        train_dl = make_loader(ds_train, cfg, self.device)
+        val_dl = make_loader(ds_val, cfg, self.device, training=False)
         model = self.build_model()
         log_message(model)
         print_model_parameters(model)
@@ -546,6 +555,8 @@ class RestorationWorkflow:
                                                  epochs=int(cfg.TRAIN.EPOCHS), steps_per_epoch=steps)
         else:
             raise ValueError(f"Unsupported scheduler {schedname}")
+        amp = self.device.type == "cuda" and bool(cfg.TRAIN.AMP)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=amp)
         start, best, stagnation = 0, float("inf"), 0
         if cfg.TRAIN.RESUME:
             state = self._load(model, self.latest)
@@ -555,6 +566,10 @@ class RestorationWorkflow:
                 raise ValueError("SR resume requires complete optimizer/scheduler states")
             opt.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"])
+            if state.get("scaler_state_dict"):
+                self.scaler.load_state_dict(state["scaler_state_dict"])
+            from sknext.utils.checkpoint import _restore_rng
+            _restore_rng(state)
             start = int(state["epoch"])
             best = float(state["best_val_loss"])
         elif cfg.MODEL.LOAD_CHECKPOINT:
@@ -562,19 +577,22 @@ class RestorationWorkflow:
             self._load(model, path)
         epochs = int(cfg.TRAIN.EPOCHS)
         loss_chart = TrainingLossChart(self.workdir / "sr_history.jsonl",
-                                       Path(cfg.PATHS.RESULT_DIR.OUTPUT_CHART) / "SR_Loss.png", start)
-        writer = SummaryWriter(log_dir=str(self.workdir / "sr_tensorboard"))
+                                       Path(cfg.PATHS.RESULT_DIR.OUTPUT_CHART) / "SR_Loss.png", start) if primary() else NullWriter()
+        writer = SummaryWriter(log_dir=str(self.workdir / "sr_tensorboard")) if primary() else NullWriter()
         for epoch in range(start, epochs):
+            set_epoch(train_dl, epoch)
             model.train()
             train_loss = 0.0
             train_samples = 0
             for step, (x, y) in enumerate(train_dl, start=1):
-                x, y = x.to(self.device), y.to(self.device)
+                x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
                 opt.zero_grad(set_to_none=True)
-                pred = model(x)
-                loss = sr_loss(pred, y, cfg)
-                loss.backward()
-                opt.step()
+                with torch.autocast("cuda", enabled=amp):
+                    pred = model(x)
+                    loss = sr_loss(pred.float(), y, cfg)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(opt)
+                self.scaler.update()
                 scheduler.step()
                 step_loss = loss.item()
                 train_loss += step_loss * len(x)
@@ -584,20 +602,22 @@ class RestorationWorkflow:
                           f"[BATCH{step:06d}/{steps:06d}] loss: {step_loss:.6f}, "
                           f"mean_loss: {train_loss/train_samples:.6f}, "
                           f"lr: {opt.param_groups[0]['lr']:.6g}", flush=True)
-                if step == 1:
-                    print_cuda_memory(self.device, prefix=f"[SR TRAIN] epoch {epoch+1}, first batch")
             model.eval()
-            val_loss, val_psnr = 0., 0.
+            val_loss, val_psnr, val_samples = 0., 0., 0
             with torch.no_grad():
                 for x, y in val_dl:
-                    x, y = x.to(self.device), y.to(self.device)
-                    pred = model(x)
-                    loss = sr_loss(pred, y, cfg)
+                    x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+                    with torch.autocast("cuda", enabled=amp):
+                        pred = validation_model(model)(x)
+                        loss = sr_loss(pred.float(), y, cfg)
                     val_loss += loss.item() * len(x)
                     val_psnr += sr_psnr(pred, y) * len(x)
-            v = val_loss / len(ds_val)
-            metrics = {"train_loss": train_loss/len(ds_train), "val_loss": v,
-                       "val_psnr_db": val_psnr/len(ds_val),
+                    val_samples += len(x)
+            train_loss, train_samples, val_loss, val_psnr, val_samples = reduce_sums(
+                [train_loss, train_samples, val_loss, val_psnr, val_samples], self.device)
+            v = val_loss / max(1, val_samples)
+            metrics = {"train_loss": train_loss/max(1, train_samples), "val_loss": v,
+                       "val_psnr_db": val_psnr/max(1, val_samples),
                        "learning_rate": opt.param_groups[0]["lr"]}
             writer.add_scalars("SR/Loss", {"train": metrics["train_loss"],
                                            "val": metrics["val_loss"]}, epoch+1)
@@ -607,14 +627,19 @@ class RestorationWorkflow:
             loss_chart.log(epoch+1, metrics)
             log_message(f"[SR] epoch={epoch+1}/{epochs} train_loss={metrics['train_loss']:.6f} "
                   f"val_loss={v:.6f} val_PSNR={metrics['val_psnr_db']:.2f}dB", flush=True)
-            print_cuda_memory(self.device, prefix=f"[SR TRAIN] epoch {epoch+1}, after validation")
+            if (epoch+1) % 5 == 0:
+                print_cuda_memory(self.device, prefix=f"[SR TRAIN] epoch {epoch+1}, after validation",
+                                  all_devices=True)
+            self._rng_states = training_rng_states()
             if v < best:
                 best, stagnation = v, 0
-                self._save(self._checkpoint_data(epoch+1, model, best=best), self.checkpoint)
+                if primary():
+                    self._save(self._checkpoint_data(epoch+1, model, best=best), self.checkpoint)
             else:
                 stagnation += 1
                 log_message(f"no improvement, Patience: {stagnation:04d}/{int(cfg.TRAIN.PATIENCE):04d}", flush=True)
-            self._save(self._checkpoint_data(epoch+1, model, opt, scheduler, best), self.latest)
+            if primary():
+                self._save(self._checkpoint_data(epoch+1, model, opt, scheduler, best), self.latest)
             if int(cfg.TRAIN.PATIENCE) > 0 and stagnation >= int(cfg.TRAIN.PATIENCE):
                 log_message(f"[SR] early stopping at epoch {epoch+1}", flush=True)
                 break
@@ -630,6 +655,27 @@ class RestorationWorkflow:
         if not src.exists():
             raise FileNotFoundError(src)
         return [src]
+
+    def _output_paths(self, source: Path):
+        """Resolve the SR store and its sibling resume log from GT_PATH."""
+        value = self.cfg.DATA.INFER.GT_PATH
+        if not value:
+            raise ValueError("DATA.INFER.GT_PATH must specify the SR output")
+        target = Path(value)
+        input_path = Path(self.cfg.DATA.INFER.PATH)
+        if target.suffix.lower() == ".zarr":
+            if input_path.is_dir() and input_path.suffix.lower() != ".zarr":
+                raise ValueError("TIFF folder inference requires DATA.INFER.GT_PATH to be an output directory")
+            out_path = target
+        else:
+            out_path = target / f"{source.stem}_SR_{self.scale}x.ome.zarr"
+        # Overwrite must never remove the input or a directory containing it.
+        resolved_source, resolved_output = source.resolve(), out_path.resolve()
+        if (resolved_source == resolved_output or resolved_output in resolved_source.parents
+                or resolved_source in resolved_output.parents):
+            raise ValueError("SR output must be separate from the inference input")
+        name = out_path.name[:-len(".ome.zarr")] if out_path.name.lower().endswith(".ome.zarr") else out_path.stem
+        return out_path, out_path.with_name(f"{name}.progress.json")
 
     def _open_reader(self, path):
         if path.suffix.lower() in (".tif", ".tiff"):
@@ -653,7 +699,73 @@ class RestorationWorkflow:
             tmp.unlink(missing_ok=True)
 
     @torch.no_grad()
-    def _infer_one(self, model, source: Path):
+    def _predict_sr_block(self, model, reader, core_lo, core_hi, input_bounds, geometry):
+        core_lo, core_hi = np.asarray(core_lo), np.asarray(core_hi)
+        core_size = core_hi - core_lo
+        shape = tuple(map(int, reader.shape[-3:]))
+        physical_ch = list(self.cfg.DATA.INFER.CHANNEL)
+        factor = (1, self.scale, self.scale)
+        padding, patch_central = geometry['padding'], geometry['patch_central']
+        block_margin = geometry['block_margin']
+        # One image read per channel per *block*. The surrounding
+        # margin contains all patch halos, except at volume edges.
+        read_lo = np.maximum(0, core_lo - block_margin)
+        read_hi = np.minimum(shape, core_hi + block_margin)
+        block = np.stack([
+            np.asarray(reader[int(ch), int(read_lo[0]):int(read_hi[0]),
+                                   int(read_lo[1]):int(read_hi[1]),
+                                   int(read_lo[2]):int(read_hi[2])])
+            for ch in physical_ch], axis=0)
+        block = (np.zeros_like(block, dtype=np.float32) if input_bounds[0] == input_bounds[1]
+                 else normalize_intensity(block, input_bounds, "inference raw"))
+        hr_size = tuple(int(n * f) for n, f in zip(core_size, factor))
+        # A block buffer permits exactly ONE write to the output
+        # store per central block, rather than one write per patch.
+        restored = np.empty((self.ch, *hr_size), dtype=np.float32)
+        from sknext.utils.parallel import inference_batch_size, configured_inference_batch
+        batch_size = inference_batch_size(model, configured_inference_batch(self.cfg))
+        pending = []
+
+        def flush_patches():
+            if not pending:
+                return
+            inputs = torch.from_numpy(np.stack([p[0] for p in pending])).to(self.device)
+            predictions = model(inputs)
+            if isinstance(predictions, dict):
+                predictions = predictions["pred"]
+            expected = (len(pending), self.ch, *tuple(p * f for p, f in zip(self.patch, factor)))
+            if tuple(predictions.shape) != expected:
+                raise RuntimeError(f"SR model output shape mismatch: {tuple(predictions.shape)}")
+            predictions = predictions.float().cpu().numpy()
+            for prediction, (_, local, valid) in zip(predictions, pending):
+                hhr = tuple(int(p * f) for p, f in zip(padding, factor))
+                nhr = tuple(int(v * f) for v, f in zip(valid, factor))
+                central_prediction = prediction[:,
+                    hhr[0]:hhr[0] + nhr[0],
+                    hhr[1]:hhr[1] + nhr[1],
+                    hhr[2]:hhr[2] + nhr[2]]
+                if bool(self.cfg.SR.OUTPUT_CLIP):
+                    central_prediction = np.clip(central_prediction, 0., 1.)
+                dst_lo = tuple(int(q * f) for q, f in zip(local, factor))
+                dst = tuple(slice(s, s + length) for s, length in zip(dst_lo, nhr))
+                restored[(slice(None), *dst)] = central_prediction
+            pending.clear()
+
+        for dz in range(0, int(core_size[0]), patch_central[0]):
+            for dy in range(0, int(core_size[1]), patch_central[1]):
+                for dx in range(0, int(core_size[2]), patch_central[2]):
+                    local = np.array((dz, dy, dx), dtype=np.int64)
+                    valid = np.minimum(patch_central, core_size - local)
+                    global_start = core_lo + local - padding
+                    patch_start_in_block = global_start - read_lo
+                    raw_patch = crop_padded(block, patch_start_in_block, self.patch)
+                    pending.append((raw_patch, local, valid))
+                    if len(pending) >= batch_size:
+                        flush_patches()
+        flush_patches()
+        return restored
+
+    def _infer_one(self, model, source: Path, pool=None):
         """One I/O read/write per central block; GPU inference on padded patches.
 
         Patch context is DATA.INFER.PADDING. Block read extent is controlled by
@@ -662,6 +774,8 @@ class RestorationWorkflow:
         writes, reconstruct an HR central block in RAM, then commit that block
         with one Zarr write and one resumable progress-record update.
         """
+        out_path, log_path = self._output_paths(source)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         reader = self._open_reader(source)
         out = None
         try:
@@ -682,8 +796,6 @@ class RestorationWorkflow:
                                                   self.cfg.SR.RAW_RANGE)
             nc = tuple(math.ceil(a / b) for a, b in zip(shape, central_block))
             total = math.prod(nc)
-            out_path = self.workdir / f"{source.stem}_SR_{self.scale}x.ome.zarr"
-            log_path = self.workdir / f"{source.stem}_SR_{self.scale}x.progress.json"
             stat = source.stat()
             ckpt = (Path(self.cfg.MODEL.CHECKPOINT_INPUT_PATH) if
                     self.cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint)
@@ -713,7 +825,7 @@ class RestorationWorkflow:
                     raise FileExistsError(f"Existing SR output has no progress log: {out_path}")
                 state = json.loads(log_path.read_text(encoding="utf-8"))
                 if state.get("manifest") != manifest or state.get("total") != total:
-                    raise ValueError("SR resume manifest mismatch. Check source/weights/block geometry or use a new run ID")
+                    raise ValueError("SR resume manifest mismatch. Check source/weights/block geometry or use a new output path")
                 done = int(state["done"])
                 if not 0 <= done <= total:
                     raise ValueError("Corrupted SR inference progress counter")
@@ -749,65 +861,34 @@ class RestorationWorkflow:
                 log_message(f"[SR] already completed: {out_path}", flush=True)
                 return
 
-            block_index = 0
-            for zz in range(0, shape[0], central_block[0]):
-                for yy in range(0, shape[1], central_block[1]):
-                    for xx in range(0, shape[2], central_block[2]):
-                        if block_index < done:
+            def jobs():
+                block_index = 0
+                for zz in range(0, shape[0], central_block[0]):
+                    for yy in range(0, shape[1], central_block[1]):
+                        for xx in range(0, shape[2], central_block[2]):
+                            core_lo = np.array((zz, yy, xx), dtype=np.int64)
+                            core_hi = np.minimum(core_lo + central_block, shape)
+                            if block_index >= done:
+                                yield dict(id=block_index, source=str(source), start=core_lo, stop=core_hi,
+                                           bounds=input_bounds, geometry=geometry)
                             block_index += 1
-                            continue
-                        core_lo = np.array((zz, yy, xx), dtype=np.int64)
-                        core_hi = np.minimum(core_lo + central_block, shape)
-                        core_size = core_hi - core_lo
-                        # One image read per channel per *block*. The surrounding
-                        # margin contains all patch halos, except at volume edges.
-                        read_lo = np.maximum(0, core_lo - block_margin)
-                        read_hi = np.minimum(shape, core_hi + block_margin)
-                        block = np.stack([
-                            np.asarray(reader[int(ch), int(read_lo[0]):int(read_hi[0]),
-                                                   int(read_lo[1]):int(read_hi[1]),
-                                                   int(read_lo[2]):int(read_hi[2])])
-                            for ch in physical_ch], axis=0)
-                        block = (np.zeros_like(block, dtype=np.float32) if input_bounds[0] == input_bounds[1]
-                                 else normalize_intensity(block, input_bounds, "inference raw"))
-                        hr_size = tuple(int(n * f) for n, f in zip(core_size, factor))
-                        # A block buffer permits exactly ONE write to the output
-                        # store per central block, rather than one write per patch.
-                        restored = np.empty((self.ch, *hr_size), dtype=np.float32)
-                        for dz in range(0, int(core_size[0]), patch_central[0]):
-                            for dy in range(0, int(core_size[1]), patch_central[1]):
-                                for dx in range(0, int(core_size[2]), patch_central[2]):
-                                    local = np.array((dz, dy, dx), dtype=np.int64)
-                                    valid = np.minimum(patch_central, core_size - local)
-                                    global_start = core_lo + local - padding
-                                    patch_start_in_block = global_start - read_lo
-                                    raw_patch = crop_padded(block, patch_start_in_block, self.patch)
-                                    input_tensor = torch.from_numpy(raw_patch[None]).to(self.device)
-                                    prediction = model(input_tensor)
-                                    if isinstance(prediction, dict):
-                                        prediction = prediction["pred"]
-                                    if tuple(prediction.shape) != (1, self.ch, *tuple(p * f for p, f in zip(self.patch, factor))):
-                                        raise RuntimeError(f"SR model output shape mismatch: {tuple(prediction.shape)}")
-                                    prediction = prediction[0].float().cpu().numpy()
-                                    hhr = tuple(int(p * f) for p, f in zip(padding, factor))
-                                    nhr = tuple(int(v * f) for v, f in zip(valid, factor))
-                                    central_prediction = prediction[:,
-                                        hhr[0]:hhr[0] + nhr[0],
-                                        hhr[1]:hhr[1] + nhr[1],
-                                        hhr[2]:hhr[2] + nhr[2]]
-                                    if bool(self.cfg.SR.OUTPUT_CLIP):
-                                        central_prediction = np.clip(central_prediction, 0., 1.)
-                                    dst_lo = tuple(int(q * f) for q, f in zip(local, factor))
-                                    dst = tuple(slice(s, s + length) for s, length in zip(dst_lo, nhr))
-                                    restored[(slice(None), *dst)] = central_prediction
-                        out_lo = tuple(int(c * f) for c, f in zip(core_lo, factor))
-                        dest = tuple(slice(s, s + length) for s, length in zip(out_lo, hr_size))
-                        out[(slice(None), *dest)] = restored
-                        block_index += 1
-                        self._write_infer_progress(log_path, manifest, block_index, total)
-                        if block_index == done + 1 or block_index % 10 == 0 or block_index == total:
-                            log_message(f"[SR] [BLOCK{block_index:07d}/{total:07d}] [INFER] results saved, source: {source.name}", flush=True)
-                            print_cuda_memory(self.device, prefix=f"[SR INFER] block {block_index}/{total}")
+
+            results = (pool.map(jobs()) if pool is not None else
+                       ((job, self._predict_sr_block(model, reader, job['start'], job['stop'],
+                                                    input_bounds, geometry)) for job in jobs()))
+            for job, restored in results:
+                core_lo, block_index = job['start'], job['id']
+                hr_size = restored.shape[1:]
+                out_lo = tuple(int(c * f) for c, f in zip(core_lo, factor))
+                dest = tuple(slice(s, s + length) for s, length in zip(out_lo, hr_size))
+                out[(slice(None), *dest)] = restored
+                block_index += 1
+                self._write_infer_progress(log_path, manifest, block_index, total)
+                if block_index == done + 1 or block_index % 10 == 0 or block_index == total:
+                    log_message(f"[SR] [BLOCK{block_index:07d}/{total:07d}] [INFER] results saved, source: {source.name}", flush=True)
+                if pool is None and block_index % 20 == 0:
+                    print_cuda_memory(self.device, prefix=f"[SR INFER] block {block_index}/{total}",
+                                      all_devices=True)
             log_message(f"[SR] restored volume: {out_path} CZYX={(self.ch, *out_shape)}", flush=True)
         finally:
             if out is not None:
@@ -815,15 +896,20 @@ class RestorationWorkflow:
             reader.close()
 
     def infer(self):
-        model = self.build_model()
-        path = Path(self.cfg.MODEL.CHECKPOINT_INPUT_PATH) if self.cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint
-        self._load(model, path)
-        model.eval()
-        log_message(model)
-        print_model_parameters(model)
-        print_cuda_memory(self.device, prefix="[SR INFER] model loaded")
-        for source in self._input_sources():
-            self._infer_one(model, source)
+        from sknext.utils.inference_workers import BlockPool, parallel_inference_enabled
+        from contextlib import ExitStack
+        use_pool = parallel_inference_enabled(self.cfg, self.device)
+        model = None
+        if not use_pool:
+            model = self.build_model()
+            path = Path(self.cfg.MODEL.CHECKPOINT_INPUT_PATH) if self.cfg.MODEL.CHECKPOINT_INPUT_PATH else self.checkpoint
+            self._load(model, path)
+            model.eval()
+            print_model_parameters(model)
+        with ExitStack() as stack:
+            pool = stack.enter_context(BlockPool(self.cfg, self.job_id, 'restoration')) if use_pool else None
+            for source in self._input_sources():
+                self._infer_one(model, source, pool)
 
     def run(self):
         if bool(self.cfg.TRAIN.ENABLE) and bool(self.cfg.INFER.ENABLE):

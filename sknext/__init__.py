@@ -53,7 +53,7 @@ def main():
         type=str,
         default='0',
         help=(
-            "GPU id, e.g. 0 or 0,1. "
+            "GPU indices/UUIDs, e.g. 0 or 0,1,2; 'all' uses all visible GPUs. "
         ),
     )
     parser.add_argument("--gui", action="store_true", help="Open the desktop interface.")
@@ -65,7 +65,8 @@ def main():
     if not args.config:
         parser.error("--config is required unless --gui is used")
     del args.gui
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    from sknext.utils.parallel import configure_visible_devices
+    configure_visible_devices(args.gpu)
     from sknext._sknext import SkNeXt
     print("SkNeXt version:", __version__, flush=True)
     print("All input args: \n", vars(args), flush=True)

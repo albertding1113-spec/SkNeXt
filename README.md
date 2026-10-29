@@ -56,8 +56,83 @@ requirement in `pyproject.toml` on each computer.
 
 Training and inference through `sknext` require an NVIDIA GPU, a working driver,
 and CUDA-enabled PyTorch. The unified launcher rejects CPU execution and selects
-one visible GPU. The GUI can edit configurations without loading PyTorch, but
+one or more visible GPUs. The GUI can edit configurations without loading PyTorch, but
 requires Tkinter/Tcl-Tk; GPU discovery additionally uses `nvidia-smi`.
+
+All three workflows support multi-GPU training and inference:
+
+```sh
+sknext --config xxx.yaml --run_id 1 --gpu 0,1
+sknext --config xxx.yaml --run_id 1 --gpu 0,1,2
+sknext --config xxx.yaml --run_id 1 --gpu all
+```
+
+`all` uses every GPU visible to the process, respecting an existing
+`CUDA_VISIBLE_DEVICES` mask (for example, one supplied by a job scheduler).
+Explicit lists set that mask. The CLI manages GPU processes automatically on
+**one node**; launch just one `sknext` task, without `torchrun`.
+
+- **Training:** one process/model/optimizer per GPU using PyTorch DDP (NCCL on
+  Linux). Data loading and augmentation run in CPU worker processes with pinned
+  memory and bounded prefetch. Gradients are synchronized; losses and validation
+  statistics are reduced across ranks. Only rank zero prepares shared patch
+  stores and writes checkpoints/charts. `TRAIN.AMP` controls mixed precision in
+  all workflows, including segmentation and restoration.
+- **Inference:** persistent GPU processes read and predict independent blocks,
+  including CPU patch preparation and postprocessing. They retain their models
+  and readers. The coordinator commits results **in spatial order**, preserving
+  instance stitching and resume progress. Only the coordinator writes Zarr
+  chunks, metadata and pyramids. This also works on one input volume; multiple
+  files are not required. The queue holds at most one pending block per GPU,
+  plus the result being committed. Plan host RAM for concurrent input,
+  prediction, and result buffers on every worker.
+
+`TRAIN.BATCH_SIZE` is the **global** training batch and must be a positive multiple
+of the GPU count: 16 on four GPUs means four patches per GPU. Training samplers
+pad the final shard when necessary so ranks execute the same number of steps;
+validation never pads or double-counts samples. DDP computes batch-dependent
+losses such as Dice within each rank before averaging gradients, so optimization
+need not exactly match a single-GPU global-batch run. Checkpoint weights remain
+portable. Optimizer/scheduler resume still requires compatible configuration;
+changing GPU count or CPU loader concurrency is not bitwise reproducible.
+
+For example:
+
+```yaml
+SYSTEM:
+  CPU_THREADS: 0          # automatic: up to four native threads per GPU process
+TRAIN:
+  BATCH_SIZE: 16          # total across GPUs during training
+  NUM_WORKERS: -1        # auto; up to 8 loader workers per GPU per loader
+  PREFETCH_FACTOR: 1     # batches prefetched by each loading worker
+  AMP: true
+INFER:
+  PARALLEL_BLOCKS: true  # persistent workers on multiple GPUs
+  BATCH_SIZE: 4          # patches PER GPU during inference; tune to GPU memory
+```
+
+`INFER.BATCH_SIZE: 0` derives a per-GPU batch from `TRAIN.BATCH_SIZE` (rounded up,
+minimum one). On a single GPU it uses `TRAIN.BATCH_SIZE` directly. Set
+`TRAIN.NUM_WORKERS: 0` for synchronous loading or a positive count to cap workers.
+Automatic CPU budgets respect Slurm and process affinity, including both loader
+pools. `INFER.PARALLEL_BLOCKS: false` retains the previous batch-parallel inference
+path for comparisons; on that path `INFER.BATCH_SIZE` is the total batch.
+`SYSTEM.DISTRIBUTED_TIMEOUT_SECONDS` defaults to 21600 (six hours), allowing other
+ranks to wait while rank zero builds large patch stores. Worker exceptions still
+abort the job; adjust this timeout for your data preparation time.
+
+Use [cluster_multi_gpu.sh](sknext/example/cluster_multi_gpu.sh) for the supplied
+Slurm example: one task, four GPUs, **128 CPU cores total** (32 per GPU).
+`--cpus-per-task=32` would request only 32 cores total. Adjust the allocation to
+node capacity and create the log directory before submitting. Copy/install the
+updated checkout in the cluster environment first. The script works for training
+as well when pointed at a training YAML.
+
+Benchmark unfinished runs with identical data, output settings and block geometry.
+Worker logs report per-block read/predict/postprocess time. Four GPUs do not
+guarantee fourfold speedup: shared filesystem bandwidth, result transfer, ordered
+stitching/writes, initial patch-store creation and final pyramids can limit scaling.
+Tiny inputs with fewer blocks than GPUs cannot keep every worker busy.
 
 1. Clone the repository and enter its root:
 
@@ -472,6 +547,7 @@ DATA:
     GT_PATH: ./dataset/val/gt
   INFER:
     PATH: ./dataset/infer/raw
+    GT_PATH: ./dataset/infer/output
     CHANNEL: [0]
     PADDING: [4, 16, 16]
     BLOCK_FACTOR: [4, 4, 4]
@@ -515,6 +591,13 @@ any explicit overrides, rather than fitted dataset-wide bounds. During inference
 each source volume is scanned in bounded blocks to obtain its own range, which
 is then reused for every inference patch. This adds an initial read pass but
 avoids seams caused by fitting a different range to every block.
+
+SR inference writes to `DATA.INFER.GT_PATH`. For an output directory, each input
+produces `<input_stem>_SR_<scale>x.ome.zarr`. For a single TIFF, IMS, or Zarr
+input, you can instead specify an exact `.zarr` output path. TIFF folder inputs
+require an output directory. Resume `.progress.json` files are saved beside the
+output stores. Output paths do not include the run ID; use a different output
+directory to keep results from different runs.
 
 Explicit `RAW_RANGE`/`GT_RANGE: [min, max]` settings still override automatic
 scaling. Values outside those explicit bounds, NaN, and Inf raise errors.

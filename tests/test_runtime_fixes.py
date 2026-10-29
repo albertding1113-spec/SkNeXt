@@ -188,12 +188,14 @@ class RuntimeFixTests(unittest.TestCase):
             import torch
             names = {"cfgget", "checked_semantic_names", "get_thresholds", "spatial_patch",
                      "overlap_voxels", "normalize_options", "checkpoint_path", "checkpoint_read_path",
-                     "_resolved_output", "infer"}
+                     "_resolved_output", "_inference_jobs", "_infer_source", "infer"}
             definitions("sknext/run/semantic_workflow.py", names, globals())
             from sknext.utils.model_info import print_cuda_memory
             from types import SimpleNamespace
             make_model = lambda cfg, device: SimpleNamespace(eval=lambda: None)
             load_model_checkpoint = lambda *args: None
+            print_model_parameters = lambda *args: None
+            detect_path_type = lambda path: 'zarr'
             predictions = []
             def predict(*args):
                 predictions.append(1)
@@ -285,6 +287,21 @@ class RuntimeFixTests(unittest.TestCase):
                 assert line.split(':', 1)[1].strip() == f'{value:.2f} MiB'
             cuda.synchronize.assert_called_once_with(device)
             cuda.mem_get_info.assert_called_once_with(device)
+            cuda.device_count.return_value = 3
+            cuda.synchronize.reset_mock()
+            cuda.mem_get_info.reset_mock()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                print_cuda_memory(device, prefix='all GPUs', all_devices=True)
+            text = output.getvalue()
+            assert text.count('CUDA memory summary all GPUs') == 3
+            assert [str(call.args[0]) for call in cuda.synchronize.call_args_list] == [
+                'cuda:0', 'cuda:1', 'cuda:2']
+            assert [str(call.args[0]) for call in cuda.mem_get_info.call_args_list] == [
+                'cuda:0', 'cuda:1', 'cuda:2']
+            cuda.reset_mock()
+            print_cuda_memory(Device('cpu'), all_devices=True)
+            cuda.is_available.assert_not_called()
             cuda.is_available.return_value = False
             cuda.synchronize.reset_mock()
             with contextlib.redirect_stdout(io.StringIO()): print_cuda_memory()

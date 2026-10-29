@@ -32,7 +32,8 @@ class Base_Workflow(ABC):
         self.checkpoint_dir = cfg.PATHS.CHECKPOINT_DIR
         self.checkpoint_file = os.path.join(self.checkpoint_dir, f"checkpoint_{self.job_id:02d}.pth")
         self.log_dir = cfg.PATHS.RESULT_DIR.OUTPUT_LOG
-        self.log_writer = SummaryWriter(log_dir=self.log_dir)
+        from sknext.utils.execution import primary, NullWriter
+        self.log_writer = SummaryWriter(log_dir=self.log_dir) if primary() and cfg.TRAIN.ENABLE else NullWriter()
         self.chart_dir = cfg.PATHS.RESULT_DIR.OUTPUT_CHART
         self.patch_size = tuple(cfg.DATA.PATCH_SIZE)
         self.norm_type = cfg.DATA.NORMALIZATION.TYPE

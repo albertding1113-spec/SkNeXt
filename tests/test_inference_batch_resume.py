@@ -23,6 +23,45 @@ class ModelConfig(dict):
 
 
 class InferenceBatchResumeTests(unittest.TestCase):
+    def test_sr_output_location_and_input_protection(self):
+        node = method('sknext/run/restoration_workflow.py', 'RestorationWorkflow', '_output_paths')
+        ns = dict(Path=Path)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'sr_output', 'exec'), ns)
+        resolve = ns['_output_paths']
+        with tempfile.TemporaryDirectory(dir=ROOT) as folder:
+            base = Path(folder)
+            source = base / 'sample.tif'
+            source.touch()
+            infer = SimpleNamespace(PATH=str(source), GT_PATH=str(base / 'nested' / 'outputs'))
+            workflow = SimpleNamespace(cfg=SimpleNamespace(DATA=SimpleNamespace(INFER=infer)), scale=2)
+            output, progress = resolve(workflow, source)
+            self.assertEqual(output, base / 'nested' / 'outputs' / 'sample_SR_2x.ome.zarr')
+            self.assertEqual(progress, output.with_name('sample_SR_2x.progress.json'))
+            for name, log in [('custom.ome.zarr', 'custom.progress.json'),
+                              ('custom.zarr', 'custom.progress.json')]:
+                infer.GT_PATH = str(base / name)
+                self.assertEqual(resolve(workflow, source), (base / name, base / log))
+            inputs = base / 'raw'
+            inputs.mkdir()
+            infer.PATH = str(inputs)
+            with self.assertRaisesRegex(ValueError, 'output directory'):
+                resolve(workflow, source)
+            infer.GT_PATH = str(base / 'outputs')
+            self.assertEqual(resolve(workflow, inputs / 'other.tif')[0],
+                             base / 'outputs' / 'other_SR_2x.ome.zarr')
+            source = base / 'input.zarr'
+            source.mkdir()
+            infer.PATH = str(source)
+            infer.GT_PATH = str(base / 'custom.zarr')
+            self.assertEqual(resolve(workflow, source)[0], base / 'custom.zarr')
+            for target in (source, source / 'nested.zarr'):
+                infer.GT_PATH = str(target)
+                with self.assertRaisesRegex(ValueError, 'separate'):
+                    resolve(workflow, source)
+            infer.GT_PATH = ''
+            with self.assertRaisesRegex(ValueError, 'GT_PATH'):
+                resolve(workflow, source)
+
     def test_segmentation_manifest_ignores_batch_size(self):
         node = method('sknext/run/networkflow.py', 'Segmentation_Workflow', '_build_infer_manifest')
         ns = dict(Path=Path, hashlib=hashlib)
