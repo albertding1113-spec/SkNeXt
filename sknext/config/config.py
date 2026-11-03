@@ -114,6 +114,9 @@ class SkNeXt_Config:
 
         # 4. DATA
         _C.DATA = CN()
+        # CPU processes for instance/semantic TIFF-to-Zarr patch preparation.
+        # 0: automatic (up to 8 available CPUs); 1: serial; >1: explicit count.
+        _C.DATA.CONVERSION_WORKERS = 0
         # Patch size, "ZYXC"
         _C.DATA.PATCH_SIZE = (32, 256, 256, 1)
         # Whether to reshape the dimensions that does not satisfy the patch shape selected by padding it with reflect.
@@ -202,9 +205,12 @@ class SkNeXt_Config:
         # Name of channel created in "hdf5"/"imaris"/"ome-zarr" file to save results.
         _C.DATA.INFER.CHANNEL_NAME = "result0"
         # Percentage of overlap in (z,y,x) when cropping. Tuple of floats between range [0, 1).
-        _C.DATA.INFER.OVERLAP = (0, 0, 0)
+        # All prediction workflows blend overlapping patches. For SR, overlap is
+        # measured against PATCH_SIZE and applied after cropping PADDING borders;
+        # PATCH_SIZE - 2 * PADDING - overlap_voxels must remain positive.
+        _C.DATA.INFER.OVERLAP = (0.25, 0.25, 0.25)
         # Padding to be done in (z,y,x). Useful to avoid patch 'border effect'. Tuples of ints.
-        _C.DATA.INFER.PADDING = (4, 16, 16)
+        _C.DATA.INFER.PADDING = (0, 0, 0)
         # Full block size (including halo) in patches, ZYX.
         # The per-side halo is computed automatically by Base_Workflow:
         # (BLOCK_FACTOR - BLOCK_CENTRAL_FACTOR) * PATCH_SIZE[:3] / 2.
@@ -371,6 +377,9 @@ class SkNeXt_Config:
         # True: exact epoch-boundary resume from *_latest.pth, including optimizer,
         # scheduler, RNG states and early-stopping status. False: start a new run.
         _C.TRAIN.RESUME = False
+        # Instance/mixed and SR training: reuse existing converted patch stores.
+        # Missing stores are generated. Disable after changing data or preprocessing.
+        _C.TRAIN.REUSE_PATCH_STORES = False
         # Optimizer. Options: "SGD", "ADAM" or "ADAMW"
         _C.TRAIN.OPTIMIZER = "ADAMW"
         # Learning rate
@@ -381,6 +390,10 @@ class SkNeXt_Config:
         _C.TRAIN.OPT_BETAS = (0.9, 0.999)
         # Batch size
         _C.TRAIN.BATCH_SIZE = 2
+        # All training workflows: probe CUDA memory instead of manual sizing.
+        _C.TRAIN.AUTO_BATCH_SIZE = False
+        _C.TRAIN.AUTO_BATCH_MAX_PER_GPU = 128
+        _C.TRAIN.AUTO_BATCH_MEMORY_FRACTION = 0.8
         # Number of epochs to train the model
         _C.TRAIN.EPOCHS = 1000
         # Epochs to wait with no validation data improvement until the training is stopped
@@ -399,10 +412,15 @@ class SkNeXt_Config:
         _C.INFER.ENABLE = False
         # Semantic-only inference: scalar or one threshold per S.* channel.
         _C.INFER.THRESHOLD = 0.5
+        # Export semantic-only sigmoid probabilities as float32 in [0, 1].
         _C.INFER.SAVE_PROBABILITIES = False
         _C.INFER.SKIP_ZERO_PATCHES = True
         _C.INFER.AMP = True
         _C.INFER.BATCH_SIZE = 0  # 0: divide TRAIN.BATCH_SIZE over GPU workers (at least one)
+        # Forward-only CUDA probing, independently in each inference GPU worker.
+        _C.INFER.AUTO_BATCH_SIZE = False
+        _C.INFER.AUTO_BATCH_MAX_PER_GPU = 128
+        _C.INFER.AUTO_BATCH_MEMORY_FRACTION = 0.8
         _C.INFER.PARALLEL_BLOCKS = True
         # 'uint16': watershed + semantic labels (legacy name); actual stored dtype
         #           is uint32 when skeleton-free instance labeling is enabled.

@@ -15,6 +15,9 @@ from typing import Any, Callable, Iterable, Literal, Sequence
 from sknext.data.imageIO import read_one_3D_tif, calculate_patch_coordinates, patch_coordinates_generator, pair_raw_and_label_tiffs
 from sknext.data.preprocessing import preprocess_img, reflect_padding_img
 from sknext.data.label import generate_channels_from_labels
+from sknext.data.patch_workers import (
+    bounded_map, conversion_pool, prepare_patch, resolve_conversion_workers,
+)
 
 def create_patch_ome_zarr(
     output_path: str | Path,
@@ -323,15 +326,19 @@ def tif_list_to_zarr(
         channel_extra_opts: dict | None = None,
         filter_dict: dict | None = None,
         normalize_per_patch: bool = False,
+        conversion_workers: int = 0,
 ):
     """Convert paired TIFF volumes into an NCZYX patch Zarr dataset.
 
     P-channel skeletonization and main-branch pruning are run independently
     inside each cropped GT patch, not on the full source TIFF.
+    conversion_workers=0 selects up to eight CPUs; 1 uses the serial path.
+    Pending cropped patches are bounded and only the parent writes Zarr.
     """
     preprocess_dict = {} if preprocess_dict is None else preprocess_dict
     channel_extra_opts = {} if channel_extra_opts is None else channel_extra_opts
     filter_dict = _normalize_patch_filter(filter_dict)
+    workers = resolve_conversion_workers(conversion_workers)
 
     if len(patch_size) != 4:
         raise ValueError("patch_size must contain four values in ZYXC order.")
@@ -353,142 +360,131 @@ def tif_list_to_zarr(
     rejected_patch_num = 0
     output_label_channel_num: int | None = None
 
-    for i in tqdm(range(len(tif_list))):
-        tif_path = tif_list[i]
-        one_gt_path_dict = {key: value[i] for key, value in gt_tif_dict.items()}
-        raw_img = read_one_3D_tif(tif_path, "CZYX")
-        gt_img_dict = {
-            key: read_one_3D_tif(value, "ZYX")
-            for key, value in one_gt_path_dict.items()
-        }
+    print(f"Converting patches with {workers} CPU worker(s)", flush=True)
+    with conversion_pool(workers) as pool:
+        for i in tqdm(range(len(tif_list))):
+            tif_path = tif_list[i]
+            one_gt_path_dict = {key: value[i] for key, value in gt_tif_dict.items()}
+            raw_img = read_one_3D_tif(tif_path, "CZYX")
+            gt_img_dict = {
+                key: read_one_3D_tif(value, "ZYX")
+                for key, value in one_gt_path_dict.items()
+            }
 
-        if raw_img.shape[0] != expected_raw_channels:
-            raise ValueError(
-                f"Raw channel count ({raw_img.shape[0]}) does not match "
-                f"patch_size C ({expected_raw_channels}) for {tif_path}."
-            )
-        for gt_img in gt_img_dict.values():
-            if raw_img.shape[1:] != gt_img.shape:
-                raise ValueError("raw and label image must have the same spatial shape.")
-
-        coords = calculate_patch_coordinates(
-            raw_img.shape,
-            spatial_patch_size,
-            overlap,
-            padding,
-        )
-        candidate_patch_num += int(coords.shape[0])
-
-        if filter_dict["enable"]:
-            keep_flags = np.fromiter(
-                (
-                    patch_satisfies_filter(
-                        raw_img,
-                        gt_img_dict,
-                        coord,
-                        spatial_patch_size,
-                        filter_dict,
-                    )
-                    for coord in coords
-                ),
-                dtype=bool,
-                count=coords.shape[0],
-            )
-            kept_coords = coords[keep_flags]
-            rejected_patch_num += int(coords.shape[0] - kept_coords.shape[0])
-        else:
-            kept_coords = coords
-
-        kept_num = int(kept_coords.shape[0])
-        if kept_num == 0:
-            continue
-
-        # Semantic-only workflow normalizes independently at patch scale.
-        # This must match the inference normalization granularity.
-        processed_img = raw_img if normalize_per_patch else preprocess_img(raw_img, preprocess_dict)
-
-        # Never build label channels on the complete TIFF. Generate the first
-        # patch now only to determine the output-channel count.
-        first_coord = kept_coords[0]
-        first_gt_patch_dict = {
-            key: _crop_patch(gt_img, first_coord)
-            for key, gt_img in gt_img_dict.items()
-        }
-        first_gt_ch_list = generate_channels_from_labels(
-            first_gt_patch_dict,
-            channels,
-            channel_extra_opts,
-        )
-        if len(first_gt_ch_list) == 0:
-            raise ValueError("No output label channels were generated.")
-
-        current_label_channel_num = len(first_gt_ch_list)
-        if output_label_channel_num is None:
-            output_label_channel_num = current_label_channel_num
-        elif current_label_channel_num != output_label_channel_num:
-            raise ValueError(
-                "Generated label channel count changed between input images: "
-                f"expected {output_label_channel_num}, got {current_label_channel_num}."
-            )
-
-        old_saved_patch_num = saved_patch_num
-        saved_patch_num += kept_num
-
-        if root is None:
-            root, data_raw, data_label = create_patch_ome_zarr(
-                zarr_path,
-                saved_patch_num,
-                expected_raw_channels,
-                output_label_channel_num,
-                spatial_patch_size,
-                raw_dtype=np.float32 if normalize_per_patch else processed_img.dtype,
-                label_dtype="uint8",
-                overwrite=False,
-            )
-        else:
-            assert data_raw is not None and data_label is not None
-            data_raw.resize(
-                (saved_patch_num, expected_raw_channels, *spatial_patch_size)
-            )
-            data_label.resize(
-                (saved_patch_num, output_label_channel_num, *spatial_patch_size)
-            )
-
-        assert data_raw is not None and data_label is not None
-        for local_index, coord in enumerate(kept_coords):
-            patch_id = old_saved_patch_num + local_index
-
-            raw_patch = _crop_patch(processed_img, coord)
-            raw_patch = reflect_padding_img(raw_patch, spatial_patch_size)
-            if normalize_per_patch:
-                raw_patch = preprocess_img(raw_patch, preprocess_dict)
-            data_raw[patch_id, :, :, :, :] = raw_patch
-
-            # Key change: crop original GT first; P/main pruning therefore sees
-            # only this patch.
-            if local_index == 0:
-                gt_patch_ch_list = first_gt_ch_list
-            else:
-                gt_patch_dict = {
-                    key: _crop_patch(gt_img, coord)
-                    for key, gt_img in gt_img_dict.items()
-                }
-                gt_patch_ch_list = generate_channels_from_labels(
-                    gt_patch_dict,
-                    channels,
-                    channel_extra_opts,
-                )
-
-            if len(gt_patch_ch_list) != output_label_channel_num:
+            if raw_img.shape[0] != expected_raw_channels:
                 raise ValueError(
-                    "Generated label channel count changed between patches: "
-                    f"expected {output_label_channel_num}, got {len(gt_patch_ch_list)}."
+                    f"Raw channel count ({raw_img.shape[0]}) does not match "
+                    f"patch_size C ({expected_raw_channels}) for {tif_path}."
+                )
+            for gt_img in gt_img_dict.values():
+                if raw_img.shape[1:] != gt_img.shape:
+                    raise ValueError("raw and label image must have the same spatial shape.")
+
+            coords = calculate_patch_coordinates(
+                raw_img.shape,
+                spatial_patch_size,
+                overlap,
+                padding,
+            )
+            candidate_patch_num += int(coords.shape[0])
+
+            if filter_dict["enable"]:
+                keep_flags = np.fromiter(
+                    (
+                        patch_satisfies_filter(
+                            raw_img,
+                            gt_img_dict,
+                            coord,
+                            spatial_patch_size,
+                            filter_dict,
+                        )
+                        for coord in coords
+                    ),
+                    dtype=bool,
+                    count=coords.shape[0],
+                )
+                kept_coords = coords[keep_flags]
+                rejected_patch_num += int(coords.shape[0] - kept_coords.shape[0])
+            else:
+                kept_coords = coords
+
+            kept_num = int(kept_coords.shape[0])
+            if kept_num == 0:
+                continue
+
+            # Semantic-only workflow normalizes independently at patch scale.
+            # This must match the inference normalization granularity.
+            processed_img = raw_img if normalize_per_patch else preprocess_img(raw_img, preprocess_dict)
+
+            # Never build label channels on the complete TIFF. Generate the first
+            # patch now only to determine the output-channel count.
+            first_coord = kept_coords[0]
+            first_gt_patch_dict = {
+                key: _crop_patch(gt_img, first_coord)
+                for key, gt_img in gt_img_dict.items()
+            }
+            first_gt_ch_list = generate_channels_from_labels(
+                first_gt_patch_dict,
+                channels,
+                channel_extra_opts,
+            )
+            if len(first_gt_ch_list) == 0:
+                raise ValueError("No output label channels were generated.")
+
+            current_label_channel_num = len(first_gt_ch_list)
+            if output_label_channel_num is None:
+                output_label_channel_num = current_label_channel_num
+            elif current_label_channel_num != output_label_channel_num:
+                raise ValueError(
+                    "Generated label channel count changed between input images: "
+                    f"expected {output_label_channel_num}, got {current_label_channel_num}."
                 )
 
-            for channel_index, label_patch in enumerate(gt_patch_ch_list):
-                # Pad the generated channel, not the original instance mask.
-                label_patch = reflect_padding_img(label_patch, spatial_patch_size)
-                data_label[patch_id, channel_index, :, :, :] = label_patch
+            old_saved_patch_num = saved_patch_num
+            saved_patch_num += kept_num
+
+            if root is None:
+                root, data_raw, data_label = create_patch_ome_zarr(
+                    zarr_path,
+                    saved_patch_num,
+                    expected_raw_channels,
+                    output_label_channel_num,
+                    spatial_patch_size,
+                    raw_dtype=np.float32 if normalize_per_patch else processed_img.dtype,
+                    label_dtype="uint8",
+                    overwrite=False,
+                )
+            else:
+                assert data_raw is not None and data_label is not None
+                data_raw.resize(
+                    (saved_patch_num, expected_raw_channels, *spatial_patch_size)
+                )
+                data_label.resize(
+                    (saved_patch_num, output_label_channel_num, *spatial_patch_size)
+                )
+
+            assert data_raw is not None and data_label is not None
+            def patch_jobs():
+                for local_index, coord in enumerate(kept_coords):
+                    yield (
+                        _crop_patch(processed_img, coord),
+                        {key: _crop_patch(img, coord) for key, img in gt_img_dict.items()},
+                        spatial_patch_size, preprocess_dict, normalize_per_patch,
+                        channels, channel_extra_opts,
+                        first_gt_ch_list if local_index == 0 else None,
+                    )
+
+            results = bounded_map(pool, prepare_patch, patch_jobs(), workers)
+            for local_index, (raw_patch, gt_patch_ch_list) in enumerate(results):
+                patch_id = old_saved_patch_num + local_index
+                if len(gt_patch_ch_list) != output_label_channel_num:
+                    raise ValueError(
+                        "Generated label channel count changed between patches: "
+                        f"expected {output_label_channel_num}, got {len(gt_patch_ch_list)}."
+                    )
+                data_raw[patch_id, :, :, :, :] = raw_patch
+                for channel_index, label_patch in enumerate(gt_patch_ch_list):
+                    data_label[patch_id, channel_index, :, :, :] = label_patch
 
     if root is None or data_raw is None or data_label is None:
         criteria = ", ".join(

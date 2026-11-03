@@ -105,7 +105,8 @@ class Segmentation_Workflow(Base_Workflow):
         """Create paired training and validation stores from configured TIFF directories.
 
         Resolves instance/semantic label files, crops patches, and writes raw and
-        label arrays. Patch filtering applies to training data only.
+        label arrays. Patch filtering applies to training data only. With
+        TRAIN.REUSE_PATCH_STORES, existing stores are reused independently.
         """
         self.train_tif_list = get_tif_path_in_folder(self.train_path)
         self.train_gt_tif_dict = get_tif_path_dict_in_folder(self.train_gt_path, self.channels)
@@ -115,14 +116,21 @@ class Segmentation_Workflow(Base_Workflow):
         self.val_tif_list, self.val_gt_tif_dict = pair_raw_and_label_tiffs(self.val_tif_list, self.val_gt_tif_dict)
         self.train_zarr_path = Path(self.train_path).parent / "train.ome.zarr"
         self.val_zarr_path = Path(self.val_path).parent / "val.ome.zarr"
-        tif_list_to_zarr(self.train_tif_list, self.train_gt_tif_dict, self.train_zarr_path, self.patch_size,
-                         self.train_overlap, self.train_padding, self.preprocess_dict, self.channels,
-                         self.channels_extra_opts, filter_dict=self.filter_dict, normalize_per_patch=True)
-        # Validation data is intentionally not filtered, otherwise the validation
-        # distribution and reported metrics would be biased toward retained patches.
-        tif_list_to_zarr(self.val_tif_list, self.val_gt_tif_dict, self.val_zarr_path, self.patch_size,
-                         self.val_overlap, self.val_padding, self.preprocess_dict, self.channels,
-                         self.channels_extra_opts, filter_dict=None, normalize_per_patch=True)
+        reuse = bool(get_cfg_value(self.cfg, "TRAIN.REUSE_PATCH_STORES", False))
+        for split in ("train", "val"):
+            store_path = getattr(self, f"{split}_zarr_path")
+            if reuse and store_path.is_dir():
+                print(f"{time_str()} reusing {split} patch store: {store_path}", flush=True)
+                continue
+            # Keep validation unfiltered to avoid biasing reported metrics.
+            tif_list_to_zarr(
+                getattr(self, f"{split}_tif_list"), getattr(self, f"{split}_gt_tif_dict"),
+                store_path, self.patch_size, getattr(self, f"{split}_overlap"),
+                getattr(self, f"{split}_padding"), self.preprocess_dict, self.channels,
+                self.channels_extra_opts,
+                filter_dict=self.filter_dict if split == "train" else None,
+                normalize_per_patch=True,
+                conversion_workers=get_cfg_value(self.cfg, "DATA.CONVERSION_WORKERS", 0))
 
     def _prepare_training_stores(self):
         self.save_patch_as_zarr()
@@ -199,15 +207,15 @@ class Segmentation_Workflow(Base_Workflow):
                                                            warmup_epochs=self.warmup_cosine_decay_epochs,
                                                            min_lr=self.min_lr)
 
-    def set_model(self):
+    def build_model(self):
         """Construct U-NeXt V2 with configured geometry and task output channels.
 
-        Moves the model to the selected device and chooses train/eval mode from
-        the workflow flags. Only the supported U-NeXt V2 architecture aliases are accepted.
+        Returns an unwrapped CPU model for training or disposable memory probes.
+        Only the supported U-NeXt V2 architecture aliases are accepted.
         """
         self.define_activations_and_channels()
         assert self.model_name in ["unext_v2", "u_next_v2", "unext-v2"], f"Unsupported model: {self.model_name}"
-        self.model = U_NeXt_V2(image_shape=self.patch_size,
+        return U_NeXt_V2(image_shape=self.patch_size,
                                feature_maps=self.feature_maps,
                                upsample_layer="convtranspose",
                                z_down=self.z_down,
@@ -223,6 +231,10 @@ class Segmentation_Workflow(Base_Workflow):
                                stem_k_size=self.convnext_stem_k_size,
                                contrast=False,
                                return_one_tensor=False)
+
+    def set_model(self):
+        """Build, place, and wrap the model for the configured workflow."""
+        self.model = self.build_model()
         from sknext.utils.parallel import parallel_model
         self.model = parallel_model(self.model, self.device,
                                     self.batch_size if self.cfg.TRAIN.ENABLE else None)
@@ -330,6 +342,7 @@ class Segmentation_Workflow(Base_Workflow):
         model = self.model.module if hasattr(self.model, "module") else self.model
         state = {
             "format_version": 2, "epoch": int(epoch), "identity": self._training_identity(),
+            "batch_size": int(self.batch_size),
             "model_name": self.model_name, "model_state_dict": model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
@@ -536,6 +549,16 @@ class Segmentation_Workflow(Base_Workflow):
         self.val_patch_loader = ZarrPatchLoader(self.cfg, self.val_zarr_path, if_val=True)
         self.train_patches = len(self.train_patch_loader)
         self.val_patches = len(self.val_patch_loader)
+        if bool(get_cfg_value(self.cfg, "TRAIN.AUTO_BATCH_SIZE", False)):
+            from sknext.utils.auto_batch import configure_auto_batch
+            self.define_activations_and_channels()
+            probe_loss = instance_segmentation_loss(
+                channel_weights=self.channel_weights, channel_names=self.output_channel_names,
+                bce_weight=1.0, dice_weight=1.0, auto_balance=True).to(self.device)
+            latest, _ = training_checkpoint_paths(self.checkpoint_input_file)
+            self.batch_size = configure_auto_batch(
+                self.cfg, self.build_model, probe_loss, self.train_patch_loader,
+                self.device, latest)
         train_loader = make_loader(self.train_patch_loader, self.cfg, self.device,
                                    shuffle=bool(get_cfg_value(self.cfg, "AUGMENTOR.SHUFFLE_TRAIN_DATA_EACH_EPOCH", True)))
         val_loader = make_loader(self.val_patch_loader, self.cfg, self.device, training=False)
@@ -848,8 +871,8 @@ class Segmentation_Workflow(Base_Workflow):
                     overlap_widths[axis, 1] = max(0, current_interval[1] - next_interval[0],)
             patch_overlap_widths.append(overlap_widths)
 
-        from sknext.utils.parallel import inference_batch_size, configured_inference_batch
-        batch_size = inference_batch_size(self.model, configured_inference_batch(self.cfg))
+        from sknext.utils.parallel import resolve_inference_batch
+        batch_size = resolve_inference_batch(self.model, self.cfg, self.device, 'segmentation')
         for batch_start in range(0, len(all_patch_coords), batch_size):
             batch_end = min(batch_start + batch_size, len(all_patch_coords),)
             block_pred_sum, block_weight_sum = self._infer_one_batch(

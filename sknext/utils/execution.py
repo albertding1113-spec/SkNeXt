@@ -218,10 +218,14 @@ def _training_worker(local_rank, size, cfg, run_id, workflow, rendezvous):
 def launch_training(cfg, run_id, workflow, size):
     import tempfile
     import torch.multiprocessing as mp
-    local_batch_size(cfg.TRAIN.BATCH_SIZE, size)
+    automatic = bool(cfgvalue(cfg, 'TRAIN.AUTO_BATCH_SIZE', False))
+    if not automatic:
+        local_batch_size(cfg.TRAIN.BATCH_SIZE, size)
     configure_threads(cfg, size)
-    print(f'Distributed training: {size} GPU processes, global batch {cfg.TRAIN.BATCH_SIZE}, '
-          f'local batch {int(cfg.TRAIN.BATCH_SIZE)//size}, CPU budget {cpu_budget(size)}/process', flush=True)
+    batch_info = ('automatic batch sizing' if automatic else
+                  f'global batch {cfg.TRAIN.BATCH_SIZE}, local batch {int(cfg.TRAIN.BATCH_SIZE)//size}')
+    print(f'Distributed training: {size} GPU processes, {batch_info}, '
+          f'CPU budget {cpu_budget(size)}/process', flush=True)
     # File rendezvous avoids fixed-port collisions between cluster jobs.
     with tempfile.TemporaryDirectory(prefix='sknext-ddp-') as folder:
         rendezvous = (Path(folder) / 'rendezvous').resolve().as_uri()

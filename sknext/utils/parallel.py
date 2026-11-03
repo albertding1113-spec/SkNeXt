@@ -55,3 +55,24 @@ def configured_inference_batch(cfg):
     from sknext.utils.execution import cfgvalue
     value = int(cfgvalue(cfg, 'INFER.BATCH_SIZE', 0))
     return value if value > 0 else int(cfgvalue(cfg, 'TRAIN.BATCH_SIZE', 1))
+
+
+def resolve_inference_batch(model, cfg, device, workflow, *, amp=False):
+    """Reuse a per-model probe result, or preserve manual inference batching."""
+    from sknext.utils.execution import cfgvalue
+    if not bool(cfgvalue(cfg, 'INFER.AUTO_BATCH_SIZE', False)):
+        return inference_batch_size(model, configured_inference_batch(cfg))
+    from sknext.utils.auto_batch import determine_inference_batch_size
+    patch = tuple(int(v) for v in cfgvalue(cfg, 'DATA.PATCH_SIZE', ()))
+    if len(patch) != 4 or min(patch) < 1:
+        raise ValueError('Automatic inference sizing requires positive DATA.PATCH_SIZE in ZYXC order')
+    maximum = int(cfgvalue(cfg, 'INFER.AUTO_BATCH_MAX_PER_GPU', 64))
+    fraction = float(cfgvalue(cfg, 'INFER.AUTO_BATCH_MEMORY_FRACTION', 0.85))
+    key = (patch, str(device), workflow, amp, maximum, fraction)
+    cached = getattr(model, '_sknext_inference_batch', None)
+    if cached is None or cached[0] != key:
+        batch = determine_inference_batch_size(
+            model, (patch[-1], *patch[:3]), device, workflow=workflow,
+            amp=amp, maximum=maximum, memory_fraction=fraction)
+        model._sknext_inference_batch = (key, batch)
+    return model._sknext_inference_batch[1]

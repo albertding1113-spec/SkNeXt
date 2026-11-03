@@ -90,6 +90,9 @@ def _workflow_epoch_probe(rank, rendezvous, folder):
     import yaml
     from sknext.config.config import SkNeXt_Config
     from sknext.utils import execution as ex
+    from sknext.utils.training_checks import check_finite
+    from sknext.utils.checkpoint import (read_checkpoint, restore_training_checkpoint,
+                                         training_checkpoint_paths)
     from sknext.utils.parallel import model_state_dict
     from sknext.utils.utils import get_cfg_value
     from sknext.model.scheduler import build_warmup_cosine_scheduler, build_onecycle_scheduler
@@ -126,6 +129,9 @@ def _workflow_epoch_probe(rank, rendezvous, folder):
                   random=random, hashlib=hashlib, time_str=lambda: '', log_message=lambda *a, **k: None,
                   print_model_parameters=lambda *a: None, print_cuda_memory=lambda *a, **k: None,
                   model_state_dict=model_state_dict, TrainingLossChart=Chart,
+                  check_finite=check_finite,
+                  read_checkpoint=read_checkpoint, restore_training_checkpoint=restore_training_checkpoint,
+                  training_checkpoint_paths=training_checkpoint_paths,
                   build_warmup_cosine_scheduler=build_warmup_cosine_scheduler,
                   build_onecycle_scheduler=build_onecycle_scheduler, get_cfg_value=get_cfg_value,
                   ZarrPatchLoader=lambda cfg, path, if_val: Data(if_val),
@@ -140,14 +146,25 @@ def _workflow_epoch_probe(rank, rendezvous, folder):
             exec(compile(ast.Module(body=nodes, type_ignores=[]), path, 'exec'), ns)
         # Semantic: real checkpoint serialization and aggregated validation/IoU.
         definitions('sknext/run/semantic_workflow.py',
-                    {'cfgget','checked_semantic_names','normalize_options','checkpoint_path','train'})
+                    {'cfgget','checked_semantic_names','normalize_options','checkpoint_path',
+                     'checkpoint_read_path','train'})
         semantic_cfg = yaml.safe_load(cfg.dump())
         semantic_cfg['MODEL']['CHECKPOINT'] = str(root / 'semantic.pth')
         semantic_cfg['TASK'].update(CHANNELS=['S.test'], CHANNEL_WEIGHTS=[1.])
+        semantic_cfg['TRAIN'].update(AUTO_BATCH_SIZE=True, BATCH_SIZE=1)
         ns.update(prepare_patch_data=lambda cfg, part, names: root / part,
                   make_model=lambda cfg, device: model(),
                   instance_segmentation_loss=lambda **kw: torch.nn.MSELoss())
-        ns['train'](semantic_cfg, 1, torch.device('cpu'))
+        with patch('sknext.utils.auto_batch.determine_batch_size', return_value=4) as tune:
+            ns['train'](semantic_cfg, 1, torch.device('cpu'))
+            tune.assert_called_once()
+        assert semantic_cfg['TRAIN']['BATCH_SIZE'] == 4
+        # Resume must recover the saved batch without probing, even if YAML differs.
+        semantic_cfg['TRAIN'].update(RESUME=True, BATCH_SIZE=1)
+        with patch('sknext.utils.auto_batch.determine_batch_size') as tune:
+            ns['train'](semantic_cfg, 1, torch.device('cpu'))
+            tune.assert_not_called()
+        assert semantic_cfg['TRAIN']['BATCH_SIZE'] == 4
         # Restoration: uneven validation shard and single-writer checkpoints.
         definitions('sknext/run/restoration_workflow.py', {'train'}, 'RestorationWorkflow')
         ns.update(make_sr_patch_store=lambda cfg, part, path: path,
@@ -158,7 +175,10 @@ def _workflow_epoch_probe(rank, rendezvous, folder):
              latest=root/'sr_latest', checkpoint=root/'sr_best', build_model=model,
              _checkpoint_data=lambda epoch, *a, **kw: epoch,
              _save=lambda data, path: saved(path, data))
-        ns['train'](sr)
+        cfg.TRAIN.AUTO_BATCH_SIZE = True
+        with patch('sknext.utils.auto_batch.determine_batch_size', return_value=4) as tune:
+            ns['train'](sr)
+            tune.assert_called_once()
         # Instance workflow: distributed patch-store metadata, metrics and saves.
         definitions('sknext/run/networkflow.py', {'train'}, 'Segmentation_Workflow')
         runner = SimpleNamespace(cfg=cfg, device=torch.device('cpu'), channels=['F'], job_id=1,
@@ -167,6 +187,10 @@ def _workflow_epoch_probe(rank, rendezvous, folder):
             _log_scalars=lambda *a: None, save_checkpoint=lambda: saved(root/'seg_best', 'best'),
             save_training_state=lambda epoch, *a: saved(root/'seg_latest', epoch))
         runner.set_model = lambda: setattr(runner, 'model', model())
+        runner.build_model = model
+        runner.define_activations_and_channels = lambda: None
+        runner.output_channel_names, runner.channel_weights = ['F'], [1.]
+        runner.checkpoint_input_file = root / 'seg_best'
         def optimizer():
             runner.optimizer = torch.optim.Adam(runner.model.parameters(), lr=.01)
             runner.scheduler = torch.optim.lr_scheduler.StepLR(runner.optimizer, 1)
@@ -175,7 +199,10 @@ def _workflow_epoch_probe(rank, rendezvous, folder):
             runner.loss_func = torch.nn.MSELoss()
             runner.metric = lambda pred, y: {'F': 1.}
         runner.set_loss_metrics = loss
-        ns['train'](runner)
+        with patch('sknext.utils.auto_batch.determine_batch_size', return_value=4) as tune:
+            ns['train'](runner)
+            tune.assert_called_once()
+        assert runner.batch_size == cfg.TRAIN.BATCH_SIZE == 4
     finally:
         dist.destroy_process_group()
 
@@ -268,6 +295,17 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual((Path(folder)/'seg_latest').read_text(), '2')
             self.assertTrue(list(Path(folder).glob('*latest.pth')))
 
+    def test_workflow_epoch_loops_and_auto_batch_resume_single_process(self):
+        # Exercise real optimizers/loaders/checkpoints even on hosts where Gloo
+        # rendezvous is unavailable. The two-rank test covers real collectives.
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ), \
+             patch('torch.distributed.init_process_group'), \
+             patch('torch.distributed.destroy_process_group'), \
+             patch('torch.nn.parallel.DistributedDataParallel', side_effect=lambda model: model), \
+             patch('sknext.utils.execution.world_size', return_value=1):
+            _workflow_epoch_probe(0, '', folder)
+            self.assertTrue(list(Path(folder).glob('*latest.pth')))
+
     def test_restoration_block_batching_matches_identity_at_edges(self):
         import numpy as np
         import torch
@@ -289,7 +327,7 @@ class ExecutionTests(unittest.TestCase):
         runner = SimpleNamespace(cfg=cfg, ch=1, scale=1, patch=(4,4,4), device=torch.device('cpu'))
         raw = np.linspace(0., 1., 5*7*9, dtype=np.float32).reshape(1,5,7,9)
         geometry = {'padding': np.array([1,1,1]), 'patch_central': np.array([2,2,2]),
-                    'block_margin': np.array([1,1,1])}
+                    'block_margin': np.array([1,1,1]), 'overlap': (0,0,0), 'stride': (2,2,2)}
         batches = []
         class Identity(torch.nn.Module):
             def forward(self, x):

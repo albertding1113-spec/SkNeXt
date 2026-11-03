@@ -67,6 +67,11 @@ def sr_infer_geometry(cfg) -> dict[str, tuple[int, int, int]]:
                                  "DATA.INFER.BLOCK_CENTRAL_FACTOR", 1)
     if any(2 * pad >= p for pad, p in zip(padding, patch)):
         raise ValueError("DATA.INFER.PADDING must be smaller than half DATA.PATCH_SIZE along each axis")
+    overlap = _overlap_voxels(cfg.DATA.INFER.OVERLAP, patch)
+    patch_central = tuple(p - 2 * pad for p, pad in zip(patch, padding))
+    stride = tuple(p - o for p, o in zip(patch_central, overlap))
+    if any(s <= 0 for s in stride):
+        raise ValueError("DATA.INFER requires patch_size - 2 * padding - overlap > 0 on every axis")
     if any(c > b for c, b in zip(central_factor, block_factor)):
         raise ValueError("DATA.INFER.BLOCK_CENTRAL_FACTOR must not exceed BLOCK_FACTOR")
     block_size = tuple(int(v * p) for v, p in zip(block_factor, patch))
@@ -77,7 +82,7 @@ def sr_infer_geometry(cfg) -> dict[str, tuple[int, int, int]]:
                          "PATCH_SIZE / 2 must be >= DATA.INFER.PADDING on every axis; "
                          "increase BLOCK_FACTOR or reduce padding")
     return {"patch": patch, "padding": padding,
-            "patch_central": tuple(p - 2 * pad for p, pad in zip(patch, padding)),
+            "patch_central": patch_central, "overlap": overlap, "stride": stride,
             "block_size": block_size, "central_block": central_block,
             "block_margin": block_margin}
 
@@ -255,9 +260,44 @@ def _overlap_voxels(fracs, patch: Sequence[int]) -> tuple[int, int, int]:
     return tuple(np.rint(frac * np.asarray(patch, dtype=int)).astype(int))
 
 
+def validate_sr_patch_store(path, cfg=None):
+    """Reject incomplete or incompatible paired stores before workers start."""
+    try:
+        root = zarr.open_group(str(path), mode="r")
+        raw_shape = tuple(root["raw"].shape)
+        label_shape = tuple(root["label"].shape)
+        if (len(raw_shape) != 5 or len(label_shape) != 5 or
+                raw_shape[0] < 1 or raw_shape[:2] != label_shape[:2]):
+            raise ValueError(f"invalid paired NCZYX shapes: {raw_shape}, {label_shape}")
+        if cfg is not None:
+            patch = tuple(int(v) for v in cfg.DATA.PATCH_SIZE[:3])
+            channels = int(cfg.DATA.PATCH_SIZE[-1])
+            scale = int(cfg.SR.UPSAMPLE)
+            expected_label = (channels, patch[0], patch[1] * scale, patch[2] * scale)
+            if raw_shape[1:] != (channels, *patch) or label_shape[1:] != expected_label:
+                raise ValueError("stored patch shapes do not match DATA.PATCH_SIZE/SR.UPSAMPLE")
+            metadata = root.attrs.get("sknext", {})
+            if metadata.get("task") != "SR" or metadata.get("normalization") != "per_image_minmax_v1":
+                raise ValueError("missing SR completion metadata or incompatible normalization")
+            if (metadata.get("raw_range") != list(cfg.SR.RAW_RANGE) or
+                    metadata.get("gt_range") != list(cfg.SR.GT_RANGE)):
+                raise ValueError("stored intensity ranges do not match SR configuration")
+        return raw_shape[0]
+    except (KeyError, FileNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid SR patch store {path}: {exc}. Stop jobs writing to this store, "
+            "then rebuild with TRAIN.REUSE_PATCH_STORES: False. "
+            "Concurrent training jobs must use separate output directories."
+        ) from exc
+
+
 def make_sr_patch_store(cfg, part: str, output: Path) -> Path:
     """Produce paired Zarr v3 NCZYX arrays with distinct raw/GT spatial shapes."""
     scale = validate_sr(cfg)
+    if bool(getattr(getattr(cfg, "TRAIN", None), "REUSE_PATCH_STORES", False)) and output.exists():
+        validate_sr_patch_store(output, cfg)
+        log_message(f"[SR] {part}: reusing paired patches from {output}")
+        return output
     patch = tuple(int(v) for v in cfg.DATA.PATCH_SIZE[:3])
     channels = int(cfg.DATA.PATCH_SIZE[-1])
     folder = getattr(cfg.DATA, part)
@@ -331,7 +371,7 @@ class SRPatchDataset(Dataset):
                                           legacy_noise_std=noise_std,
                                           legacy_blur_sigma=blur_sigma)
                           if self.train else None)
-        self._length = int(zarr.open_group(str(path), mode="r")["raw"].shape[0])
+        self._length = validate_sr_patch_store(path, cfg)
 
     def __len__(self):
         return self._length
@@ -406,7 +446,7 @@ class RestorationWorkflow:
         self.checkpoint = Path(cfg.PATHS.CHECKPOINT_DIR) / f"checkpoint_{int(job_id):02d}.pth"
         self.latest = self.checkpoint.with_name(self.checkpoint.stem + "_latest.pth")
 
-    def build_model(self):
+    def build_model(self, parallel=True):
         cfg = self.cfg
         if str(cfg.MODEL.ARCHITECTURE).lower().replace("-", "_") not in {"unext_v2", "u_next_v2"}:
             raise ValueError("SR workflow currently supports only U_NeXt_V2")
@@ -420,6 +460,8 @@ class RestorationWorkflow:
             explicit_activations=False, separated_decoders=False,
             upsampling_factor=(1, self.scale, self.scale) if self.scale > 1 else (),
             upsampling_position="post")
+        if not parallel:
+            return model
         from sknext.utils.parallel import parallel_model
         return parallel_model(model, self.device, cfg.TRAIN.BATCH_SIZE
                               if cfg.TRAIN.ENABLE else None)
@@ -464,6 +506,7 @@ class RestorationWorkflow:
                 "z_down": list(self.cfg.MODEL.Z_DOWN),
                 "yx_down": list(self.cfg.MODEL.YX_DOWN),
                 "epoch": epoch, "best_val_loss": best, "identity": self._identity(),
+                "batch_size": int(self.cfg.TRAIN.BATCH_SIZE),
                 "rng_by_rank": getattr(self, "_rng_states", []),
                 "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
                 "scaler_state_dict": self.scaler.state_dict() if hasattr(self, "scaler") else None,
@@ -520,6 +563,12 @@ class RestorationWorkflow:
                                   noise_std=float(cfg.SR.AUGMENT_NOISE_STD),
                                   blur_sigma=float(cfg.SR.AUGMENT_BLUR_SIGMA))
         ds_val = SRPatchDataset(val_path)
+        if bool(getattr(cfg.TRAIN, 'AUTO_BATCH_SIZE', False)):
+            from sknext.utils.auto_batch import configure_auto_batch
+            configure_auto_batch(
+                cfg, lambda: self.build_model(parallel=False),
+                lambda pred, target: sr_loss(pred, target, cfg),
+                ds_train, self.device, self.latest)
         batch = int(cfg.TRAIN.BATCH_SIZE)
         if batch < 1:
             raise ValueError("TRAIN.BATCH_SIZE must be positive")
@@ -706,6 +755,7 @@ class RestorationWorkflow:
         physical_ch = list(self.cfg.DATA.INFER.CHANNEL)
         factor = (1, self.scale, self.scale)
         padding, patch_central = geometry['padding'], geometry['patch_central']
+        overlap, stride = geometry['overlap'], geometry['stride']
         block_margin = geometry['block_margin']
         # One image read per channel per *block*. The surrounding
         # margin contains all patch halos, except at volume edges.
@@ -721,9 +771,10 @@ class RestorationWorkflow:
         hr_size = tuple(int(n * f) for n, f in zip(core_size, factor))
         # A block buffer permits exactly ONE write to the output
         # store per central block, rather than one write per patch.
-        restored = np.empty((self.ch, *hr_size), dtype=np.float32)
-        from sknext.utils.parallel import inference_batch_size, configured_inference_batch
-        batch_size = inference_batch_size(model, configured_inference_batch(self.cfg))
+        restored = np.zeros((self.ch, *hr_size), dtype=np.float32)
+        weight_sum = np.zeros(hr_size, dtype=np.float32)
+        from sknext.utils.parallel import resolve_inference_batch
+        batch_size = resolve_inference_batch(model, self.cfg, self.device, 'restoration')
         pending = []
 
         def flush_patches():
@@ -744,16 +795,28 @@ class RestorationWorkflow:
                     hhr[0]:hhr[0] + nhr[0],
                     hhr[1]:hhr[1] + nhr[1],
                     hhr[2]:hhr[2] + nhr[2]]
-                if bool(self.cfg.SR.OUTPUT_CLIP):
-                    central_prediction = np.clip(central_prediction, 0., 1.)
                 dst_lo = tuple(int(q * f) for q, f in zip(local, factor))
                 dst = tuple(slice(s, s + length) for s, length in zip(dst_lo, nhr))
-                restored[(slice(None), *dst)] = central_prediction
+                axes = []
+                for axis, scale in enumerate(factor):
+                    length = patch_central[axis] * scale
+                    width = overlap[axis] * scale
+                    weights = np.ones(length, dtype=np.float32)
+                    if width:
+                        ramp = np.linspace(0., 1., width + 2, dtype=np.float32)[1:-1]
+                        if local[axis] > 0:
+                            weights[:width] *= ramp
+                        if local[axis] + stride[axis] < core_size[axis]:
+                            weights[-width:] *= ramp[::-1]
+                    axes.append(weights[:nhr[axis]])
+                weight = axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
+                restored[(slice(None), *dst)] += central_prediction * weight[None]
+                weight_sum[dst] += weight
             pending.clear()
 
-        for dz in range(0, int(core_size[0]), patch_central[0]):
-            for dy in range(0, int(core_size[1]), patch_central[1]):
-                for dx in range(0, int(core_size[2]), patch_central[2]):
+        for dz in range(0, int(core_size[0]), stride[0]):
+            for dy in range(0, int(core_size[1]), stride[1]):
+                for dx in range(0, int(core_size[2]), stride[2]):
                     local = np.array((dz, dy, dx), dtype=np.int64)
                     valid = np.minimum(patch_central, core_size - local)
                     global_start = core_lo + local - padding
@@ -763,6 +826,11 @@ class RestorationWorkflow:
                     if len(pending) >= batch_size:
                         flush_patches()
         flush_patches()
+        if np.any(weight_sum <= 0):
+            raise RuntimeError("SR patch blending left voxels without prediction weight")
+        restored /= weight_sum[None]
+        if bool(self.cfg.SR.OUTPUT_CLIP):
+            np.clip(restored, 0., 1., out=restored)
         return restored
 
     def _infer_one(self, model, source: Path, pool=None):
@@ -770,8 +838,8 @@ class RestorationWorkflow:
 
         Patch context is DATA.INFER.PADDING. Block read extent is controlled by
         BLOCK_FACTOR/BLOCK_CENTRAL_FACTOR, with a derived margin. Read only a
-        bounded source block, tile its *central* region without overlapping
-        writes, reconstruct an HR central block in RAM, then commit that block
+        bounded source block, blend overlapping patch centers in its central
+        region, reconstruct an HR central block in RAM, then commit that block
         with one Zarr write and one resumable progress-record update.
         """
         out_path, log_path = self._output_paths(source)
@@ -802,7 +870,7 @@ class RestorationWorkflow:
             ckptstat = ckpt.stat()
             # Batch size is an execution setting, not a resume compatibility key.
             manifest_args = {
-                "version": 3, "source": str(source.resolve()),
+                "version": 4, "source": str(source.resolve()),
                 "normalization_policy": "per_image_minmax_v1",
                 "input_image_range": list(input_bounds),
                 "source_stat": [stat.st_size, stat.st_mtime_ns],
@@ -810,6 +878,7 @@ class RestorationWorkflow:
                 "checkpoint_stat": [ckptstat.st_size, ckptstat.st_mtime_ns],
                 "channels": physical_ch, "shape": shape, "scale": self.scale,
                 "patch": self.patch, "infer_padding": padding,
+                "infer_overlap": geometry["overlap"], "blending": "linear_weighted_mean",
                 "block_size": geometry["block_size"],
                 "central_block": central_block, "block_margin": block_margin,
                 "raw_range": list(self.cfg.SR.RAW_RANGE),

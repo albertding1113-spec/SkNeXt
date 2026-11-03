@@ -45,6 +45,7 @@ from sknext.utils.checkpoint import (read_checkpoint, load_model_weights,
 from sknext.utils.model_info import print_cuda_memory, print_model_parameters
 from sknext.utils.progress import loss_log_steps, log_message
 from sknext.utils.training_charts import TrainingLossChart
+from sknext.utils.training_checks import check_finite
 
 
 def cfgget(cfg: dict, path: str, default=None):
@@ -105,7 +106,7 @@ def normalize_options(cfg: dict) -> dict:
     }
 
 
-def make_model(cfg: dict, device: torch.device) -> torch.nn.Module:
+def make_model(cfg: dict, device: torch.device, *, parallel=True) -> torch.nn.Module:
     channels = checked_semantic_names(cfg)
     patch = cfgget(cfg, 'DATA.PATCH_SIZE', [32, 128, 128, 1])
     features = list(cfgget(cfg, 'MODEL.FEATURE_MAPS', [16,32,64,128,256]))
@@ -128,6 +129,8 @@ def make_model(cfg: dict, device: torch.device) -> torch.nn.Module:
         output_channels=[len(channels)], output_channel_info=['semantic'],
         separated_decoders=False, explicit_activations=False, contrast=False,
     )
+    if not parallel:
+        return model.to(device)
     from sknext.utils.parallel import parallel_model
     return parallel_model(model, device, cfgget(cfg, 'TRAIN.BATCH_SIZE', 1)
                           if cfgget(cfg, 'TRAIN.ENABLE', False) else None)
@@ -198,6 +201,7 @@ def prepare_patch_data(cfg: dict, part: str, names: list[str]) -> Path:
         preprocess_dict=normalize_options(cfg), channels=names,
         channel_extra_opts=channel_extra,
         filter_dict=fd, normalize_per_patch=True,
+        conversion_workers=cfgget(cfg, 'DATA.CONVERSION_WORKERS', 0),
     )
     return output
 
@@ -211,7 +215,34 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
     val_path = prepare_once(prepare_patch_data, cfg, 'VAL', names)
     train_ds = ZarrPatchLoader(cfg, train_path, if_val=False)
     val_ds = ZarrPatchLoader(cfg, val_path, if_val=True)
-    batch_size = int(cfgget(cfg, 'TRAIN.BATCH_SIZE', 1))
+    if cfgget(cfg, 'TRAIN.AUTO_BATCH_SIZE', False):
+        if cfgget(cfg, 'TRAIN.RESUME', False):
+            input_latest, _ = training_checkpoint_paths(checkpoint_read_path(cfg, run_id))
+            saved_batch = read_checkpoint(input_latest).get('batch_size')
+            if saved_batch is None:
+                raise ValueError('Checkpoint has no saved batch size. Disable TRAIN.AUTO_BATCH_SIZE '
+                                 'and set TRAIN.BATCH_SIZE to the original batch size to resume.')
+            cfg['TRAIN']['BATCH_SIZE'] = int(saved_batch)
+        else:
+            from sknext.utils.auto_batch import determine_batch_size
+            if str(cfgget(cfg, 'TRAIN.OPTIMIZER', 'ADAMW')).upper() != 'ADAMW':
+                raise ValueError('Semantic-only runner currently supports TRAIN.OPTIMIZER: ADAMW')
+            probe_loss = instance_segmentation_loss(
+                channel_weights=weights, channel_names=names,
+                bce_weight=float(cfgget(cfg, 'TRAIN.BCE_WEIGHT', 1.0)),
+                dice_weight=float(cfgget(cfg, 'TRAIN.DICE_WEIGHT', 1.0)),
+                auto_balance=bool(cfgget(cfg, 'TRAIN.AUTO_BALANCE', True)))
+            log_message('Probing GPU memory for automatic training batch size...', flush=True)
+            cfg['TRAIN']['BATCH_SIZE'] = determine_batch_size(
+                lambda: make_model(cfg, device, parallel=False), probe_loss, train_ds, device,
+                amp=bool(cfgget(cfg, 'TRAIN.AMP', True)),
+                optimizer_options=dict(lr=float(cfgget(cfg, 'TRAIN.LR', 1e-4)),
+                    weight_decay=float(cfgget(cfg, 'TRAIN.W_DECAY', 0.01)),
+                    betas=tuple(cfgget(cfg, 'TRAIN.OPT_BETAS', [0.9, 0.999]))),
+                maximum=int(cfgget(cfg, 'TRAIN.AUTO_BATCH_MAX_PER_GPU', 64)),
+                memory_fraction=float(cfgget(cfg, 'TRAIN.AUTO_BATCH_MEMORY_FRACTION', 0.85)))
+        log_message(f"Automatic batch size: global={cfg['TRAIN']['BATCH_SIZE']}, "
+                    f"per GPU={cfg['TRAIN']['BATCH_SIZE']//world_size()}", flush=True)
     loader = make_loader(train_ds, cfg, device)
     val_loader = make_loader(val_ds, cfg, device, training=False)
     model = make_model(cfg, device)
@@ -302,15 +333,26 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
         train_sum = 0.
         for step, (inputs, targets) in enumerate(loader, start=1):
             inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+            context = f'[SEMANTIC] [TRAIN] [epoch={epoch+1}] [batch={step}]'
+            check_finite([('inputs', inputs), ('targets', targets)],
+                         context=context, device=device, synchronize=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('cuda', dtype=torch.float16, enabled=amp):
                 logits = model(inputs)
                 if isinstance(logits, dict):
                     logits = logits['pred']
+                check_finite([('logits', logits)], context=context,
+                             device=device, synchronize=True)
                 loss = loss_fn(logits.float(), targets)
+            check_finite([('loss', loss)], context=context, device=device, synchronize=True)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            check_finite(((f'gradient:{name}', p.grad) for name, p in model.named_parameters()),
+                         context=context, device=device, synchronize=True)
             scaler.step(optimizer)
             scaler.update()
+            check_finite(model.named_parameters(), context=context + ' [after optimizer]',
+                         device=device, synchronize=True)
             scheduler.step()
             step_loss = float(loss.detach())
             train_sum += step_loss
@@ -324,12 +366,17 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
         intersections = np.zeros(len(names), dtype=np.float64)
         unions = np.zeros(len(names), dtype=np.float64)
         with torch.inference_mode():
-            for inputs, targets in val_loader:
+            for step, (inputs, targets) in enumerate(val_loader, start=1):
                 inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+                context = f'[SEMANTIC] [VAL] [epoch={epoch+1}] [batch={step}]'
+                check_finite([('inputs', inputs), ('targets', targets)],
+                             context=context, device=device)
                 with torch.autocast('cuda', dtype=torch.float16, enabled=amp):
                     logits = validation_model(model)(inputs)
                     if isinstance(logits, dict): logits = logits['pred']
+                    check_finite([('logits', logits)], context=context, device=device)
                     loss = loss_fn(logits.float(), targets)
+                check_finite([('loss', loss)], context=context, device=device)
                 valid_sum += float(loss) * len(inputs)
                 count += len(inputs)
                 binary = torch.sigmoid(logits.float()) >= 0.5
@@ -365,6 +412,7 @@ def train(cfg: dict, run_id: int, device: torch.device) -> None:
         if primary():
             np_rng = np.random.get_state()
             state = {'format_version':2, 'epoch':epoch+1, 'identity':identity,
+                     'batch_size':int(cfgget(cfg, 'TRAIN.BATCH_SIZE', 1)),
                      'model_state_dict':model_state_dict(model),
                      'optimizer_state_dict':optimizer.state_dict(),
                      'scheduler_state_dict':scheduler.state_dict(),
@@ -432,6 +480,13 @@ def _prediction_model_result(model, tensor):
     return out
 
 
+def _semantic_batch_probabilities(model, patches, device, amp):
+    # Keep GPU tensors in a separate frame so OOM recovery can release them.
+    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.float16, enabled=amp):
+        xx = torch.from_numpy(np.stack(patches)).to(device)
+        return torch.sigmoid(_prediction_model_result(model, xx).float()).cpu().numpy()
+
+
 def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
                    names: list[str], amp: bool) -> np.ndarray:
     """Infer one bounded CZYX block and blend overlapping patch probabilities."""
@@ -442,11 +497,12 @@ def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
     win = _window(patch_size)
     overlap = overlap_voxels(cfg, 'INFER')
     coords = list(patch_coordinates_iter(sz, patch_size, overlap, (0,0,0)))
-    from sknext.utils.parallel import inference_batch_size, configured_inference_batch
-    batch_size = inference_batch_size(model, configured_inference_batch(cfg))
+    from sknext.utils.parallel import resolve_inference_batch
+    batch_size = resolve_inference_batch(model, cfg, device, 'semantic', amp=amp)
     norm = normalize_options(cfg)
     skip_empty = bool(cfgget(cfg, 'INFER.SKIP_ZERO_PATCHES', True))
-    for batch_start in range(0, len(coords), batch_size):
+    batch_start = 0
+    while batch_start < len(coords):
         coords_batch = coords[batch_start:batch_start+batch_size]
         tensor_patches = []
         nonempty_indices = []
@@ -460,10 +516,25 @@ def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
             tensor_patches.append(raw_patch)
             nonempty_indices.append(i)
         if nonempty_indices:
-            xx = torch.from_numpy(np.stack(tensor_patches)).to(device)
-            with torch.inference_mode(), torch.autocast('cuda', dtype=torch.float16, enabled=amp):
-                probabilities = torch.sigmoid(_prediction_model_result(model, xx).float()).cpu().numpy()
-            del xx
+            retry = False
+            try:
+                probabilities = _semantic_batch_probabilities(model, tensor_patches, device, amp)
+            except torch.cuda.OutOfMemoryError:
+                if not cfgget(cfg, 'INFER.AUTO_BATCH_SIZE', False) or len(nonempty_indices) <= 1:
+                    raise
+                batch_size = max(1, len(nonempty_indices) // 2)
+                retry = True
+            if retry:
+                # The exception traceback must be gone before clearing cached allocations.
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                cached = getattr(model, '_sknext_inference_batch', None)
+                if cached is not None:
+                    model._sknext_inference_batch = (cached[0], batch_size)
+                log_message(f'[AUTO INFER BATCH] {device}: CUDA OOM; retrying with batch={batch_size}',
+                            flush=True)
+                continue
         else:
             probabilities = np.zeros((0,len(names),*patch_size),dtype=np.float32)
         results = {i: probabilities[j] for j,i in enumerate(nonempty_indices)}
@@ -475,6 +546,7 @@ def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
                 prob = results[i][:,:actual[0],:actual[1],:actual[2]]
                 accum[:, z0:z1,y0:y1,x0:x1] += prob * weight[None]
             divisor[z0:z1,y0:y1,x0:x1] += weight
+        batch_start += len(coords_batch)
     return accum / np.maximum(divisor[None], 1e-8)
 
 
@@ -566,6 +638,8 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
                     'checkpoint_mtime_ns':checkpoint_read_path(cfg, run_id).stat().st_mtime_ns,
                     'thresholds':get_thresholds(cfg,len(names)).tolist(),
                     'save_probabilities':bool(cfgget(cfg, 'INFER.SAVE_PROBABILITIES', False))}
+        if run_meta['save_probabilities']:
+            run_meta['probability_dtype'] = 'float32'
         if source.suffix.lower() in {'.tif', '.tiff'}:
             source_stat = source.stat()
             run_meta.update(source_size=source_stat.st_size, source_mtime_ns=source_stat.st_mtime_ns)
@@ -607,11 +681,19 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
         with ZarrIOManager(output, shape=(len(names),*zyx), dtype='uint8', chunks=chunks,
                            mode='a', channel_names=[ch[2:] for ch in names]) as dst:
             dst.root.attrs['sknext_semantic_channels'] = names
-            prob_writer = (ZarrIOManager(prob_path,shape=(len(names),*zyx),dtype='uint16',
+            prob_writer = (ZarrIOManager(prob_path,shape=(len(names),*zyx),dtype='float32',
                                           mode='a',chunks=chunks,
-                                          channel_names=[ch[2:] for ch in names])
+                                          channel_names=[ch[2:] for ch in names],
+                                          channel_windows=[(0.0, 1.0)] * len(names),
+                                          image_name='SkNeXt sigmoid probability maps')
                            if save_prob else None)
             try:
+                if prob_writer is not None:
+                    prob_writer.root.attrs['sknext_prediction'] = {
+                        'kind': 'sigmoid_probability', 'dtype': 'float32',
+                        'channel_names': names, 'overlap_blending': 'weighted_mean',
+                        'value_range': [0.0, 1.0],
+                    }
                 total = math.prod(num_core)
                 def jobs():
                     block_id = 0
@@ -641,7 +723,7 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
                     masks = (center_probs >= thresholds[:,None,None,None]).astype('uint8')
                     dst[write_key] = masks
                     if prob_writer is not None:
-                        prob_writer[write_key] = np.rint(center_probs * 65535.).astype('uint16')
+                        prob_writer[write_key] = np.clip(center_probs, 0., 1.).astype('float32', copy=False)
                     completed.add(block_id)
                     # Update progress atomically: a crash cannot truncate its JSON.
                     temporary = progress.with_name(progress.name + '.tmp')

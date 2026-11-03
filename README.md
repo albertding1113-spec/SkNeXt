@@ -96,6 +96,56 @@ need not exactly match a single-GPU global-batch run. Checkpoint weights remain
 portable. Optimizer/scheduler resume still requires compatible configuration;
 changing GPU count or CPU loader concurrency is not bitwise reproducible.
 
+All training workflows (semantic, instance/mixed, and SR) can choose their batch size
+automatically at startup:
+
+```yaml
+TRAIN:
+  AUTO_BATCH_SIZE: True
+  AUTO_BATCH_MAX_PER_GPU: 64       # search limit, not the selected batch
+  AUTO_BATCH_MEMORY_FRACTION: 0.85 # budget fraction of currently free GPU memory
+```
+
+This overrides `TRAIN.BATCH_SIZE` for the run. Disposable models run two full
+forward/backward/update steps using the configured optimizer per candidate with the patch size
+and AMP setting. Probing adds startup time and preserves training random states.
+For multi-GPU training, use the main `sknext` CLI: every rank probes locally and
+the smallest fitting local batch is used on all GPUs. The chosen global and
+per-GPU batches are logged. Automatic sizing requires CUDA and does not change
+inference batch sizes. Semantic training supports AdamW; instance/mixed and SR
+probes support AdamW, Adam, and SGD.
+
+The 15% default headroom allows for runtime variation, including distributed
+buffers, but cannot guarantee against later OOMs or another process consuming
+GPU memory. Lower the fraction if more headroom is needed. New latest checkpoints
+save the chosen batch; `TRAIN.RESUME: True` reuses it rather than retuning and
+changing the optimizer/scheduler trajectory. For older checkpoints without this
+metadata, disable automatic sizing and supply the original `TRAIN.BATCH_SIZE`.
+Automatic sizing addresses memory capacity, not NaN losses or numerical stability.
+
+All inference workflows also support independent, forward-only automatic sizing:
+
+```yaml
+INFER:
+  AUTO_BATCH_SIZE: True
+  AUTO_BATCH_MAX_PER_GPU: 64
+  AUTO_BATCH_MEMORY_FRACTION: 0.85
+```
+
+This overrides `INFER.BATCH_SIZE` and its `TRAIN.BATCH_SIZE` fallback. It requires
+CUDA and probes the loaded model with synthetic patches of `DATA.PATCH_SIZE`
+before the first predicted block. Each GPU block worker chooses its own batch
+and reuses it for subsequent blocks and input files. The DataParallel fallback
+checks every participating GPU. Semantic probes honor `INFER.AMP`; instance/mixed
+and SR probes use FP32, matching their inference paths. Resumed inference probes
+again because available GPU memory may have changed. The budget covers GPU
+forward/output allocations, not CPU block buffers, and cannot prevent later OOMs
+if memory use changes. Semantic inference with automatic sizing catches runtime
+CUDA OOMs, halves the failed patch batch, and retries those patches before blending
+their output. The worker retains the reduced batch for subsequent blocks. An OOM
+at one patch still fails; reduce the patch/model size or free GPU memory in that
+case. Training and inference auto-sizing switches are independent.
+
 For example:
 
 ```yaml
@@ -284,7 +334,27 @@ Ground-truth volumes are ZYX and must match the corresponding raw spatial shape.
 Instance/mixed training recreates `train.ome.zarr` beside the training raw directory and
 `val.ome.zarr` beside the validation raw directory. These contain `raw` and
 `label` arrays in **NCZYX** order. Existing generated stores at those paths are
-replaced when training starts.
+replaced when training starts by default. Set `TRAIN.REUSE_PATCH_STORES: true`
+to reuse each existing store and convert only missing stores. This option is
+independent of `MODEL.LOAD_CHECKPOINT` and `TRAIN.RESUME` and applies to
+instance/mixed training and SR training. SR reuses `train_sr_patches.zarr` and
+`val_sr_patches.zarr` in the run output directory, checking paired array shapes
+and normalization metadata first; invalid stores raise an error requesting a
+rebuild. Concurrent SR jobs must use separate output directories.
+For instance/mixed training, source TIFF directories are still scanned for training
+metadata. Reused stores are not checked for changes to source data or conversion
+settings; set this option back to `false` after changing data, patch size,
+channels, preprocessing, overlap, padding, or patch filtering.
+
+Training and validation TIFF conversion for instance/mixed and semantic tasks
+prepares patches with multiple CPU processes by default (up to eight available
+CPUs). Set `DATA.CONVERSION_WORKERS: 4` to choose a process count, `0` for
+automatic selection, or `1` for serial conversion. Workers normalize patches
+and generate label channels, including skeleton targets. The parent writes
+Zarr in source order; at most two cropped patches per worker are queued, rather
+than copying full source volumes to every process. Lower the count if memory
+is limited. TIFF loading, filtering, and Zarr writes remain serial, so speedup
+depends on label complexity and storage throughput. Reused stores skip conversion.
 
 ### Instance/mixed inference
 
@@ -495,13 +565,15 @@ to the semantic-only runner; semantic channels in the instance/mixed runner
 still use the fixed `probability > 0.5` rule.
 
 Output masks are uint8 CZYX. With `SAVE_PROBABILITIES: true`, a separate
-`<output-name>_prob.zarr` store contains probabilities scaled to uint16
-(`stored_value / 65535` recovers the probability). A directory `GT_PATH` receives
+`<output-name>_prob.zarr` store contains float32 probabilities in `[0, 1]`
+without integer scaling. A directory `GT_PATH` receives
 `semantic_<run_id>.ome.zarr`; a `.zarr` path is used directly. Progress is stored
 beside it as `<output-name>.progress.json`. Rerun the same command to resume.
 Changed thresholds, normalization, overlap, zero-patch handling, checkpoint,
 and other recorded prediction settings are rejected during resume. Older
 progress files without the required metadata cannot be verified.
+Runs with legacy uint16 probability output must be regenerated with `--overwrite`
+or written to a new output path.
 
 The semantic-only runner currently does not apply `INFER.POST_PROCESSING`
 operations, even when they are present in the shared configuration.
@@ -863,7 +935,7 @@ from the result root and run ID. Set exactly one of `TRAIN.ENABLE` and
 | `TRAIN.LR_SCHEDULER.NAME` | `warmupcosine` or `one_cycle`. |
 | `DATA.NORMALIZATION` | Min/max or mean/std normalization, with optional percentile clipping. |
 | `DATA.TRAIN.FILTER` | Optional filters on original raw mean or foreground label fraction; validation is unfiltered. |
-| `DATA.*.OVERLAP` | Per-axis overlap fractions in `[0, 1)`, in ZYX order. |
+| `DATA.*.OVERLAP` | Per-axis overlap fractions in `[0, 1)`, in ZYX order. `DATA.INFER.OVERLAP` enables weighted patch blending in semantic, instance/mixed, and SR inference. |
 | `DATA.*.PADDING` | Per-axis padding in voxels, in ZYX order. |
 | `DATA.INFER.CHANNEL` | List of input channel indices; its length must match patch C. |
 | `DATA.INFER.BLOCK_FACTOR` | Expanded inference block size as a multiple of spatial patch size. |
@@ -871,12 +943,20 @@ from the result root and run ID. Set exactly one of `TRAIN.ENABLE` and
 | `DATA.INFER.HALO` | Semantic-only block context in ZYX voxels; `[]` selects half the patch size. |
 | `TASK.WATERSHED` | Seed/growth channels and thresholds; provide one threshold per selected channel or an empty list for automatic thresholds. |
 | `INFER.THRESHOLD` | Semantic-only scalar or per-channel threshold; default 0.5. |
-| `INFER.SAVE_PROBABILITIES` | Semantic-only uint16 probability export in a separate store. |
+| `INFER.SAVE_PROBABILITIES` | Semantic-only float32 probability export in a separate store. |
 | `INFER.OUTPUT_MODE` | Instance/mixed labels, float32 probabilities, or both. |
 | `INFER.POST_PROCESSING` | Instance/mixed operations: `fill_holes`, `remove_small`, `remove_large`; not applied by semantic-only or SR runners. |
 | `SR.UPSAMPLE` | XY restoration scale: 1, 2, or 4. |
 | `SR.RAW_RANGE`, `SR.GT_RANGE` | `[]`: independent min/max scaling per complete raw/GT image for every dtype; explicit `[min,max]` overrides it. |
 | `SR.INFER.RESUME`, `SR.INFER.OVERWRITE` | Resume SR output or explicitly replace it. |
+
+For SR inference, overlap voxels are rounded from `DATA.INFER.OVERLAP * PATCH_SIZE[:3]`.
+Patch borders specified by `DATA.INFER.PADDING` are cropped before weighted blending;
+`PATCH_SIZE[:3] - 2 * PADDING - overlap_voxels` must be positive on every axis.
+Zero overlap retains direct tiling of patch centers. Blending occurs inside each
+inference block; block centers are still committed separately. SR outputs created
+before overlap blending was added need a new output path or an explicit overwrite
+because their resume manifest uses the previous stitching policy.
 
 Supported task channels:
 
@@ -945,7 +1025,7 @@ tensorboard --logdir ./result/results/2/sr_tensorboard
 All prediction stores use **CZYX** layout. Skeleton-guided instance labels use
 uint16 IDs (at most 65,535 SWCs); SWC-free instance labels use uint32 IDs;
 semantic-only masks use uint8; SR predictions and instance/mixed raw probability
-outputs use float32. Semantic-only optional probability output uses scaled uint16.
+outputs use float32. All saved probability maps use float32 values in `[0, 1]`.
 
 ## Skeleton-associated component export
 

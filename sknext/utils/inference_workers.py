@@ -60,7 +60,9 @@ def _initialize(gpu, size, cfg, run_id, workflow):
     model.eval()
     _runtime = dict(cfg=cfg, model=model, runner=runner, names=names, device=device,
                     workflow=workflow, reader=None, source=None)
-    print(f'[INFER worker {gpu}] ready: batch={batch}, CPU budget={cpu_budget(size)}', flush=True)
+    batch_info = ('automatic (probed before first prediction)'
+                  if cfgvalue(cfg, 'INFER.AUTO_BATCH_SIZE', False) else str(batch))
+    print(f'[INFER worker {gpu}] ready: batch={batch_info}, CPU budget={cpu_budget(size)}', flush=True)
 
 
 def _predict(task):

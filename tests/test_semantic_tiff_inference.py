@@ -98,7 +98,11 @@ class SemanticTiffInferenceTests(unittest.TestCase):
                 np.testing.assert_array_equal(reader[1], np.zeros(shape, dtype='uint8'))
             prob = output.with_name(output.name[:-5] + '_prob.zarr')
             with self.ns['ZarrIOManager'](prob, mode='r') as reader:
-                np.testing.assert_allclose(reader[0] / 65535., torch.sigmoid(torch.tensor(2.)).item(), atol=2e-5)
+                self.assertEqual(reader.dtype, np.dtype('float32'))
+                for channel, logit in enumerate([2., -2.]):
+                    np.testing.assert_allclose(reader[channel], torch.sigmoid(torch.tensor(logit)).item(),
+                                               rtol=1e-6, atol=1e-7)
+                self.assertEqual(reader.root.attrs['sknext_prediction']['value_range'], [0., 1.])
             progress = json.loads(output.with_name(output.name + '.progress.json').read_text())
             self.assertTrue(progress['completed'])
         # A completed folder run must not predict any blocks again.
@@ -109,6 +113,21 @@ class SemanticTiffInferenceTests(unittest.TestCase):
         os.utime(changed, ns=(changed.stat().st_atime_ns, changed.stat().st_mtime_ns + 1_000_000))
         with self.assertRaisesRegex(RuntimeError, 'Cannot resume'):
             self.infer()
+
+    def test_reject_resume_of_legacy_integer_probability_run(self):
+        tifffile.imwrite(self.raw / 'a.tif', np.ones((2, 4, 4), dtype='uint16'),
+                         photometric='minisblack')
+        self.infer()
+        output = self.output / 'a_semantic_7.ome.zarr'
+        progress_path = output.with_name(output.name + '.progress.json')
+        progress = json.loads(progress_path.read_text())
+        # Legacy runs did not record a probability dtype and wrote scaled uint16.
+        progress['meta'].pop('probability_dtype')
+        progress_path.write_text(json.dumps(progress))
+        self.ns['_predict_block'] = Mock(side_effect=AssertionError('Legacy run was resumed'))
+        with self.assertRaisesRegex(RuntimeError, 'Cannot resume'):
+            self.infer()
+        self.ns['_predict_block'].assert_not_called()
 
     def test_parallel_block_results_match_serial_at_volume_edges(self):
         from concurrent.futures import ThreadPoolExecutor

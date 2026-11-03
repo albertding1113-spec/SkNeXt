@@ -111,12 +111,16 @@ class InferenceBatchResumeTests(unittest.TestCase):
                   ckptstat=SimpleNamespace(st_size=200, st_mtime_ns=2),
                   input_bounds=(0., 1.), physical_ch=[0], shape=(8, 16, 16),
                   padding=(1, 1, 1), central_block=(4, 8, 8), block_margin=(1, 1, 1),
-                  geometry={'block_size': (8, 16, 16)}, hashlib=hashlib, json=json)
+                  geometry={'block_size': (8, 16, 16), 'overlap': (0, 0, 0)}, hashlib=hashlib, json=json)
         exec(code, ns)
         original = ns['manifest']
         cfg.TRAIN.BATCH_SIZE = 8
         exec(code, ns)
         self.assertEqual(ns['manifest'], original)
+        ns['geometry']['overlap'] = (1, 2, 2)
+        exec(code, ns)
+        self.assertNotEqual(ns['manifest'], original)
+        ns['geometry']['overlap'] = (0, 0, 0)
         ns['padding'] = (0, 0, 0)
         exec(code, ns)
         self.assertNotEqual(ns['manifest'], original)
