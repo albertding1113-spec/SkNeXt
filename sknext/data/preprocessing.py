@@ -2,6 +2,27 @@ from typing import Literal
 import numpy as np
 
 
+def fill_inference_zeros(img: np.ndarray) -> np.ndarray:
+    """Fill uint8/uint16 CZYX input zeros with each channel's nonzero P1.
+
+    Statistics use the current inference patch/block before normalization.
+    Empty channels stay zero. Float inputs and other integer types are unchanged.
+    Return float32 for filled inputs to retain fractional percentile values;
+    never modify the source array.
+    """
+    if img.dtype.kind != "u" or img.dtype.itemsize not in (1, 2):
+        return img
+    result = None
+    for channel_index, channel in enumerate(img):
+        zeros = channel == 0
+        if not zeros.any() or zeros.all():
+            continue
+        if result is None:
+            result = img.astype(np.float32)
+        result[channel_index][zeros] = np.percentile(channel[~zeros], 1)
+    return img if result is None else result
+
+
 def preprocess_img(img: np.ndarray,
                    preprocess_dict:dict) -> np.ndarray:
     """Apply configured clipping and normalization independently to each channel.

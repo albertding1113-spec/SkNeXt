@@ -20,6 +20,7 @@ def cutout(
     mask: Optional[NDArray] = None,  # ZYXC / YXC，也兼容 ZYX / YX
     values: tuple[float, float] = (0, 0.05),
     size: tuple[float, float] = (0.05, 0.30),
+    geometry: str = "interior",
 ) -> Union[
     NDArray,
     Tuple[NDArray, Optional[NDArray]],
@@ -49,6 +50,13 @@ def cutout(
     size : tuple of float, default=(0.05, 0.30)
         Minimum and maximum side-length ratio of the cutout region.
         One random ratio is sampled independently for every spatial axis.
+        For slabs, only the depth is constrained; other axes span the patch.
+
+    geometry : str, default="interior"
+        "interior": legacy randomly positioned contained cuboid.
+        "edge": cuboid anchored to one uniformly sampled patch face.
+        "slab": full-face slab entering from one uniformly sampled face.
+        "mixed": sample the three geometries with equal probability.
 
     Returns
     -------
@@ -87,6 +95,10 @@ def cutout(
         raise ValueError(f"`size` must satisfy 0 < min <= max <= 1, got {size}.")
     spatial_shape = img.shape[:-1]
     spatial_ndim = len(spatial_shape)
+    if geometry not in ("interior", "edge", "slab", "mixed"):
+        raise ValueError("`geometry` must be interior, edge, slab, or mixed")
+    if geometry == "mixed":
+        geometry = str(np.random.choice(("interior", "edge", "slab")))
     # Randomly determine the cutout size along every spatial axis.
     cutout_shape = []
     for axis_size in spatial_shape:
@@ -96,6 +108,15 @@ def cutout(
         cutout_shape.append(region_size)
     # Randomly determine the starting coordinate.
     starts = [int(np.random.randint(0, axis_size - region_size + 1)) for axis_size, region_size in zip(spatial_shape, cutout_shape,)]
+    if geometry in ("edge", "slab"):
+        face = int(np.random.choice(2 * spatial_ndim))
+        axis, high_end = divmod(face, 2)
+        starts[axis] = spatial_shape[axis] - cutout_shape[axis] if high_end else 0
+        if geometry == "slab":
+            for other_axis in range(spatial_ndim):
+                if other_axis != axis:
+                    starts[other_axis] = 0
+                    cutout_shape[other_axis] = spatial_shape[other_axis]
     spatial_slices = tuple(slice(start, start + region_size) for start, region_size in zip(starts, cutout_shape))
     img_out = img.copy()
     # Calculate the low-percentile interval independently for each channel.
@@ -1258,6 +1279,17 @@ class PairedAugmentor:
         self.cfg = cfg.get("AUGMENTOR", cfg) if isinstance(cfg, dict) else getattr(cfg, "AUGMENTOR", cfg)
         self.enable = bool(self._get("ENABLE", True))
         self.prob = float(self._get("DA_PROB", 0.5))
+        self.cut_out_size = float(self._get("CUT_OUT_SIZE", 0.30))
+        self.cut_out_geometry = self._get("CUT_OUT_GEOMETRY", "interior")
+        if self.cut_out_geometry not in ("interior", "edge", "slab", "mixed"):
+            raise ValueError("AUGMENTOR.CUT_OUT_GEOMETRY must be interior, edge, slab, or mixed")
+        if not np.isfinite(self.cut_out_size) or not 0 < self.cut_out_size <= 1:
+            raise ValueError("AUGMENTOR.CUT_OUT_SIZE must satisfy 0 < size <= 1")
+        self.cut_out_intensity_range = tuple(self._get("CUT_OUT_INTENSITY_RANGE", (0.0, 0.05)))
+        if (len(self.cut_out_intensity_range) != 2
+                or not np.isfinite(self.cut_out_intensity_range).all()
+                or not 0 <= self.cut_out_intensity_range[0] <= self.cut_out_intensity_range[1] <= 1):
+            raise ValueError("AUGMENTOR.CUT_OUT_INTENSITY_RANGE must satisfy 0 <= low <= high <= 1")
         if not 0 <= self.prob <= 1:
             raise ValueError("AUGMENTOR.DA_PROB must be in [0,1]")
         if legacy_noise_std < 0 or legacy_blur_sigma < 0:
@@ -1366,10 +1398,13 @@ class PairedAugmentor:
 
         # Raw-only photometric augmentations. SR targets must retain calibrated GT.
         if self._enabled("CUT_OUT", self.prob / 5):
+            cut_out_size = (min(0.05, self.cut_out_size), self.cut_out_size)
             if self.task == "segmentation":
-                raw, target = cutout(raw, target)
+                raw, target = cutout(raw, target, values=self.cut_out_intensity_range,
+                                     size=cut_out_size, geometry=self.cut_out_geometry)
             else:
-                raw = cutout(raw)  # missing raw signal is NOT missing GT anatomy
+                raw = cutout(raw, values=self.cut_out_intensity_range,
+                             size=cut_out_size, geometry=self.cut_out_geometry)  # missing raw signal is NOT missing GT anatomy
         blur_configured = bool(self._get("G_BLUR", False))
         blur = self._enabled("G_BLUR")
         if (not blur_configured and self.task == "sr"

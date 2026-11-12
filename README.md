@@ -779,6 +779,14 @@ predicts overlapping patches in the remaining blocks, and blends probabilities.
 Watershed combines predicted seeds with skeleton IDs. The writer saves the
 central region of each block and builds a multiresolution pyramid on completion.
 
+All volume inference workflows (instance segmentation, semantic-only, and SR)
+build five lower-resolution OME-Zarr levels after inference succeeds, using
+cumulative ZYX factors `(1,2,2)`, `(2,4,4)`, `(4,8,8)`, `(8,16,16)`, and
+`(16,32,32)`. Labels use nearest-neighbor downsampling; probability maps and
+restored images use mean downsampling. Resuming semantic-only or SR inference
+also rebuilds the pyramid when all blocks are already complete. The separate
+skeleton object-export workflow writes TIFF/JSON/SWC files rather than a volume.
+
 `DATA.INFER.GT_PATH` is the **output** destination despite its historical name.
 A directory destination receives `result<run_id>.ome.zarr`; a `.zarr` path is
 used directly. With the example channels, output channel 0 contains neuronal
@@ -815,6 +823,45 @@ channel per model output, and skips watershed when used alone. Set
 enabled, `INFER.RAW_ALL_BLOCKS: true` allows probability prediction outside
 SWC-selected blocks. Semantic-only and SR runners use their separate output
 settings described above.
+
+## Missing-signal augmentation and inference
+
+All training workflows support size and intensity settings for cut-out augmentation:
+
+```yaml
+AUGMENTOR:
+  CUT_OUT: True
+  CUT_OUT_GEOMETRY: "mixed"
+  CUT_OUT_SIZE: 0.30
+  CUT_OUT_INTENSITY_RANGE: [0.0, 0.01]
+```
+
+`CUT_OUT_GEOMETRY` accepts `interior` (default: legacy randomly positioned
+contained cuboid), `edge` (cuboid anchored to a random patch face), `slab`
+(full-face slab), or `mixed` (equal probability of all three each time cut-out
+is applied). The selected face is sampled uniformly across all spatial axes
+and both ends. The existing cut-out application probability is unchanged.
+
+`CUT_OUT_SIZE` sets the maximum side-length fraction independently for each
+spatial axis (default `0.30`). Side lengths are sampled from 5% up to this maximum;
+if the maximum is below 5%, that fraction is used for every axis. Sizes are rounded
+to voxels, with at least one voxel per axis.
+For `slab`, this limit applies only to depth; the other axes span the full patch.
+Segmentation labels are zeroed in the selected region, while SR targets remain
+unchanged, matching the existing cut-out target policy.
+
+`CUT_OUT_INTENSITY_RANGE` gives replacement intensity quantiles as fractions: this example
+samples between the minimum and 1st percentile in each channel. The default is
+`[0.0, 0.05]` (minimum to 5th percentile). Lower it to simulate darker missing
+signal. It does not change the spatial size of the cut-out region.
+
+During inference, all workflows automatically replace zeros in uint8/uint16
+inputs with the 1st percentile of non-zero values in the same channel, before
+clipping, normalization, and padding. Segmentation and semantic workflows
+estimate this per patch; restoration estimates it per loaded block. Fractional
+percentile values are retained in float32. Entirely empty channels stay zero,
+float inputs are unchanged, and source files are never modified. Resume metadata
+records this policy to prevent mixing predictions from different preprocessing.
 
 ## Training progress, memory, and logs
 
@@ -1050,6 +1097,25 @@ Exports include `data.tif`, `data.json`, and `data.swc` grouped by input channel
 and skeleton index. `subregion` can restrict association to SWC compartment
 labels such as soma (1), axon (2), basal dendrite (3), or apical dendrite (4).
 This workflow is separate from the GUI's training/inference selector.
+
+Input volumes use CZYX axes, and SWC coordinates must already be in the same
+voxel coordinate system. Values >= 1 are treated as binary foreground: touching
+instance IDs are merged, and probability maps should be thresholded before use.
+Components are assigned to the skeleton with the most overlapping mask voxels
+(ties choose the lowest index), then filtered by the compartment of its node
+nearest the component centroid.
+
+The centroid assigns each object to one central block. Choose `block_halo`
+large enough to contain the entire object in that block: objects touching any
+padded-block face, including a dataset edge, are excluded as potentially
+truncated. This is a local-block extraction, not global component stitching.
+Output folders include the first occupied voxel to distinguish objects with
+identical bounding-box minima. JSON records half-open global ZYX bounds,
+centroid, voxel count, channel and source SWC filename/ID. TIFFs are binary ZYX
+masks with lossless Deflate compression; SWCs use global coordinates and end
+at the first soma ancestor or the component root. Processing failures propagate
+to the caller and the volume reader is closed. Use a fresh output directory
+when changing settings or rerunning exports produced by older versions.
 
 ## Current implementation notes
 

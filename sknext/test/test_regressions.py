@@ -206,7 +206,7 @@ def test_uint16_inference_preserves_float_normalization():
             return torch.zeros((len(t),1,*t.shape[-3:]),dtype=t.dtype)
     model=Capture()
     a=SimpleNamespace(patch_size=(2,2,2,1),device=torch.device('cpu'),batch_size=1,
-                      model=model, preprocess_dict={'normalization':True,
+                      model=model, cfg={}, preprocess_dict={'normalization':True,
                                                      'norm_type':'zero_mean_unit_variance'})
     image=np.arange(8,dtype=np.uint16).reshape((1,2,2,2))*100
     coords=[np.array([[0,2],[0,2],[0,2]])]

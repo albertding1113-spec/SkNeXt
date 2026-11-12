@@ -3,10 +3,10 @@ SYSTEM:
 
 PATHS:
     RESULT_DIR:
-        PATH: ''
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
 
 TASK:
-    CHANNELS: ["S.globular"]
+    CHANNELS: ["S.reticular"]
     CHANNEL_WEIGHTS: [1]
 
 DATA:
@@ -14,14 +14,14 @@ DATA:
     NORMALIZATION:
         TYPE: "zero_mean_unit_variance"
     TRAIN:
-        PATH: '/raw'
-        GT_PATH: '/label'
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_train/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_train/label'
     VAL:
-        PATH: '/raw'
-        GT_PATH: '/label'
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/label'
     INFER:
         PATH: ''
-        GT_PATH: '/.ome.zarr'
+        GT_PATH: ''
         CHANNEL: [0]
 
 AUGMENTOR:
@@ -41,16 +41,17 @@ AUGMENTOR:
 
 MODEL:
     ARCHITECTURE: "unext_v2"
-    LOAD_CHECKPOINT: True
+    LOAD_CHECKPOINT: False
     FEATURE_MAPS: [32, 64, 128, 256, 320]
 
 TRAIN:
-    ENABLE: False
+    ENABLE: True
     RESUME: False
+    AUTO_BATCH_SIZE: True
+    AMP: False
     OPTIMIZER: "ADAMW"
     LR: 1.E-4
-    BATCH_SIZE: 16
-    EPOCHS: 400
+    EPOCHS: 200
     PATIENCE: 100
     LR_SCHEDULER:
         NAME: "warmupcosine"
@@ -58,7 +59,7 @@ TRAIN:
         WARMUP_COSINE_DECAY_EPOCHS: 5
 
 INFER:
-    ENABLE: True
+    ENABLE: False
     THRESHOLD: 0.5
     SAVE_PROBABILITIES: True
 

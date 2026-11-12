@@ -3,25 +3,25 @@ SYSTEM:
 
 PATHS:
     RESULT_DIR:
-        PATH: ''
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
 
 TASK:
     CHANNELS: ["S.reticular"]
     CHANNEL_WEIGHTS: [1]
 
 DATA:
-    PATCH_SIZE: [32, 256, 256, 1]
+    PATCH_SIZE: [32, 128, 128, 1]
     NORMALIZATION:
         TYPE: "zero_mean_unit_variance"
     TRAIN:
-        PATH: '/raw'
-        GT_PATH: '/label'
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_train/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_train/label'
     VAL:
-        PATH: '/raw'
-        GT_PATH: '/label'
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/label'
     INFER:
         PATH: ''
-        GT_PATH: '/.ome.zarr'
+        GT_PATH: ''
         CHANNEL: [0]
 
 AUGMENTOR:
@@ -29,7 +29,7 @@ AUGMENTOR:
     CUT_OUT: True
     RANDOM_ROT: True
     ZOOM: True
-    ZOOM_RANGE: [0.8, 1.2]
+    ZOOM_RANGE: [0.9, 1.1]
     VFLIP: True
     HFLIP: True
     ZFLIP: True
@@ -41,15 +41,20 @@ AUGMENTOR:
 
 MODEL:
     ARCHITECTURE: "unext_v2"
-    LOAD_CHECKPOINT: True
+    LOAD_CHECKPOINT: False
     FEATURE_MAPS: [32, 64, 128, 256, 320]
+    CONVNEXT_STEM_K_SIZE: 1
+    Z_DOWN: [1, 1, 2, 2]
+    YX_DOWN: [2, 2, 2, 2]
+    ISOTROPY: [False, False, True, True, True]
+    CONVNEXT_LAYERS: [2, 2, 2, 2, 2]
 
 TRAIN:
-    ENABLE: False
+    ENABLE: True
     RESUME: False
     OPTIMIZER: "ADAMW"
     LR: 1.E-4
-    BATCH_SIZE: 16
+    BATCH_SIZE: 4
     EPOCHS: 400
     PATIENCE: 100
     LR_SCHEDULER:
@@ -58,7 +63,7 @@ TRAIN:
         WARMUP_COSINE_DECAY_EPOCHS: 5
 
 INFER:
-    ENABLE: True
-    THRESHOLD: 0.5
+    ENABLE: False
+    THRESHOLD: 0.3
     SAVE_PROBABILITIES: True
 

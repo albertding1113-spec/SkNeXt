@@ -1,0 +1,89 @@
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
+
+TASK:
+    CHANNELS: ["F", "P", "S.soma", "S.spine", "S.bouton"]
+    CHANNELS_EXTRA_OPTS: [{"P":{"type": "skeleton", "dilation": 2, "skeleton_mode": "main"}}]
+    CHANNEL_WEIGHTS: [1, 2, 2, 2, 2]
+    WATERSHED:
+        SEED_CHANNELS: ["P"]
+        SEED_CHANNELS_THRESH: [0.3]
+        TOPOGRAPHIC_SURFACE_CHANNEL: "F"
+        GROWTH_MASK_CHANNELS: ["F"]
+        GROWTH_MASK_CHANNELS_THRESH: [0.5]
+
+DATA:
+    PATCH_SIZE: [32, 128, 128, 1]
+    NORMALIZATION:
+        TYPE: "zero_mean_unit_variance"
+    TRAIN:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/instance_train/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/instance_train/label'
+        FILTER:
+            ENABLE: TRUE
+            PROPS: ['label_mean']
+            VALUES: [1e-6]
+            SIGNS: ['gt']
+
+    VAL:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/instance_val/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/instance_val/label'
+    INFER:
+        PATH: ''
+        GT_PATH: ''
+        CHANNEL: [0]
+        SKELETON_PATH: ''
+
+AUGMENTOR:
+    ENABLE: True
+    CUT_OUT: True
+    RANDOM_ROT: True
+    ZOOM: True
+    ZOOM_RANGE: [0.8, 1.2]
+    VFLIP: True
+    HFLIP: True
+    ZFLIP: True
+    BRIGHTNESS: True
+    BRIGHTNESS_FACTOR: [-0.1, 0.1]
+    CONTRAST: True
+    CONTRAST_FACTOR: [-0.1, 0.1]
+    AFFINE_MODE: "reflect"
+
+MODEL:
+    ARCHITECTURE: "unext_v2"
+    LOAD_CHECKPOINT: False
+    FEATURE_MAPS: [32, 64, 128, 256, 320]
+    CONVNEXT_STEM_K_SIZE: 1
+    Z_DOWN: [1, 1, 2, 2]
+    YX_DOWN: [2, 2, 2, 2]
+    ISOTROPY: [False, False, True, True, True]
+    CONVNEXT_LAYERS: [2, 2, 2, 2, 2]
+
+TRAIN:
+    ENABLE: True
+    RESUME: False
+    OPTIMIZER: "ADAMW"
+    LR: 1.E-4
+    BATCH_SIZE: 2
+    EPOCHS: 400
+    PATIENCE: 100
+    LR_SCHEDULER:
+        NAME: "warmupcosine"
+        MIN_LR: 1.E-6
+        WARMUP_COSINE_DECAY_EPOCHS: 5
+
+INFER:
+    ENABLE: False
+    OUTPUT_MODE: "uint16" # "uint16", "float32", "both"
+    SKELETON:
+        ENABLE: True
+    POST_PROCESSING:
+        ENABLE: True
+        OPERATIONS: ["fill_holes"]
+        VALUES: [None]
+
+

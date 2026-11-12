@@ -1,0 +1,34 @@
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
+
+TASK:
+    CHANNELS: ["S.reticular"]
+    CHANNEL_WEIGHTS: [1]
+
+DATA:
+    PATCH_SIZE: [32, 256, 256, 1]
+    NORMALIZATION:
+        TYPE: "zero_mean_unit_variance"
+    INFER:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260928_ER-mBaoJin_mito-mScarlet3H/261029_X18000-51000_Y9000-41000_Z1500-5000/261029_X18000-51000_Y9000-41000_Z1500-5000.ims'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260928_ER-mBaoJin_mito-mScarlet3H/261029_X18000-51000_Y9000-41000_Z1500-5000/261029_X18000-51000_Y9000-41000_Z1500-5000_ER_test2.ome.zarr'
+        CHANNEL: [0]
+
+MODEL:
+    ARCHITECTURE: "unext_v2"
+    LOAD_CHECKPOINT: True
+    FEATURE_MAPS: [32, 64, 128, 256, 320]
+
+TRAIN:
+    ENABLE: False
+    RESUME: False
+
+INFER:
+    ENABLE: True
+    AUTO_BATCH_SIZE: True
+    THRESHOLD: 0.4
+    SAVE_PROBABILITIES: False

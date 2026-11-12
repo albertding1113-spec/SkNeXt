@@ -96,6 +96,10 @@ class SemanticTiffInferenceTests(unittest.TestCase):
                 self.assertEqual(reader.shape, (2, *shape))
                 np.testing.assert_array_equal(reader[0], np.ones(shape, dtype='uint8'))
                 np.testing.assert_array_equal(reader[1], np.zeros(shape, dtype='uint8'))
+                self.assertEqual(len(reader.level_paths), 6)
+                for level in range(1, 6):
+                    np.testing.assert_array_equal(reader.get_array(level)[0], 1)
+                    np.testing.assert_array_equal(reader.get_array(level)[1], 0)
             prob = output.with_name(output.name[:-5] + '_prob.zarr')
             with self.ns['ZarrIOManager'](prob, mode='r') as reader:
                 self.assertEqual(reader.dtype, np.dtype('float32'))
@@ -103,6 +107,12 @@ class SemanticTiffInferenceTests(unittest.TestCase):
                     np.testing.assert_allclose(reader[channel], torch.sigmoid(torch.tensor(logit)).item(),
                                                rtol=1e-6, atol=1e-7)
                 self.assertEqual(reader.root.attrs['sknext_prediction']['value_range'], [0., 1.])
+                self.assertEqual(len(reader.level_paths), 6)
+                for level in range(1, 6):
+                    for channel, logit in enumerate([2., -2.]):
+                        np.testing.assert_allclose(
+                            reader.get_array(level)[channel],
+                            torch.sigmoid(torch.tensor(logit)).item(), rtol=1e-6, atol=1e-7)
             progress = json.loads(output.with_name(output.name + '.progress.json').read_text())
             self.assertTrue(progress['completed'])
         # A completed folder run must not predict any blocks again.

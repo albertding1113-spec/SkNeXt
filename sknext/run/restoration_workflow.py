@@ -749,6 +749,7 @@ class RestorationWorkflow:
 
     @torch.no_grad()
     def _predict_sr_block(self, model, reader, core_lo, core_hi, input_bounds, geometry):
+        from sknext.data.preprocessing import fill_inference_zeros
         core_lo, core_hi = np.asarray(core_lo), np.asarray(core_hi)
         core_size = core_hi - core_lo
         shape = tuple(map(int, reader.shape[-3:]))
@@ -766,6 +767,7 @@ class RestorationWorkflow:
                                    int(read_lo[1]):int(read_hi[1]),
                                    int(read_lo[2]):int(read_hi[2])])
             for ch in physical_ch], axis=0)
+        block = fill_inference_zeros(block)
         block = (np.zeros_like(block, dtype=np.float32) if input_bounds[0] == input_bounds[1]
                  else normalize_intensity(block, input_bounds, "inference raw"))
         hr_size = tuple(int(n * f) for n, f in zip(core_size, factor))
@@ -777,17 +779,23 @@ class RestorationWorkflow:
         batch_size = resolve_inference_batch(model, self.cfg, self.device, 'restoration')
         pending = []
 
-        def flush_patches():
-            if not pending:
-                return
-            inputs = torch.from_numpy(np.stack([p[0] for p in pending])).to(self.device)
+        def predict(patches):
+            inputs = torch.from_numpy(np.stack([p[0] for p in patches])).to(self.device)
             predictions = model(inputs)
             if isinstance(predictions, dict):
                 predictions = predictions["pred"]
-            expected = (len(pending), self.ch, *tuple(p * f for p, f in zip(self.patch, factor)))
+            expected = (len(patches), self.ch, *tuple(p * f for p, f in zip(self.patch, factor)))
             if tuple(predictions.shape) != expected:
                 raise RuntimeError(f"SR model output shape mismatch: {tuple(predictions.shape)}")
-            predictions = predictions.float().cpu().numpy()
+            return predictions.float().cpu().numpy()
+
+        def flush_patches():
+            nonlocal batch_size
+            if not pending:
+                return
+            from sknext.utils.parallel import predict_inference_batches
+            predictions = predict_inference_batches(model, self.cfg, self.device, pending, predict)
+            batch_size = resolve_inference_batch(model, self.cfg, self.device, 'restoration')
             for prediction, (_, local, valid) in zip(predictions, pending):
                 hhr = tuple(int(p * f) for p, f in zip(padding, factor))
                 nhr = tuple(int(v * f) for v, f in zip(valid, factor))
@@ -873,6 +881,7 @@ class RestorationWorkflow:
                 "version": 4, "source": str(source.resolve()),
                 "normalization_policy": "per_image_minmax_v1",
                 "input_image_range": list(input_bounds),
+                "zero_fill_policy": "uint8_uint16_nonzero_p1_per_block_v1",
                 "source_stat": [stat.st_size, stat.st_mtime_ns],
                 "checkpoint": str(ckpt.resolve()),
                 "checkpoint_stat": [ckptstat.st_size, ckptstat.st_mtime_ns],
@@ -919,8 +928,8 @@ class RestorationWorkflow:
                         v = (1., 1., 1.)
                 vout = tuple(float(a) / b for a, b in zip(v, factor))
                 out = ZarrIOManager(out_path, shape=(self.ch, *out_shape), dtype="float32",
-                                    chunks=(1, min(16, out_shape[0]),
-                                            min(256, out_shape[1]), min(256, out_shape[2])),
+                                    chunks=(1, 2 * self.patch[0],
+                                            4 * self.patch[1], 4 * self.patch[2]),
                                     mode="a", voxel_size=vout, image_name="SkNeXt SR restored",
                                     channel_names=[f"SR_{i}" for i in range(self.ch)])
                 out.root.attrs["sknext_normalization"] = {
@@ -928,7 +937,6 @@ class RestorationWorkflow:
                 self._write_infer_progress(log_path, manifest, 0, total)
             if done == total:
                 log_message(f"[SR] already completed: {out_path}", flush=True)
-                return
 
             def jobs():
                 block_index = 0
@@ -958,6 +966,10 @@ class RestorationWorkflow:
                 if pool is None and block_index % 20 == 0:
                     print_cuda_memory(self.device, prefix=f"[SR INFER] block {block_index}/{total}",
                                       all_devices=True)
+            log_message('[SR] building restored image pyramid', flush=True)
+            out.build_pyramid(
+                factors=[(1, 2, 2), (2, 4, 4), (4, 8, 8), (8, 16, 16), (16, 32, 32)],
+                mode='mean')
             log_message(f"[SR] restored volume: {out_path} CZYX={(self.ch, *out_shape)}", flush=True)
         finally:
             if out is not None:

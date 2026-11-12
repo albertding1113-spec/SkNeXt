@@ -20,8 +20,8 @@ DATA:
         PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/globular_val/raw'
         GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/globular_val/label'
     INFER:
-        PATH: ''
-        GT_PATH: ''
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260601_TEEX_whole_brain/260822_x10000-38000y65000-120000z7000-16000/channel1/260822_x10000-38000y65000-120000z7000-16000_channel1.ims'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260601_TEEX_whole_brain/260822_x10000-38000y65000-120000z7000-16000/channel1/260822_x10000-38000y65000-120000z7000-16000_channel1.ome.zarr'
         CHANNEL: [0]
 
 AUGMENTOR:
@@ -47,11 +47,12 @@ MODEL:
 TRAIN:
     ENABLE: True
     RESUME: False
+    AUTO_BATCH_SIZE: True
+    AMP: False
     OPTIMIZER: "ADAMW"
     LR: 1.E-4
-    BATCH_SIZE: 16
-    EPOCHS: 400
-    PATIENCE: 100
+    EPOCHS: 150
+    PATIENCE: 50
     LR_SCHEDULER:
         NAME: "warmupcosine"
         MIN_LR: 1.E-6
@@ -60,5 +61,4 @@ TRAIN:
 INFER:
     ENABLE: False
     THRESHOLD: 0.5
-    SAVE_PROBABILITIES: True
 

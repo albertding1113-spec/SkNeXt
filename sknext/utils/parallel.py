@@ -57,6 +57,56 @@ def configured_inference_batch(cfg):
     return value if value > 0 else int(cfgvalue(cfg, 'TRAIN.BATCH_SIZE', 1))
 
 
+def reduce_inference_batch(model, failed_batch, device):
+    """Release failed CUDA allocations and cache a 20% smaller retry batch.
+
+    Call after leaving the exception handler so its traceback is released.
+    """
+    import gc
+    import torch
+    from sknext.utils.progress import log_message
+    batch = max(1, int(failed_batch * 0.8))
+    gc.collect()
+    torch.cuda.empty_cache()
+    cached = getattr(model, '_sknext_inference_batch', None)
+    if cached is not None:
+        model._sknext_inference_batch = (cached[0], batch)
+    log_message(f'[AUTO INFER BATCH] {device}: CUDA OOM; retrying with batch={batch}',
+                flush=True)
+    return batch
+
+
+def predict_inference_batches(model, cfg, device, inputs, predict):
+    """Retry pure predictions on OOM, returning CPU arrays in input order.
+
+    The callback owns GPU tensors and must return a NumPy array before any
+    blending or output writes. Failed attempts therefore have no side effects.
+    """
+    import numpy as np
+    import torch
+    from sknext.utils.execution import cfgvalue
+    automatic = bool(cfgvalue(cfg, 'INFER.AUTO_BATCH_SIZE', False))
+    cached = getattr(model, '_sknext_inference_batch', None)
+    batch = min(len(inputs), cached[1]) if automatic and cached else len(inputs)
+    outputs = []
+    start = 0
+    while start < len(inputs):
+        end = min(start + batch, len(inputs))
+        retry = False
+        try:
+            result = predict(inputs[start:end])
+        except torch.cuda.OutOfMemoryError:
+            if not automatic or end - start <= 1:
+                raise
+            retry = True
+        if retry:
+            batch = reduce_inference_batch(model, end - start, device)
+            continue
+        outputs.append(result)
+        start = end
+    return outputs[0] if len(outputs) == 1 else np.concatenate(outputs, axis=0)
+
+
 def resolve_inference_batch(model, cfg, device, workflow, *, amp=False):
     """Reuse a per-model probe result, or preserve manual inference batching."""
     from sknext.utils.execution import cfgvalue

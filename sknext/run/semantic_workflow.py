@@ -499,6 +499,7 @@ def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
     coords = list(patch_coordinates_iter(sz, patch_size, overlap, (0,0,0)))
     from sknext.utils.parallel import resolve_inference_batch
     batch_size = resolve_inference_batch(model, cfg, device, 'semantic', amp=amp)
+    from sknext.data.preprocessing import fill_inference_zeros
     norm = normalize_options(cfg)
     skip_empty = bool(cfgget(cfg, 'INFER.SKIP_ZERO_PATCHES', True))
     batch_start = 0
@@ -511,6 +512,7 @@ def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
             raw_patch = raw[:,z0:z1,y0:y1,x0:x1]
             if skip_empty and not np.any(raw_patch):
                 continue
+            raw_patch = fill_inference_zeros(raw_patch)
             raw_patch = reflect_padding_img(raw_patch, patch_size)
             raw_patch = preprocess_img(raw_patch, norm).astype(np.float32, copy=False)
             tensor_patches.append(raw_patch)
@@ -522,18 +524,11 @@ def _predict_block(model, raw: np.ndarray, cfg: dict, device: torch.device,
             except torch.cuda.OutOfMemoryError:
                 if not cfgget(cfg, 'INFER.AUTO_BATCH_SIZE', False) or len(nonempty_indices) <= 1:
                     raise
-                batch_size = max(1, len(nonempty_indices) // 2)
                 retry = True
             if retry:
                 # The exception traceback must be gone before clearing cached allocations.
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-                cached = getattr(model, '_sknext_inference_batch', None)
-                if cached is not None:
-                    model._sknext_inference_batch = (cached[0], batch_size)
-                log_message(f'[AUTO INFER BATCH] {device}: CUDA OOM; retrying with batch={batch_size}',
-                            flush=True)
+                from sknext.utils.parallel import reduce_inference_batch
+                batch_size = reduce_inference_batch(model, len(nonempty_indices), device)
                 continue
         else:
             probabilities = np.zeros((0,len(names),*patch_size),dtype=np.float32)
@@ -629,6 +624,7 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
                     'patch_size':list(spatial_patch(cfg)), 'core_size':list(core_size),
                     'halo':list(halo), 'input_channels':channels,
                     'normalization': normalize_options(cfg),
+                    'zero_fill_policy': 'uint8_uint16_nonzero_p1_per_patch_v1',
                     'overlap_voxels': list(overlap_voxels(cfg, 'INFER')),
                     'skip_zero_patches': bool(cfgget(cfg, 'INFER.SKIP_ZERO_PATCHES', True)),
                     'amp': amp,
@@ -677,7 +673,8 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
             from sknext.data.datasetIO import remove_zarr_if_exists
             remove_zarr_if_exists(prob_path)
         # output store remains CZYX, but contains NO instance ID channel.
-        chunks = (1,min(16,zyx[0]),min(256,zyx[1]),min(256,zyx[2]))
+        patch = spatial_patch(cfg)
+        chunks = (1, 2 * patch[0], 4 * patch[1], 4 * patch[2])
         with ZarrIOManager(output, shape=(len(names),*zyx), dtype='uint8', chunks=chunks,
                            mode='a', channel_names=[ch[2:] for ch in names]) as dst:
             dst.root.attrs['sknext_semantic_channels'] = names
@@ -734,6 +731,12 @@ def _infer_source(model, cfg: dict, run_id: int, device: torch.device,
                     if pool is None and (block_id+1) % 20 == 0:
                         print_cuda_memory(device, prefix=f"[SEMANTIC INFER] block {block_id+1}/{total}",
                                           all_devices=True)
+                factors = [(1, 2, 2), (2, 4, 4), (4, 8, 8), (8, 16, 16), (16, 32, 32)]
+                log_message('Building semantic label pyramid', flush=True)
+                dst.build_pyramid(factors=factors, mode='nearest')
+                if prob_writer is not None:
+                    log_message('Building float32 probability pyramid', flush=True)
+                    prob_writer.build_pyramid(factors=factors, mode='mean')
             finally:
                 if prob_writer is not None: prob_writer.close()
         log_message(f'Semantic-only results saved to: {output}',flush=True)

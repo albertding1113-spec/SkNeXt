@@ -2162,7 +2162,9 @@ class ZarrIOManager:
         modes = self._normalize_downsample_modes(mode, self.shape[0])
         self._remove_listed_lower_levels()
 
-        source = da.from_zarr(str(self.path), component=self.array_path)
+        # Reuse the local Zarr array so Windows drive paths are not interpreted
+        # as filesystem URL schemes by Dask/fsspec.
+        source = da.from_zarr(self.get_array(0))
         previous_factor = (1, 1, 1)
         datasets = [self._level0_dataset_metadata()]
         vz, vy, vx = self.voxel_size
@@ -2237,7 +2239,7 @@ class ZarrIOManager:
                     ],
                 }
             )
-            source = da.from_zarr(str(self.path), component=level_path)
+            source = da.from_zarr(target)
             previous_factor = factor
 
         multiscales = list(self.root.attrs.get("multiscales", []))

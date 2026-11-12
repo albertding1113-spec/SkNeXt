@@ -1,0 +1,48 @@
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
+
+TASK:
+    CHANNELS: ["S.reticular"]
+    CHANNEL_WEIGHTS: [1]
+
+DATA:
+    PATCH_SIZE: [32, 128, 128, 1]
+    NORMALIZATION:
+        TYPE: "zero_mean_unit_variance"
+    TRAIN:
+        PATH: ''
+        GT_PATH: ''
+    VAL:
+        PATH: ''
+        GT_PATH: ''
+    INFER:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/reticular_val/inferred'
+        CHANNEL: [0]
+        PADDING: [4, 8, 8]
+        BLOCK_FACTOR: [8, 8, 8]
+        BLOCK_CENTRAL_FACTOR: [7, 7, 7]
+
+MODEL:
+    ARCHITECTURE: "unext_v2"
+    LOAD_CHECKPOINT: True
+    FEATURE_MAPS: [32, 64, 128, 256, 320]
+    CONVNEXT_STEM_K_SIZE: 1
+    Z_DOWN: [1, 1, 2, 2]
+    YX_DOWN: [2, 2, 2, 2]
+    ISOTROPY: [False, False, True, True, True]
+    CONVNEXT_LAYERS: [2, 2, 2, 2, 2]
+
+TRAIN:
+    ENABLE: False
+
+INFER:
+    ENABLE: True
+    AUTO_BATCH_SIZE: True
+    THRESHOLD: 0.3
+    SAVE_PROBABILITIES: True
+

@@ -2,6 +2,7 @@
 from contextlib import ExitStack
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -9,10 +10,82 @@ import numpy as np
 import torch
 
 from sknext.utils.auto_batch import determine_inference_batch_size, _inference_trial
-from sknext.utils.parallel import resolve_inference_batch
+from sknext.utils.parallel import resolve_inference_batch, predict_inference_batches
 
 
 class InferenceAutoBatchTests(unittest.TestCase):
+    def test_segmentation_oom_retries_before_blending(self):
+        source = Path(__file__).resolve().parents[1] / 'sknext/run/networkflow.py'
+        tree = ast.parse(source.read_text(encoding='utf-8'))
+        owner = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                     and n.name == 'Segmentation_Workflow')
+        node = next(n for n in owner.body if isinstance(n, ast.FunctionDef)
+                    and n.name == '_infer_one_batch')
+        ns = dict(np=np, torch=torch, preprocess_img=lambda x, cfg: x)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), ns)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+                self._sknext_inference_batch = ('key', 10)
+
+            def forward(self, x):
+                self.calls.append(len(x))
+                if len(x) > 6:
+                    raise torch.cuda.OutOfMemoryError('simulated OOM')
+                return x
+
+        model = Model()
+        runner = SimpleNamespace(model=model, cfg={'INFER': {'AUTO_BATCH_SIZE': True}},
+                                 device=torch.device('cpu'), patch_size=(1, 1, 1, 1),
+                                 preprocess_dict={})
+        coords = [np.array([[0, 1], [0, 1], [i, i + 1]]) for i in range(10)]
+        raw = np.arange(10, dtype=np.float32).reshape(1, 1, 1, 10)
+        with torch.inference_mode(), patch('torch.cuda.empty_cache'):
+            result, weights = ns['_infer_one_batch'](
+                runner, np.zeros_like(raw), np.zeros(raw.shape[1:], dtype=np.float32),
+                raw, coords, [np.zeros((3, 2), dtype=int)] * 10)
+        np.testing.assert_allclose(result, torch.sigmoid(torch.from_numpy(raw)).numpy())
+        np.testing.assert_array_equal(weights, np.ones(raw.shape[1:]))
+        self.assertEqual(model.calls, [10, 8, 6, 4])
+        self.assertEqual(model._sknext_inference_batch, ('key', 6))
+
+    def test_shared_runtime_retry_preserves_order_and_caches_reduced_batch(self):
+        model = torch.nn.Identity()
+        model._sknext_inference_batch = ('key', 10)
+        inputs = np.arange(23).reshape(-1, 1)
+        calls = []
+
+        def predict(values):
+            calls.append(len(values))
+            if len(values) > 6:
+                raise torch.cuda.OutOfMemoryError('simulated OOM')
+            return values * 2
+
+        cfg = {'INFER': {'AUTO_BATCH_SIZE': True}}
+        with patch('torch.cuda.empty_cache'):
+            result = predict_inference_batches(model, cfg, 'cpu', inputs, predict)
+            np.testing.assert_array_equal(result, inputs * 2)
+            self.assertEqual(calls, [10, 8, 6, 6, 6, 5])
+            self.assertEqual(model._sknext_inference_batch, ('key', 6))
+            calls.clear()
+            predict_inference_batches(model, cfg, 'cpu', inputs, predict)
+            self.assertEqual(calls, [6, 6, 6, 5])
+
+    def test_shared_retry_propagates_manual_single_patch_and_other_errors(self):
+        model = torch.nn.Identity()
+        for cfg, size, error in (
+            ({}, 10, torch.cuda.OutOfMemoryError),
+            ({'INFER': {'AUTO_BATCH_SIZE': True}}, 1, torch.cuda.OutOfMemoryError),
+            ({'INFER': {'AUTO_BATCH_SIZE': True}}, 10, RuntimeError),
+        ):
+            with self.subTest(size=size, cfg=cfg, error=error):
+                with self.assertRaises(error), patch('torch.cuda.empty_cache') as clear:
+                    predict_inference_batches(model, cfg, 'cpu', np.zeros((size, 1)),
+                                              lambda values: (_ for _ in ()).throw(error('test')))
+                clear.assert_not_called()
+
     def test_semantic_runtime_oom_retries_without_losing_or_double_blending_patches(self):
         source = Path(__file__).resolve().parents[1] / 'sknext/run/semantic_workflow.py'
         tree = ast.parse(source.read_text(encoding='utf-8'))
@@ -51,10 +124,11 @@ class InferenceAutoBatchTests(unittest.TestCase):
             result = ns['_predict_block'](model, raw, cfg, torch.device('cpu'), ['a'], False)
             np.testing.assert_allclose(result, torch.sigmoid(torch.from_numpy(raw)).numpy()
                                        * (raw != 0), rtol=1e-6)
-            self.assertEqual(model._sknext_inference_batch, ('key', 1))
+            self.assertEqual(model.calls, [3, 1, 2, 2, 1])
+            self.assertEqual(model._sknext_inference_batch, ('key', 2))
             model.calls.clear()
             ns['_predict_block'](model, raw, cfg, torch.device('cpu'), ['a'], False)
-            self.assertEqual(model.calls, [1] * 6)
+            self.assertEqual(model.calls, [1, 2, 2, 1])
             model.limit = 0
             with self.assertRaises(torch.cuda.OutOfMemoryError):
                 ns['_predict_block'](model, raw, cfg, torch.device('cpu'), ['a'], False)

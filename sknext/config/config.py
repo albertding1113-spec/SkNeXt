@@ -235,6 +235,12 @@ class SkNeXt_Config:
         _C.AUGMENTOR.SHUFFLE_VAL_DATA_EACH_EPOCH = False
         # Cut out one subregion.
         _C.AUGMENTOR.CUT_OUT = False
+        # interior (legacy), edge-attached cuboid, full-face slab, or equal mixed.
+        _C.AUGMENTOR.CUT_OUT_GEOMETRY = "mixed"
+        # Maximum cut-out side length as a fraction of each spatial patch axis.
+        _C.AUGMENTOR.CUT_OUT_SIZE = 0.50
+        # Replacement intensity quantiles (fractions): 0.05 = 5th percentile.
+        _C.AUGMENTOR.CUT_OUT_INTENSITY_RANGE = (0.0, 0.01)
         # Random rotation between a defined range
         _C.AUGMENTOR.RANDOM_ROT = False
         # Range of random rotations
@@ -392,8 +398,8 @@ class SkNeXt_Config:
         _C.TRAIN.BATCH_SIZE = 2
         # All training workflows: probe CUDA memory instead of manual sizing.
         _C.TRAIN.AUTO_BATCH_SIZE = False
-        _C.TRAIN.AUTO_BATCH_MAX_PER_GPU = 128
-        _C.TRAIN.AUTO_BATCH_MEMORY_FRACTION = 0.8
+        _C.TRAIN.AUTO_BATCH_MAX_PER_GPU = 96
+        _C.TRAIN.AUTO_BATCH_MEMORY_FRACTION = 0.75
         # Number of epochs to train the model
         _C.TRAIN.EPOCHS = 1000
         # Epochs to wait with no validation data improvement until the training is stopped
@@ -419,7 +425,7 @@ class SkNeXt_Config:
         _C.INFER.BATCH_SIZE = 0  # 0: divide TRAIN.BATCH_SIZE over GPU workers (at least one)
         # Forward-only CUDA probing, independently in each inference GPU worker.
         _C.INFER.AUTO_BATCH_SIZE = False
-        _C.INFER.AUTO_BATCH_MAX_PER_GPU = 128
+        _C.INFER.AUTO_BATCH_MAX_PER_GPU = 96
         _C.INFER.AUTO_BATCH_MEMORY_FRACTION = 0.8
         _C.INFER.PARALLEL_BLOCKS = True
         # 'uint16': watershed + semantic labels (legacy name); actual stored dtype

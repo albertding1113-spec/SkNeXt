@@ -1,0 +1,69 @@
+SYSTEM:
+    DEVICE: "gpu"
+
+PATHS:
+    RESULT_DIR:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/result'
+
+TASK:
+    CHANNELS: ["S.globular"]
+    CHANNEL_WEIGHTS: [1]
+
+DATA:
+    PATCH_SIZE: [32, 128, 128, 1]
+    NORMALIZATION:
+        TYPE: "zero_mean_unit_variance"
+    TRAIN:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/globular_train/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/globular_train/label'
+    VAL:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/globular_val/raw'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/261020_SkNeXt_dataset/dataset/globular_val/label'
+    INFER:
+        PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260601_TEEX_whole_brain/260822_x10000-38000y65000-120000z7000-16000/channel1/260822_x10000-38000y65000-120000z7000-16000_channel1.ims'
+        GT_PATH: '/HWFS/zhaohu_lab/dingjiayi/data/260601_TEEX_whole_brain/260822_x10000-38000y65000-120000z7000-16000/channel1/260822_x10000-38000y65000-120000z7000-16000_channel1.ome.zarr'
+        CHANNEL: [0]
+
+AUGMENTOR:
+    ENABLE: True
+    CUT_OUT: True
+    RANDOM_ROT: True
+    ZOOM: True
+    ZOOM_RANGE: [0.8, 1.2]
+    VFLIP: True
+    HFLIP: True
+    ZFLIP: True
+    BRIGHTNESS: True
+    BRIGHTNESS_FACTOR: [-0.1, 0.1]
+    CONTRAST: True
+    CONTRAST_FACTOR: [-0.1, 0.1]
+    AFFINE_MODE: "reflect"
+
+MODEL:
+    ARCHITECTURE: "unext_v2"
+    LOAD_CHECKPOINT: False
+    FEATURE_MAPS: [32, 64, 128, 256, 320]
+    CONVNEXT_STEM_K_SIZE: 1
+    Z_DOWN: [1, 1, 2, 2]
+    YX_DOWN: [2, 2, 2, 2]
+    ISOTROPY: [False, False, True, True, True]
+    CONVNEXT_LAYERS: [2, 2, 2, 2, 2]
+
+TRAIN:
+    ENABLE: True
+    RESUME: False
+    OPTIMIZER: "ADAMW"
+    LR: 1.E-4
+    BATCH_SIZE: 4
+    EPOCHS: 200
+    PATIENCE: 50
+    LR_SCHEDULER:
+        NAME: "warmupcosine"
+        MIN_LR: 1.E-6
+        WARMUP_COSINE_DECAY_EPOCHS: 5
+
+INFER:
+    ENABLE: False
+    THRESHOLD: 0.5
+    SAVE_PROBABILITIES: False
+

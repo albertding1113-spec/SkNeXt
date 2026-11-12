@@ -873,7 +873,8 @@ class Segmentation_Workflow(Base_Workflow):
 
         from sknext.utils.parallel import resolve_inference_batch
         batch_size = resolve_inference_batch(self.model, self.cfg, self.device, 'segmentation')
-        for batch_start in range(0, len(all_patch_coords), batch_size):
+        batch_start = 0
+        while batch_start < len(all_patch_coords):
             batch_end = min(batch_start + batch_size, len(all_patch_coords),)
             block_pred_sum, block_weight_sum = self._infer_one_batch(
                 block_pred_sum,
@@ -881,6 +882,8 @@ class Segmentation_Workflow(Base_Workflow):
                 block_raw,
                 all_patch_coords[batch_start:batch_end],
                 patch_overlap_widths[batch_start:batch_end],)
+            batch_start = batch_end
+            batch_size = resolve_inference_batch(self.model, self.cfg, self.device, 'segmentation')
         uncovered_mask = block_weight_sum <= 0
         if np.any(uncovered_mask):
             uncovered_voxels = int(np.count_nonzero(uncovered_mask))
@@ -1065,17 +1068,25 @@ class Segmentation_Workflow(Base_Workflow):
             return block_pred_sum, block_weight_sum
         if current_batch_size != len(p_overlap_widths):
             raise ValueError("p_coord_list and p_overlap_widths must have the same length.")
+        from sknext.data.preprocessing import fill_inference_zeros
         patch_raw = np.zeros((current_batch_size, self.patch_size[3], *self.patch_size[0:3],), dtype=np.float32,)  # BCZYX: retain normalized fractional values
         for i, p_coord in enumerate(p_coord_list):
             patch = block_raw[
                 :, p_coord[0, 0]:p_coord[0, 1], p_coord[1, 0]:p_coord[1, 1],p_coord[2, 0]:p_coord[2, 1],]  # CZYX
+            patch = fill_inference_zeros(patch)
             if patch.shape[1:4] != patch_raw.shape[2:5]:
                 patch = reflect_padding_img(patch, patch_raw.shape[2:5])
             patch_raw[i, ...] = preprocess_img(patch, self.preprocess_dict)
 
-        patch_tensor = torch.from_numpy(patch_raw.astype(np.float32, copy=False)).to(self.device, non_blocking=True)
-        patch_pred = self.model(patch_tensor)  # B(out_channel_num)ZYX
-        patch_pred = torch.sigmoid(patch_pred).cpu().numpy().astype(np.float32, copy=False,)
+        from sknext.utils.parallel import predict_inference_batches
+
+        def predict(patches):
+            patch_tensor = torch.from_numpy(patches).to(self.device, non_blocking=True)
+            prediction = self.model(patch_tensor)  # B(out_channel_num)ZYX
+            return torch.sigmoid(prediction).cpu().numpy().astype(np.float32, copy=False)
+
+        patch_pred = predict_inference_batches(
+            self.model, self.cfg, self.device, patch_raw, predict)
 
         def make_axis_weight(
             axis_length: int,
@@ -1168,6 +1179,7 @@ class Segmentation_Workflow(Base_Workflow):
                   "selected_raw_channels": list(self.infer_channel),
                   "model": str(architecture_cfg), "task": str(self.cfg.TASK),
                   "normalization": str(self.cfg.DATA.NORMALIZATION),
+                  "zero_fill_policy": "uint8_uint16_nonzero_p1_per_patch_v1",
                   "patch_size": list(self.patch_size),
                   "infer_overlap": list(map(int, self.infer_overlap)),
                   "infer_padding": list(self.infer_padding),

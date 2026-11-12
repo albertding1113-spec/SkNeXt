@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from yacs.config import CfgNode
 
 
 class SROverlapTests(unittest.TestCase):
@@ -24,10 +25,10 @@ class SROverlapTests(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), cls.ns)
 
     def runner(self, size, overlap, padding, scale=1):
-        cfg = SimpleNamespace(DATA=SimpleNamespace(PATCH_SIZE=(*size, 1), INFER=SimpleNamespace(
-            CHANNEL=[0], OVERLAP=overlap, PADDING=padding,
-            BLOCK_FACTOR=(3,3,3), BLOCK_CENTRAL_FACTOR=(1,1,1))),
-            SR=SimpleNamespace(OUTPUT_CLIP=False))
+        cfg = CfgNode({'DATA': {'PATCH_SIZE': (*size, 1), 'INFER': {
+            'CHANNEL': [0], 'OVERLAP': overlap, 'PADDING': padding,
+            'BLOCK_FACTOR': (3,3,3), 'BLOCK_CENTRAL_FACTOR': (1,1,1)}},
+            'SR': {'OUTPUT_CLIP': False}})
         return SimpleNamespace(cfg=cfg, ch=1, scale=scale, patch=size, device=torch.device('cpu'))
 
     def predict(self, runner, raw, model, start=None, stop=None, batch=3):
@@ -64,6 +65,30 @@ class SROverlapTests(unittest.TestCase):
             runner = self.runner((4,8,8), overlap, (1,1,1))
             with self.assertRaises(ValueError):
                 self.ns['sr_infer_geometry'](runner.cfg)
+
+    def test_oom_retries_preserve_blended_output(self):
+        raw = np.linspace(0, 1, 5*9*11, dtype=np.float32).reshape(1,5,9,11)
+        runner = self.runner((2,4,4), (.25,.25,.25), (0,0,0))
+        runner.cfg.INFER = CfgNode({'AUTO_BATCH_SIZE': True})
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+                self._sknext_inference_batch = ('key', 10)
+
+            def forward(self, x):
+                self.calls.append(len(x))
+                if len(x) > 6:
+                    raise torch.cuda.OutOfMemoryError('simulated OOM')
+                return {'pred': x}
+
+        model = Model()
+        with patch('torch.cuda.empty_cache'):
+            result = self.predict(runner, raw, model, batch=10)
+        np.testing.assert_allclose(result, raw, atol=2e-7)
+        self.assertEqual(model.calls[:3], [10, 8, 6])
+        self.assertEqual(model._sknext_inference_batch, ('key', 6))
 
 
 if __name__ == '__main__':
